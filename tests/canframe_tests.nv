@@ -1,0 +1,219 @@
+// canframe_tests.nv — a frame in three integers: the packing, the
+// arbitration order, and the CAN FD lengths that are not byte counts.
+//
+// RED ON PURPOSE: every assertion against a FUNCTION reaches
+// `not implemented: can-nv.canframe.<fn>`, because every body under
+// `src/` is a `todo()`.  Assertions against published CONSTANTS pass,
+// because a constant is not a stub.
+//
+// THE VECTORS ARE ISO 11898-1's OWN TABLES.  The data length code
+// mapping — 0 to 8 then 12, 16, 20, 24, 32, 48, 64 — is table 5 of the
+// 2015 edition, and the arbitration rule is § 10.4.2.2: a dominant bit
+// overwrites a recessive one, the identifier is sent most significant
+// bit first, and a node that reads back a bit it did not send stops
+// transmitting.  The consequence — the smaller identifier wins — is
+// what the assertions below check, because it is the one property a
+// queue can silently invert.
+
+use std.test
+use canframe
+
+// Whether a check refused.  An optional is matched rather than
+// compared, so the two-line helper is what every assertion below
+// goes through.
+fn refused(e: ?CanError) -> Bool
+    match e
+        Some(_) => true
+        None    => false
+
+@test
+fn test_a_classic_frame_carries_its_whole_payload_in_one_integer() [io]
+    test.case("eight bytes is sixty-four bits, and that is the fact the whole package is built on")
+    test.assert_eq(canframe.CAN_MAX_DLEN, 8)
+    let f = canframe.frame(0x123, 8, canframe.pack8(1, 2, 3, 4, 5, 6, 7, 8))
+    test.assert_eq(canframe.frame_byte(f, 0), 1)
+    test.assert_eq(canframe.frame_byte(f, 7), 8)
+    test.assert_eq(canframe.frame_len(f), 8)
+
+@test
+fn test_byte_zero_is_in_the_low_bits() [io]
+    test.case("the order a controller's data registers are in, so a driver copies rather than shuffles")
+    test.assert_eq(canframe.byte_of(0x2211, 0), 0x11)
+    test.assert_eq(canframe.byte_of(0x2211, 1), 0x22)
+    test.assert_eq(canframe.pack2(0x11, 0x22), 0x2211)
+
+@test
+fn test_a_byte_past_the_declared_length_reads_zero() [io]
+    test.case("not whatever the word happens to hold — a frame of three bytes has five that are not payload")
+    let f = canframe.frame(0x123, 3, canframe.pack8(1, 2, 3, 4, 5, 6, 7, 8))
+    test.assert_eq(canframe.frame_byte(f, 2), 3)
+    test.assert_eq(canframe.frame_byte(f, 3), 0)
+    test.assert_eq(canframe.frame_byte(f, 7), 0)
+
+@test
+fn test_setting_a_byte_grows_the_length_to_cover_it() [io]
+    test.case("what a receive interrupt does, one byte at a time, with nothing allocated")
+    var f = canframe.frame(0x123, 0, 0)
+    f = canframe.frame_with_byte(f, 0, 0xAA)
+    test.assert_eq(canframe.frame_len(f), 1)
+    f = canframe.frame_with_byte(f, 3, 0xBB)
+    test.assert_eq(canframe.frame_len(f), 4)
+    test.assert_eq(canframe.frame_byte(f, 3), 0xBB)
+    test.case("and the bytes skipped over are zero rather than uninitialised")
+    test.assert_eq(canframe.frame_byte(f, 1), 0)
+
+@test
+fn test_the_two_identifier_widths_are_two_constructors() [io]
+    test.case("0x123 is a valid standard identifier AND a valid extended one, and they are different frames on the same bus")
+    test.assert(canframe.is_extended(canframe.frame(0x123, 0, 0)) == false)
+    test.assert(canframe.is_extended(canframe.frame_ext(0x123, 0, 0)))
+    test.assert_eq(canframe.CAN_SFF_MAX_ID, 0x7FF)
+    test.assert_eq(canframe.CAN_EFF_MAX_ID, 0x1FFFFFFF)
+
+@test
+fn test_an_identifier_too_wide_for_its_format_is_refused() [io]
+    test.case("0x800 in eleven bits is silently truncated by a controller, which is a frame nobody asked for on an identifier somebody else owns")
+    test.assert(refused(canframe.check_frame(canframe.frame(0x800, 0, 0))))
+    test.assert(refused(canframe.check_frame(canframe.frame_ext(0x800, 0, 0))) == false)
+    test.assert(refused(canframe.check_frame(canframe.frame_ext(0x20000000, 0, 0))))
+
+@test
+fn test_a_classic_payload_longer_than_eight_is_refused() [io]
+    test.assert(refused(canframe.check_frame(canframe.frame(0x123, 9, 0))))
+    test.assert(refused(canframe.check_frame(canframe.frame(0x123, 8, 0))) == false)
+
+@test
+fn test_the_smaller_identifier_wins_the_bus() [io]
+    test.case("ISO 11898-1 section 10.4.2.2 — dominant is low and sent first, so the smaller number wins")
+    test.assert(canframe.wins_arbitration(canframe.frame(0x100, 0, 0),
+                                          canframe.frame(0x200, 0, 0)))
+    test.assert(canframe.wins_arbitration(canframe.frame(0x200, 0, 0),
+                                          canframe.frame(0x100, 0, 0)) == false)
+
+    test.case("a standard identifier beats an extended one sharing its first eleven bits, because the extension bit is recessive")
+    test.assert(canframe.wins_arbitration(canframe.frame(0x123, 0, 0),
+                                          canframe.frame_ext(0x123, 0, 0)))
+
+    test.case("and a data frame beats a remote frame with the same identifier, for the same reason")
+    test.assert(canframe.wins_arbitration(canframe.frame(0x123, 0, 0),
+                                          canframe.remote_frame(0x123, 0)))
+
+@test
+fn test_the_arbitration_key_orders_the_same_way_the_bus_does() [io]
+    test.case("one number whose numeric order IS the bus's order, so a queue sorts by < and cannot get the direction wrong")
+    let hi = canframe.arbitration_key(canframe.frame(0x100, 0, 0))
+    let lo = canframe.arbitration_key(canframe.frame(0x200, 0, 0))
+    test.assert(hi < lo)
+
+    test.case("and it agrees with wins_arbitration on every pair, which is what makes it safe to sort by")
+    let std_key = canframe.arbitration_key(canframe.frame(0x123, 0, 0))
+    let ext_key = canframe.arbitration_key(canframe.frame_ext(0x123, 0, 0))
+    test.assert(std_key < ext_key)
+
+@test
+fn test_nothing_arrived_is_not_a_frame_and_says_so() [io]
+    test.case("a @value struct cannot be an optional payload (E2015), so the frame carries its own status")
+    test.assert(canframe.is_none(canframe.none()))
+    test.assert(canframe.is_frame(canframe.none()) == false)
+    test.assert(canframe.is_fault(canframe.none()) == false)
+
+@test
+fn test_a_refusal_is_not_a_frame_either_and_carries_its_reason() [io]
+    let bad = canframe.fault(canframe.CAN_FAULT_MALFORMED)
+    test.assert(canframe.is_fault(bad))
+    test.assert(canframe.is_frame(bad) == false)
+    test.assert(canframe.is_none(bad) == false)
+    test.assert_eq(canframe.fault_code(bad), canframe.CAN_FAULT_MALFORMED)
+    test.assert(refused(canframe.fault_of(bad)))
+
+    test.case("and a real frame is neither, which is the one question a receive loop asks")
+    let f = canframe.frame(0x123, 0, 0)
+    test.assert(canframe.is_frame(f))
+    test.assert(refused(canframe.fault_of(f)) == false)
+
+@test
+fn test_a_data_length_code_is_not_a_byte_count() [io]
+    test.case("ISO 11898-1 table 5: CAN FD's codes 9 to 15 are 12, 16, 20, 24, 32, 48 and 64")
+    test.assert_eq(canframe.dlc_for(8), 8)
+    test.assert_eq(canframe.dlc_for(12), 9)
+    test.assert_eq(canframe.dlc_for(16), 10)
+    test.assert_eq(canframe.dlc_for(20), 11)
+    test.assert_eq(canframe.dlc_for(24), 12)
+    test.assert_eq(canframe.dlc_for(32), 13)
+    test.assert_eq(canframe.dlc_for(48), 14)
+    test.assert_eq(canframe.dlc_for(64), 15)
+
+    test.case("and a length the format does not have answers -1 rather than something plausible")
+    test.assert_eq(canframe.dlc_for(9), 0 - 1)
+    test.assert_eq(canframe.dlc_for(65), 0 - 1)
+
+@test
+fn test_the_mapping_goes_back_the_other_way() [io]
+    test.assert_eq(canframe.fd_len_for_dlc(14), 48)
+    test.assert_eq(canframe.fd_len_for_dlc(15), 64)
+    test.assert_eq(canframe.fd_len_for_dlc(8), 8)
+
+    test.case("and a CLASSIC frame clamps every code above 8 to 8, which is the other half of the same four bits")
+    test.assert_eq(canframe.classic_len_for_dlc(9), 8)
+    test.assert_eq(canframe.classic_len_for_dlc(15), 8)
+    test.assert_eq(canframe.classic_len_for_dlc(3), 3)
+
+@test
+fn test_the_gaps_are_why_a_payload_is_padded() [io]
+    test.case("9, 10, 11 and 13 are not lengths, so a 9-byte message goes out as 12 and the receiver cannot tell")
+    test.assert(canframe.fd_len_is_valid(8))
+    test.assert(canframe.fd_len_is_valid(9) == false)
+    test.assert(canframe.fd_len_is_valid(12))
+    test.assert(canframe.fd_len_is_valid(13) == false)
+    test.assert(canframe.fd_len_is_valid(64))
+    test.assert(canframe.fd_len_is_valid(65) == false)
+
+    test.assert_eq(canframe.fd_padded_len(9), 12)
+    test.assert_eq(canframe.fd_padded_len(33), 48)
+    test.assert_eq(canframe.fd_padded_len(8), 8)
+
+@test
+fn test_a_fd_frame_is_a_header_because_sixty_four_bytes_do_not_fit_an_integer() [io]
+    test.case("the payload stays in the caller's buffer, which is where a controller's DMA region has it anyway")
+    test.assert_eq(canframe.CAN_FD_MAX_DLEN, 64)
+    let f = canframe.fd_frame(0x123, 48, true)
+    test.assert_eq(canframe.fd_id(f), 0x123)
+    test.assert_eq(canframe.fd_len(f), 48)
+    test.assert_eq(canframe.fd_dlc(f), 14)
+    test.assert(canframe.fd_has_brs(f))
+    test.assert(canframe.fd_is_extended(f) == false)
+
+    test.case("and FD without the bit rate switch is a legitimate frame, not an omission")
+    test.assert(canframe.fd_has_brs(canframe.fd_frame(0x123, 48, false)) == false)
+
+@test
+fn test_an_fd_length_the_format_lacks_is_refused() [io]
+    test.assert(refused(canframe.check_fd_frame(canframe.fd_frame(0x123, 9, false))))
+    test.assert(refused(canframe.check_fd_frame(canframe.fd_frame(0x123, 12, false))) == false)
+
+@test
+fn test_a_remote_frames_length_is_a_request_not_a_description() [io]
+    test.case("the one place in CAN where the length field does not describe what follows")
+    let r = canframe.remote_frame(0x123, 8)
+    test.assert(canframe.is_remote(r))
+    test.assert_eq(canframe.frame_len(r), 8)
+    test.assert_eq(canframe.frame_data(r), 0)
+
+@test
+fn test_a_signal_is_read_at_a_bit_offset_and_the_endianness_matters() [io]
+    test.case("a DBC file describes signals in bits, and reading a big-endian one as little-endian is wrong by a factor of 256")
+    let d = canframe.pack2(0x12, 0x34)
+    test.assert_eq(canframe.signal_le(d, 0, 16), 0x3412)
+    test.assert_eq(canframe.signal_be(d, 0, 16), 0x1234)
+
+    test.case("and a signal narrower than a byte comes out of the middle of one")
+    test.assert_eq(canframe.signal_le(canframe.pack2(0xF0, 0), 4, 4), 0x0F)
+
+@test
+fn test_the_flag_bits_do_not_collide() [io]
+    test.case("three protocol flags and two sentinels in one field, and a frame that was both remote and nothing would be a bug nobody could see")
+    test.assert_eq(canframe.CAN_FLAG_EXTENDED, 0x01)
+    test.assert_eq(canframe.CAN_FLAG_RTR, 0x02)
+    test.assert_eq(canframe.CAN_FLAG_ERROR, 0x04)
+    test.assert_eq(canframe.CAN_FLAG_NONE, 0x80)
+    test.assert_eq(canframe.CAN_FLAG_FAULT, 0x100)

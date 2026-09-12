@@ -1,0 +1,283 @@
+// canbus.nv — error confinement: the two counters that decide whether
+// a node is allowed to speak.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A CAN NODE POLICES ITSELF, and this is the arithmetic it does.  A
+// transmit error adds 8 to the transmit counter, a receive error adds
+// 1 to the receive counter, and a success subtracts 1 from whichever
+// applies.  At 128 a node becomes ERROR-PASSIVE and may no longer
+// signal an error actively; at 256 on the transmit counter it goes
+// BUS-OFF and stops transmitting entirely until it is reset and has
+// seen 128 occurrences of eleven consecutive recessive bits.
+//
+// THE ASYMMETRY IS THE WHOLE MECHANISM.  Eight up and one down means a
+// node whose own transceiver is broken takes itself off the bus in
+// thirty-two frames, while a node that occasionally sees a corrupted
+// frame from someone else never does.  A controller implements this in
+// hardware; this module exists because the SOFTWARE has to know what
+// the hardware decided — a driver that retries a transmission on a
+// bus-off node retries forever, and an application that does not
+// notice the transition reports no fault while sending nothing.
+//
+// A NODE ALONE ON A BUS IS THE CASE TO GET RIGHT.  With no other node
+// to acknowledge, every transmission is an acknowledgement error, so a
+// node alone reaches bus-off in about thirty-two frames and stays
+// there.  That is not a bug and it is the single most common first
+// experience of CAN — a board on a bench with a terminator and no
+// peer.  `would_go_bus_off_alone` is that story as a number a test can
+// assert, and the README says so.
+//
+// A `@value` STRUCT OF THREE INTEGERS, so a driver holds the state
+// beside its peripheral handle and an interrupt updates it.
+
+use canframe
+
+// ── The thresholds ───────────────────────────────────────────────────
+
+// The counter value at which a node becomes error-passive: 128.
+pub const CAN_ERROR_PASSIVE_LIMIT = 128
+// The transmit counter value at which a node goes bus-off: 256.
+pub const CAN_BUS_OFF_LIMIT = 256
+// What a transmit error adds to the transmit counter: 8.
+pub const CAN_TX_ERROR_WEIGHT = 8
+// What a receive error adds to the receive counter: 1.
+pub const CAN_RX_ERROR_WEIGHT = 1
+// How many occurrences of eleven consecutive recessive bits a bus-off
+// node must see before it may rejoin: 128.
+pub const CAN_BUS_OFF_RECOVERY_SEQUENCES = 128
+
+// ── The states ───────────────────────────────────────────────────────
+
+// Error-active: both counters below 128.  The node signals errors
+// actively, with a dominant error flag that every other node sees.
+pub const CAN_STATE_ERROR_ACTIVE = 0
+// Error-warning: a counter has reached 96.  Not a protocol state — the
+// protocol has three — but a threshold every controller reports,
+// because it is the last moment at which a problem is still cheap to
+// investigate.
+pub const CAN_STATE_ERROR_WARNING = 1
+// Error-passive: a counter has reached 128.  The node still sends and
+// receives, but signals errors only passively, so a broken node can no
+// longer disturb a working bus.
+pub const CAN_STATE_ERROR_PASSIVE = 2
+// Bus-off: the transmit counter reached 256.  The node is
+// disconnected from the bus and sends nothing at all.
+pub const CAN_STATE_BUS_OFF = 3
+
+// ── The error kinds a controller reports ─────────────────────────────
+
+// A bit error: the node transmitted one level and read back the other,
+// outside arbitration.  Usually a wiring or transceiver fault.
+pub const CAN_ERR_BIT = 0x01
+// A stuff error: six consecutive bits of the same level where the
+// encoding forbids it.
+pub const CAN_ERR_STUFF = 0x02
+// A form error: a fixed-format field held the wrong value.
+pub const CAN_ERR_FORM = 0x04
+// A CRC error: the frame's check sequence did not match.
+pub const CAN_ERR_CRC = 0x08
+// An acknowledgement error: nobody acknowledged the frame.  The error
+// a node alone on a bus gets on every transmission, forever.
+pub const CAN_ERR_ACK = 0x10
+
+// ── The state ────────────────────────────────────────────────────────
+
+// A node's error-confinement state.
+pub @value
+struct CanBusState
+    // The transmit error counter.
+    tx_errors: Int
+    // The receive error counter.
+    rx_errors: Int
+    // How many recovery sequences have been seen since going bus-off.
+    recovery: Int
+
+// A freshly reset node: both counters at zero, error-active.
+//
+// ```novo
+// use canbus
+//
+// fn main() [io]
+//     println("${canbus.state_of(canbus.bus_state())}")   // 0, error-active
+// ```
+pub fn bus_state() -> CanBusState []
+    todo("can-nv.canbus.bus_state")
+
+// A state with the counters a controller's registers hold, for a
+// driver that reads them rather than tracking them.
+pub fn bus_state_of(tx_errors: Int, rx_errors: Int) -> CanBusState []
+    todo("can-nv.canbus.bus_state_of")
+
+// The transmit error counter.
+pub fn tx_errors(s: CanBusState) -> Int []
+    todo("can-nv.canbus.tx_errors")
+
+// The receive error counter.
+pub fn rx_errors(s: CanBusState) -> Int []
+    todo("can-nv.canbus.rx_errors")
+
+// Which of the four states the counters put the node in.
+//
+// ```novo
+// use canbus
+//
+// fn main() [io]
+//     println("${canbus.state_of(canbus.bus_state_of(200, 0))}")   // 2
+// ```
+pub fn state_of(s: CanBusState) -> Int []
+    todo("can-nv.canbus.state_of")
+
+// The state in words, for a log.
+pub fn state_name(state: Int) -> Str []
+    todo("can-nv.canbus.state_name")
+
+// The state after a transmit error: the transmit counter up by 8.
+pub fn on_tx_error(s: CanBusState) -> CanBusState []
+    todo("can-nv.canbus.on_tx_error")
+
+// The state after a receive error: the receive counter up by 1.
+pub fn on_rx_error(s: CanBusState) -> CanBusState []
+    todo("can-nv.canbus.on_rx_error")
+
+// The state after a successful transmission: the transmit counter
+// down by 1, never below zero.
+pub fn on_tx_success(s: CanBusState) -> CanBusState []
+    todo("can-nv.canbus.on_tx_success")
+
+// The state after a successful reception: the receive counter down by
+// 1, never below zero.
+pub fn on_rx_success(s: CanBusState) -> CanBusState []
+    todo("can-nv.canbus.on_rx_success")
+
+// The state after one recovery sequence while bus-off.
+pub fn on_recovery_sequence(s: CanBusState) -> CanBusState []
+    todo("can-nv.canbus.on_recovery_sequence")
+
+// Whether a bus-off node has seen enough recovery sequences to rejoin.
+pub fn may_rejoin(s: CanBusState) -> Bool []
+    todo("can-nv.canbus.may_rejoin")
+
+// A node that has rejoined: both counters and the recovery count back
+// to zero.
+pub fn rejoined(s: CanBusState) -> CanBusState []
+    todo("can-nv.canbus.rejoined")
+
+// Whether the node may transmit at all.
+//
+// The question a driver's transmit path asks first, and the one a
+// driver that does not ask spins on: a bus-off node's transmissions
+// never complete, so a retry loop around one never ends.
+//
+// ```novo
+// use canbus
+//
+// fn main() [io]
+//     println("${canbus.may_transmit(canbus.bus_state_of(256, 0))}")   // false
+// ```
+pub fn may_transmit(s: CanBusState) -> Bool []
+    todo("can-nv.canbus.may_transmit")
+
+// Whether the node still signals errors actively.
+pub fn is_error_active(s: CanBusState) -> Bool []
+    todo("can-nv.canbus.is_error_active")
+
+// How many consecutive transmit errors would take this node from here
+// to bus-off.
+//
+// The number worth putting in a diagnostic: "four more failures and
+// this node stops talking" is actionable where a counter of 224 is
+// not.
+//
+// ```novo
+// use canbus
+//
+// fn main() [io]
+//     println("${canbus.tx_errors_to_bus_off(canbus.bus_state())}")   // 32
+// ```
+pub fn tx_errors_to_bus_off(s: CanBusState) -> Int []
+    todo("can-nv.canbus.tx_errors_to_bus_off")
+
+// How many transmissions a node alone on a bus makes before it goes
+// bus-off.
+//
+// With no peer to acknowledge, every transmission is an
+// acknowledgement error, so the answer is 32 — and it is the single
+// most common first experience of CAN, a board on a bench with a
+// terminator and no second node.  A number rather than a paragraph,
+// so a test asserts it and a diagnostic can explain it.
+//
+// ```novo
+// use canbus
+//
+// fn main() [io]
+//     println("${canbus.would_go_bus_off_alone()}")   // 32
+// ```
+pub fn would_go_bus_off_alone() -> Int []
+    todo("can-nv.canbus.would_go_bus_off_alone")
+
+// ── Error frames ─────────────────────────────────────────────────────
+
+// The `CAN_ERR_*` bits a controller-generated error frame reports.
+//
+// A frame that is not an error frame answers 0, which is also what an
+// error frame reporting nothing would answer — `canframe.is_error_frame`
+// is the question that distinguishes them, and this function does not
+// pretend to.
+pub fn error_kinds(f: CanFrame) -> Int []
+    todo("can-nv.canbus.error_kinds")
+
+// The state an error frame's payload reports, for a controller whose
+// error frames carry the counters — which SocketCAN's do.
+pub fn state_from_error_frame(f: CanFrame) -> CanBusState []
+    todo("can-nv.canbus.state_from_error_frame")
+
+// One error kind in words.
+pub fn error_kind_name(kind: Int) -> Str []
+    todo("can-nv.canbus.error_kind_name")
+
+// ── Bit timing, which is the other way a bus fails silently ──────────
+
+// The nominal bit rates a CAN bus conventionally runs at, as the one
+// list worth having: 10, 20, 50, 100, 125, 250, 500, 800 and 1000
+// kbit/s.
+//
+// `i` from 0 to 8, and -1 outside.  A list rather than a constant per
+// rate because the useful operation is "try each in turn", which is
+// what a tool that does not know a bus's rate does.
+pub fn standard_bitrate(i: Int) -> Int []
+    todo("can-nv.canbus.standard_bitrate")
+
+// How many standard bit rates there are: 9.
+pub const CAN_STANDARD_BITRATES = 9
+
+// The sample point, in tenths of a percent, that a bit rate wants.
+//
+// CiA 301 asks for 87.5% at 500 kbit/s and above and 75% below it.
+// Two nodes with different sample points on the same bus communicate
+// perfectly until a cable gets longer, and then produce bit errors
+// nobody can attribute — which is why the number belongs somewhere a
+// driver can read it rather than in a datasheet's example table.
+//
+// ```novo
+// use canbus
+//
+// fn main() [io]
+//     println("${canbus.sample_point_permille(500000)}")   // 875
+// ```
+pub fn sample_point_permille(bitrate: Int) -> Int []
+    todo("can-nv.canbus.sample_point_permille")
+
+// How many time quanta a bit is divided into for this peripheral
+// clock and bit rate, or -1 when the clock cannot produce the rate
+// within the tolerance CAN allows.
+//
+// The refusal is the valuable half: a clock that is 1.2% off produces
+// a bus that works between two boards with the same error and fails
+// against anything else, and the failure looks like a wiring fault.
+pub fn time_quanta(clock_hz: Int, bitrate: Int) -> Int []
+    todo("can-nv.canbus.time_quanta")
+
+// Why a bit timing cannot be used, or nothing.
+pub fn check_timing(clock_hz: Int, bitrate: Int) -> ?CanError []
+    todo("can-nv.canbus.check_timing")

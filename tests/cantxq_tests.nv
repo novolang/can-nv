@@ -1,0 +1,176 @@
+// cantxq_tests.nv — the queue that does not invert the bus's ordering,
+// and the callback that answers a key rather than a frame.
+//
+// RED ON PURPOSE: every assertion against a FUNCTION reaches
+// `not implemented: can-nv.cantxq.<fn>`.
+//
+// THERE IS NO REFERENCE VECTOR FOR A TRANSMIT QUEUE, because no CAN
+// library publishes one — SocketCAN's queue is the kernel's and
+// embedded-hal has none.  What is asserted instead is the ONE property
+// that distinguishes this queue from a FIFO: the frame it hands over
+// next is the one that would win the bus, not the one that arrived
+// first.  A test for that is a table of identifiers and a comparison,
+// which is exactly what a queue of `@value` frames makes possible.
+
+use std.test
+use cantxq
+use canframe
+
+// Whether a check refused.  An optional is matched rather than
+// compared, so the two-line helper is what every assertion below
+// goes through.
+fn refused(e: ?CanError) -> Bool
+    match e
+        Some(_) => true
+        None    => false
+
+// A caller's slot array, as a driver would hold it: three pending
+// frames whose arrival order is the opposite of their priority.
+//
+// A named function rather than a lambda, because a lambda that becomes
+// a value at `@tier(embedded)` is refused — and because this is
+// exactly how a driver passes its own storage in.
+fn key_at(i: Int) -> Int
+    if i == 0
+        canframe.arbitration_key(canframe.frame(0x600, 0, 0))
+    else if i == 1
+        canframe.arbitration_key(canframe.frame(0x100, 0, 0))
+    else
+        canframe.arbitration_key(canframe.frame(0x300, 0, 0))
+
+fn id_at(i: Int) -> Int
+    if i == 0
+        0x600
+    else if i == 1
+        0x100
+    else
+        0x300
+
+@test
+fn test_a_fresh_queue_is_empty_and_has_dropped_nothing() [io]
+    let q = cantxq.queue(16)
+    test.assert_eq(cantxq.len(q), 0)
+    test.assert_eq(cantxq.capacity(q), 16)
+    test.assert(cantxq.is_empty(q))
+    test.assert(cantxq.is_full(q) == false)
+    test.assert_eq(cantxq.dropped(q), 0)
+
+@test
+fn test_enqueueing_is_two_steps_because_the_storage_is_the_callers() [io]
+    test.case("heapless-nv's own shape: this answers a slot, the caller writes the frame, and nothing here ever holds one")
+    var q = cantxq.queue(4)
+    test.assert_eq(cantxq.enqueue_at(q), 0)
+    q = cantxq.enqueued(q)
+    test.assert_eq(cantxq.len(q), 1)
+    test.assert_eq(cantxq.enqueue_at(q), 1)
+
+@test
+fn test_a_full_queue_answers_minus_one_rather_than_panicking() [io]
+    test.case("a panic in a transmit path is a reset, so the caller is told and decides")
+    var q = cantxq.queue(2)
+    q = cantxq.enqueued(q)
+    q = cantxq.enqueued(q)
+    test.assert(cantxq.is_full(q))
+    test.assert_eq(cantxq.enqueue_at(q), 0 - 1)
+
+    test.case("and a caller that had nowhere to put a frame says so, so the drop is counted rather than invisible")
+    let after = cantxq.dropped_one(q)
+    test.assert_eq(cantxq.dropped(after), 1)
+
+@test
+fn test_the_queue_hands_over_the_frame_that_wins_the_bus() [io]
+    test.case("the only reason this module exists: an emergency stop behind six telemetry frames is a priority inversion the protocol prevented")
+    var q = cantxq.queue(3)
+    q = cantxq.enqueued(q)
+    q = cantxq.enqueued(q)
+    q = cantxq.enqueued(q)
+    test.assert_eq(cantxq.len(q), 3)
+
+    test.case("slot 1 holds 0x100, which beats 0x300 and 0x600")
+    test.assert_eq(cantxq.dequeue_index(q, key_at), 1)
+
+    test.case("and arrival order says slot 0, which is the answer a FIFO would give")
+    test.assert_eq(cantxq.dequeue_fifo_index(q), 0)
+
+@test
+fn test_an_empty_queue_has_nothing_to_hand_over() [io]
+    let q = cantxq.queue(4)
+    test.assert_eq(cantxq.dequeue_index(q, key_at), 0 - 1)
+    test.assert_eq(cantxq.dequeue_fifo_index(q), 0 - 1)
+    test.assert_eq(cantxq.lowest_priority_index(q, key_at), 0 - 1)
+
+@test
+fn test_the_frame_to_overwrite_is_the_one_that_loses() [io]
+    test.case("a driver that dropped the NEW frame at a full queue would drop exactly the frame that mattered")
+    var q = cantxq.queue(3)
+    q = cantxq.enqueued(q)
+    q = cantxq.enqueued(q)
+    q = cantxq.enqueued(q)
+    test.assert_eq(cantxq.lowest_priority_index(q, key_at), 0)
+
+@test
+fn test_a_high_priority_frame_displaces_rather_than_being_dropped() [io]
+    var q = cantxq.queue(3)
+    q = cantxq.enqueued(q)
+    q = cantxq.enqueued(q)
+    q = cantxq.enqueued(q)
+
+    test.case("0x050 beats everything queued, so it takes the lowest-priority slot")
+    let urgent = canframe.arbitration_key(canframe.frame(0x050, 0, 0))
+    test.assert(cantxq.should_displace(q, urgent, key_at))
+
+    test.case("0x700 loses to everything queued, so it is the one to drop")
+    let dull = canframe.arbitration_key(canframe.frame(0x700, 0, 0))
+    test.assert(cantxq.should_displace(q, dull, key_at) == false)
+
+@test
+fn test_a_queue_with_room_displaces_nothing() [io]
+    test.case("displacement is what fullness costs, not something a queue does for fun")
+    var q = cantxq.queue(8)
+    q = cantxq.enqueued(q)
+    let urgent = canframe.arbitration_key(canframe.frame(0x050, 0, 0))
+    test.assert(cantxq.should_displace(q, urgent, key_at) == false)
+
+@test
+fn test_a_periodic_sender_can_find_its_own_stale_frame() [io]
+    test.case("a status message every 10 ms into a queue draining slower accumulates copies, and only the newest is worth sending")
+    var q = cantxq.queue(3)
+    q = cantxq.enqueued(q)
+    q = cantxq.enqueued(q)
+    q = cantxq.enqueued(q)
+    test.assert(cantxq.holds_id(q, 0x300, id_at))
+    test.assert(cantxq.holds_id(q, 0x123, id_at) == false)
+    test.assert_eq(cantxq.index_of_id(q, 0x300, id_at), 2)
+    test.assert_eq(cantxq.index_of_id(q, 0x123, id_at), 0 - 1)
+
+@test
+fn test_dequeueing_frees_the_slot() [io]
+    var q = cantxq.queue(3)
+    q = cantxq.enqueued(q)
+    q = cantxq.enqueued(q)
+    q = cantxq.dequeued(q, 0)
+    test.assert_eq(cantxq.len(q), 1)
+    test.assert(cantxq.is_full(q) == false)
+
+@test
+fn test_clearing_counts_what_it_threw_away() [io]
+    test.case("what a driver does on a bus-off transition: a stale actuator command delivered on recovery is worse than none")
+    var q = cantxq.queue(4)
+    q = cantxq.enqueued(q)
+    q = cantxq.enqueued(q)
+    let after = cantxq.cleared(q)
+    test.assert(cantxq.is_empty(after))
+    test.assert_eq(cantxq.dropped(after), 2)
+
+@test
+fn test_a_frame_the_bus_cannot_carry_is_refused_before_it_is_queued() [io]
+    test.case("queueing a frame that will be refused on transmission wastes a slot and delays everything behind it")
+    let q = cantxq.queue(4)
+    test.assert(refused(cantxq.check_enqueue(q, canframe.frame(0x800, 0, 0))))
+    test.assert(refused(cantxq.check_enqueue(q, canframe.frame(0x123, 0, 0))) == false)
+
+@test
+fn test_a_full_queue_refuses_the_enqueue_with_its_capacity_named() [io]
+    var q = cantxq.queue(1)
+    q = cantxq.enqueued(q)
+    test.assert(refused(cantxq.check_enqueue(q, canframe.frame(0x123, 0, 0))))

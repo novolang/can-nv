@@ -1,0 +1,172 @@
+// canbus_tests.nv — error confinement: eight up, one down, and the
+// node alone on a bench.
+//
+// RED ON PURPOSE: every assertion against a FUNCTION reaches
+// `not implemented: can-nv.canbus.<fn>`.
+//
+// THE VECTORS ARE ISO 11898-1 § 12.1's OWN RULES.  A transmit error
+// adds 8, a receive error adds 1, a success subtracts 1, 128 is
+// error-passive, 256 on the transmit counter is bus-off, and recovery
+// takes 128 occurrences of eleven consecutive recessive bits.  Those
+// are six numbers, they are the whole of error confinement, and every
+// assertion below is one of them.
+
+use std.test
+use canbus
+use canframe
+
+// Whether a check refused.  An optional is matched rather than
+// compared, so the two-line helper is what every assertion below
+// goes through.
+fn refused(e: ?CanError) -> Bool
+    match e
+        Some(_) => true
+        None    => false
+
+@test
+fn test_a_fresh_node_is_error_active() [io]
+    let s = canbus.bus_state()
+    test.assert_eq(canbus.tx_errors(s), 0)
+    test.assert_eq(canbus.rx_errors(s), 0)
+    test.assert_eq(canbus.state_of(s), canbus.CAN_STATE_ERROR_ACTIVE)
+    test.assert(canbus.is_error_active(s))
+    test.assert(canbus.may_transmit(s))
+
+@test
+fn test_eight_up_and_one_down_is_the_whole_mechanism() [io]
+    test.case("the asymmetry is what takes a broken transmitter off the bus and leaves an occasional listener alone")
+    test.assert_eq(canbus.CAN_TX_ERROR_WEIGHT, 8)
+    test.assert_eq(canbus.CAN_RX_ERROR_WEIGHT, 1)
+
+    let after_tx = canbus.on_tx_error(canbus.bus_state())
+    test.assert_eq(canbus.tx_errors(after_tx), 8)
+
+    let after_rx = canbus.on_rx_error(canbus.bus_state())
+    test.assert_eq(canbus.rx_errors(after_rx), 1)
+
+    test.case("and a success takes one back")
+    test.assert_eq(canbus.tx_errors(canbus.on_tx_success(after_tx)), 7)
+    test.assert_eq(canbus.rx_errors(canbus.on_rx_success(after_rx)), 0)
+
+@test
+fn test_a_counter_never_goes_below_zero() [io]
+    test.case("a node with a clean bus subtracts forever, and a negative counter would eventually wrap into a confinement state")
+    test.assert_eq(canbus.tx_errors(canbus.on_tx_success(canbus.bus_state())), 0)
+    test.assert_eq(canbus.rx_errors(canbus.on_rx_success(canbus.bus_state())), 0)
+
+@test
+fn test_one_hundred_and_twenty_eight_is_error_passive() [io]
+    test.case("at which point the node may no longer signal an error actively, so a broken node cannot disturb a working bus")
+    test.assert_eq(canbus.CAN_ERROR_PASSIVE_LIMIT, 128)
+    test.assert_eq(canbus.state_of(canbus.bus_state_of(127, 0)),
+                   canbus.CAN_STATE_ERROR_WARNING)
+    test.assert_eq(canbus.state_of(canbus.bus_state_of(128, 0)),
+                   canbus.CAN_STATE_ERROR_PASSIVE)
+
+    test.case("and the RECEIVE counter reaches it on its own terms")
+    test.assert_eq(canbus.state_of(canbus.bus_state_of(0, 128)),
+                   canbus.CAN_STATE_ERROR_PASSIVE)
+
+    test.case("an error-passive node still transmits, which is the difference from bus-off")
+    test.assert(canbus.may_transmit(canbus.bus_state_of(128, 0)))
+    test.assert(canbus.is_error_active(canbus.bus_state_of(128, 0)) == false)
+
+@test
+fn test_the_warning_threshold_is_the_last_cheap_moment() [io]
+    test.case("96 is not a protocol state and every controller reports it, because it is the point at which a problem is still investigable")
+    test.assert_eq(canbus.state_of(canbus.bus_state_of(95, 0)),
+                   canbus.CAN_STATE_ERROR_ACTIVE)
+    test.assert_eq(canbus.state_of(canbus.bus_state_of(96, 0)),
+                   canbus.CAN_STATE_ERROR_WARNING)
+
+@test
+fn test_two_hundred_and_fifty_six_on_the_transmit_counter_is_bus_off() [io]
+    test.case("and only the TRANSMIT counter: a node that only ever hears errors is not the one at fault")
+    test.assert_eq(canbus.CAN_BUS_OFF_LIMIT, 256)
+    test.assert_eq(canbus.state_of(canbus.bus_state_of(256, 0)),
+                   canbus.CAN_STATE_BUS_OFF)
+    test.assert_eq(canbus.state_of(canbus.bus_state_of(0, 256)),
+                   canbus.CAN_STATE_ERROR_PASSIVE)
+
+@test
+fn test_a_bus_off_node_may_not_transmit_at_all() [io]
+    test.case("the question a driver's transmit path asks first — a bus-off node's transmissions never complete, so a retry loop around one never ends")
+    test.assert(canbus.may_transmit(canbus.bus_state_of(256, 0)) == false)
+    test.assert(canbus.may_transmit(canbus.bus_state_of(255, 0)))
+
+@test
+fn test_a_node_alone_on_a_bus_goes_bus_off_in_thirty_two_frames() [io]
+    test.case("with no peer to acknowledge, every transmission is an acknowledgement error — the single most common first experience of CAN")
+    test.assert_eq(canbus.would_go_bus_off_alone(), 32)
+    test.assert_eq(canbus.tx_errors_to_bus_off(canbus.bus_state()), 32)
+
+    test.case("and the number shrinks as the counter climbs, which is what makes it worth putting in a diagnostic")
+    test.assert_eq(canbus.tx_errors_to_bus_off(canbus.bus_state_of(248, 0)), 1)
+    test.assert_eq(canbus.tx_errors_to_bus_off(canbus.bus_state_of(256, 0)), 0)
+
+@test
+fn test_recovery_takes_a_hundred_and_twenty_eight_idle_sequences() [io]
+    test.case("a bus-off node stays off until something asks it back, and then has to see the bus quiet before it may speak")
+    test.assert_eq(canbus.CAN_BUS_OFF_RECOVERY_SEQUENCES, 128)
+    var s = canbus.bus_state_of(256, 0)
+    test.assert(canbus.may_rejoin(s) == false)
+
+    for _seq in 0..canbus.CAN_BUS_OFF_RECOVERY_SEQUENCES
+        s = canbus.on_recovery_sequence(s)
+    test.assert(canbus.may_rejoin(s))
+
+    let back = canbus.rejoined(s)
+    test.assert_eq(canbus.tx_errors(back), 0)
+    test.assert_eq(canbus.state_of(back), canbus.CAN_STATE_ERROR_ACTIVE)
+
+@test
+fn test_an_error_frame_reports_which_kind() [io]
+    test.case("five kinds, and which one it is decides whether to look at the cable or at the other node")
+    test.assert_eq(canbus.CAN_ERR_BIT, 0x01)
+    test.assert_eq(canbus.CAN_ERR_STUFF, 0x02)
+    test.assert_eq(canbus.CAN_ERR_FORM, 0x04)
+    test.assert_eq(canbus.CAN_ERR_CRC, 0x08)
+    test.assert_eq(canbus.CAN_ERR_ACK, 0x10)
+
+    test.case("and a frame that is not an error frame reports nothing")
+    test.assert_eq(canbus.error_kinds(canframe.frame(0x123, 0, 0)), 0)
+
+@test
+fn test_every_state_and_error_kind_has_a_name() [io]
+    test.case("a log of a bus going down is unreadable as integers")
+    test.assert(str.len(canbus.state_name(canbus.CAN_STATE_BUS_OFF)) > 0)
+    test.assert(str.len(canbus.error_kind_name(canbus.CAN_ERR_ACK)) > 0)
+
+@test
+fn test_the_standard_bit_rates_are_the_ones_a_tool_tries() [io]
+    test.case("nine of them, because a tool that does not know a bus's rate tries each in turn")
+    test.assert_eq(canbus.CAN_STANDARD_BITRATES, 9)
+    test.assert_eq(canbus.standard_bitrate(0), 10000)
+    test.assert_eq(canbus.standard_bitrate(4), 125000)
+    test.assert_eq(canbus.standard_bitrate(6), 500000)
+    test.assert_eq(canbus.standard_bitrate(8), 1000000)
+    test.assert_eq(canbus.standard_bitrate(9), 0 - 1)
+
+@test
+fn test_the_sample_point_is_a_number_two_boards_have_to_agree_on() [io]
+    test.case("CiA 301: 87.5% at 500 kbit/s and above, 75% below — and two nodes that disagree work until a cable gets longer")
+    test.assert_eq(canbus.sample_point_permille(500000), 875)
+    test.assert_eq(canbus.sample_point_permille(1000000), 875)
+    test.assert_eq(canbus.sample_point_permille(125000), 750)
+
+@test
+fn test_a_clock_that_cannot_produce_the_rate_is_refused() [io]
+    test.case("a bus 1.2% off works between two boards with the same error and fails against anything else, and the failure looks like a wiring fault")
+    test.assert(canbus.time_quanta(8000000, 500000) > 0)
+    test.assert(refused(canbus.check_timing(8000000, 500000)) == false)
+
+    test.assert_eq(canbus.time_quanta(7000000, 500000), 0 - 1)
+    test.assert(refused(canbus.check_timing(7000000, 500000)))
+
+@test
+fn test_a_state_read_from_a_controllers_registers_is_the_same_type() [io]
+    test.case("a driver that reads counters and a driver that tracks them answer the same value, so a diagnostic is written once")
+    let s = canbus.bus_state_of(130, 5)
+    test.assert_eq(canbus.tx_errors(s), 130)
+    test.assert_eq(canbus.rx_errors(s), 5)
+    test.assert_eq(canbus.state_of(s), canbus.CAN_STATE_ERROR_PASSIVE)

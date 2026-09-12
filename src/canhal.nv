@@ -1,0 +1,248 @@
+// canhal.nv — the peripheral trait, and the boards that have one.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `CanPeripheral[e]` IS THE TRAIT THAT CROSSES THE LAYER, and this
+// package implements it nowhere.  It is `embedded-can`'s shape in
+// novo-lang: transmit, receive, the two questions a driver asks about
+// state, and nothing else.  `cansocket` satisfies it on Linux and a
+// board's driver satisfies it on a device, and the whole rest of this
+// package is written against neither.
+//
+// NEITHER BOARD THIS PROJECT SUPPORTS HAS A CAN CONTROLLER, and saying
+// so is more useful than implying otherwise.  The nRF52840 has none.
+// The RP2040 has none.  What exists on those parts is an external
+// controller over SPI — the MCP2515 for classic CAN, the MCP2518FD for
+// FD — and that is a driver over `orbit/hal`'s SPI trait rather than
+// anything this package can supply.  The parts with a CAN peripheral
+// on the die are STM32 (bxCAN on the F1/F4, FDCAN on the G4/H7), NXP's
+// FlexCAN (i.MX RT, S32K, LPC), the ESP32's TWAI, Atmel SAM C/E, and
+// Infineon AURIX.  `CAN_CONTROLLER_*` below names them so a reader
+// choosing a part has the list in the package rather than in a search.
+//
+// TRANSMISSION IS NOT COMPLETION.  `can_transmit` answers a MAILBOX
+// index, not "sent": a CAN controller accepts a frame into a mailbox
+// and arbitrates for the bus afterwards, which can take arbitrarily
+// long on a busy bus and can fail.  A trait whose transmit answered
+// `Result<(), E>` would have to block, and a driver that blocks in an
+// interrupt handler is a driver that misses frames.  `can_tx_done` is
+// the second half, and `cantxq` is what sits behind it.
+//
+// A MAILBOX DISPLACEMENT IS NOT AN ERROR EITHER.  Every controller
+// with more than one transmit mailbox will, when they are all full,
+// abort the lowest-priority pending frame to make room for a
+// higher-priority one — and the aborted frame's index comes back so
+// the caller can requeue it.  That is `CanTxAccepted`'s second field,
+// and a trait that hid it would lose frames silently.
+
+use canframe
+use canfilter
+
+// ── What a transmit attempt answers ──────────────────────────────────
+
+// Whether a mailbox took the frame, which one, and which frame it
+// displaced.
+//
+// THE ACCEPTANCE CARRIES ITS OWN REFUSAL.  A `@value` struct cannot be
+// a `Result` payload (E2015) and this has to be answerable from an
+// interrupt with nothing on a heap, so `status` is one of the
+// `CAN_TX_*` codes and `tx_fault` turns a refusal into words.  That is
+// the same trade every fallible answer in this package makes.
+pub @value
+struct CanTxAccepted
+    // One of the `CAN_TX_*` codes.
+    status: Int
+    // The mailbox the frame went into, or -1.
+    mailbox: Int
+    // The mailbox whose pending frame was aborted to make room, or -1
+    // when nothing was displaced.  A driver requeues that frame; one
+    // that ignores this field loses it, silently, only under load.
+    displaced: Int
+
+// A mailbox took the frame.
+pub const CAN_TX_ACCEPTED = 0
+// Every mailbox is occupied by a frame that outranks this one.
+pub const CAN_TX_FULL = 1
+// The node is bus-off and may not transmit at all.
+pub const CAN_TX_BUS_OFF = 2
+// The frame itself is not one this bus can carry — an FD frame on a
+// classic controller, an identifier too wide for its format.
+pub const CAN_TX_REFUSED = 3
+
+// Build an acceptance.
+pub fn accepted(mailbox: Int, displaced: Int) -> CanTxAccepted []
+    todo("can-nv.canhal.accepted")
+
+// A refusal with the given `CAN_TX_*` status.
+pub fn tx_refused(status: Int) -> CanTxAccepted []
+    todo("can-nv.canhal.tx_refused")
+
+// Whether a mailbox took the frame.
+pub fn tx_ok(a: CanTxAccepted) -> Bool []
+    todo("can-nv.canhal.tx_ok")
+
+// The `CAN_TX_*` status.
+pub fn tx_status(a: CanTxAccepted) -> Int []
+    todo("can-nv.canhal.tx_status")
+
+// Why the frame was refused, or nothing.
+pub fn tx_fault(a: CanTxAccepted) -> ?CanError []
+    todo("can-nv.canhal.tx_fault")
+
+// Which mailbox took the frame.
+pub fn accepted_mailbox(a: CanTxAccepted) -> Int []
+    todo("can-nv.canhal.accepted_mailbox")
+
+// Which pending frame was displaced, or -1.
+pub fn accepted_displaced(a: CanTxAccepted) -> Int []
+    todo("can-nv.canhal.accepted_displaced")
+
+// Whether anything was displaced.
+pub fn accepted_displaced_any(a: CanTxAccepted) -> Bool []
+    todo("can-nv.canhal.accepted_displaced_any")
+
+// ── The trait ────────────────────────────────────────────────────────
+
+// A CAN controller, on a die or behind a socket.
+//
+// `e` is the effect row the implementation supplies: `[hw]` for a
+// peripheral driver over `orbit/hal`, `[net]` for `cansocket`'s
+// SocketCAN, `[hw, io]` for an MCP2515 over SPI with a chip-select
+// line, and NOTHING for a table in a test.  Every function written
+// over this trait costs what its argument costs (SPEC § 5.6).
+pub trait CanPeripheral[e]
+    // Hand a frame to a transmit mailbox.  The answer says which
+    // mailbox took it and what it displaced; it does NOT say the frame
+    // reached the bus.
+    fn can_transmit(self, f: CanFrame) -> CanTxAccepted [e]
+    // Whether the frame in `mailbox` has reached the bus.
+    fn can_tx_done(self, mailbox: Int) -> Bool [e]
+    // Abort a pending transmission.  What a driver does when a
+    // deadline passes, and the operation a queue cannot be correct
+    // without: a stale actuator command that finally wins arbitration
+    // three seconds late is worse than one that was never sent.
+    fn can_tx_abort(self, mailbox: Int) -> ?CanError [e]
+    // Take the next received frame.
+    //
+    // Answers `canframe.none()` when the bus was quiet and a FAULT
+    // frame when the controller reported one — a `@value` struct
+    // cannot be an optional or a `Result` payload (E2015), so the
+    // frame carries its own status and `canframe.is_none` and
+    // `canframe.is_fault` are the two questions a receive loop asks.
+    //
+    // NOT A BLOCKING READ.  A device driver is called from an
+    // interrupt and a host driver from a poll loop, and a blocking
+    // read would make the first impossible; a caller that wants to
+    // wait waits on its own terms.
+    fn can_receive(self) -> CanFrame [e]
+    // Program one hardware acceptance filter.
+    //
+    // `slot` is the controller's own filter index, and how many there
+    // are is the controller's business — `canfilter.merge` is what a
+    // driver with more filters than slots uses.
+    fn can_set_filter(self, slot: Int, f: CanFilter) -> ?CanError [e]
+    // How many hardware filter slots this controller has.  Answered
+    // without performing anything, because a driver asks it once at
+    // startup and a question that cost `[hw]` would be a question a
+    // caller caches.
+    fn can_filter_slots(self) -> Int
+    // The error counters and confinement state.  Reading a
+    // controller's counters cannot fail, which is why this is the one
+    // method with no way to refuse.
+    fn can_bus_state(self) -> CanBusState [e]
+    // Bring a bus-off controller back.  The one operation that is
+    // neither transmit nor receive and that every controller needs,
+    // because a node that has taken itself off the bus stays off until
+    // something asks it to come back.
+    fn can_recover(self) -> ?CanError [e]
+
+// ── Driving one ──────────────────────────────────────────────────────
+
+// Transmit a frame, refusing rather than trying when the node is
+// bus-off.
+//
+// `[e]`, so the cost is the peripheral's.  The check is worth writing
+// once here because a driver that omits it spins: a bus-off
+// controller's transmissions never complete, so a retry loop around
+// one never ends.
+pub fn transmit_checked<P: CanPeripheral[e]>(p: P, f: CanFrame) -> CanTxAccepted [e]
+    todo("can-nv.canhal.transmit_checked")
+
+// Take the next frame the filter accepts, discarding up to `limit`
+// frames that it does not.
+//
+// The software half of filtering, for a driver with more filters than
+// its controller has slots: the widened filter is in the hardware and
+// the precise one is here.  A `CanFilter` rather than a predicate,
+// because a `@value` struct cannot appear in a fn value's signature
+// (E2015) — and because a filter value is what the hardware was
+// programmed with, so the two halves cannot drift apart.
+//
+// Answers `canframe.none()` when `limit` frames went by without a
+// match.
+pub fn receive_filtered<P: CanPeripheral[e]>(p: P, filt: CanFilter, limit: Int) -> CanFrame [e]
+    todo("can-nv.canhal.receive_filtered")
+
+// Recover a bus-off node, doing nothing when it is not bus-off.
+pub fn recover_if_bus_off<P: CanPeripheral[e]>(p: P) -> ?CanError [e]
+    todo("can-nv.canhal.recover_if_bus_off")
+
+// ── Which parts have a controller ────────────────────────────────────
+
+// No CAN controller on the die.  What the nRF52840 and the RP2040
+// answer, and the reason a board built on either needs an MCP2515 or
+// an MCP2518FD over SPI.
+pub const CAN_CONTROLLER_NONE = 0
+// STM32's bxCAN — classic CAN only, on the F1, F4 and L4 families.
+pub const CAN_CONTROLLER_BXCAN = 1
+// STM32's FDCAN — classic and FD, on the G0, G4, H7 and U5 families.
+pub const CAN_CONTROLLER_FDCAN = 2
+// NXP's FlexCAN — i.MX RT, S32K, LPC.
+pub const CAN_CONTROLLER_FLEXCAN = 3
+// Espressif's TWAI, which is a CAN 2.0B controller under a name that
+// avoids the trademark.  Classic only.
+pub const CAN_CONTROLLER_TWAI = 4
+// Microchip's MCP2515: an external classic controller over SPI, and
+// the usual answer for a board whose part has none.
+pub const CAN_CONTROLLER_MCP2515 = 5
+// Microchip's MCP2518FD: the same, with FD.
+pub const CAN_CONTROLLER_MCP2518FD = 6
+// Linux's SocketCAN, which is not a controller but is what a host
+// program talks to.
+pub const CAN_CONTROLLER_SOCKETCAN = 7
+
+// What the named board carries.
+//
+// A function rather than a table in the README, so a build for a board
+// with no controller can fail at compile time with a name in the
+// message rather than at runtime on a bench.  `nrf52840-dk`,
+// `nrf52832-dk` and `rp2040` all answer `CAN_CONTROLLER_NONE`, which
+// is the fact this package most needs to state plainly.
+//
+// ```novo
+// use canhal
+//
+// fn main() [io]
+//     println("${canhal.controller_of("nrf52840-dk")}")   // 0, there is none
+// ```
+pub fn controller_of(board: Str) -> Int []
+    todo("can-nv.canhal.controller_of")
+
+// Whether a controller handles CAN FD.
+pub fn supports_fd(controller: Int) -> Bool []
+    todo("can-nv.canhal.supports_fd")
+
+// How many hardware acceptance filter slots a controller typically
+// has.
+//
+// The number that decides whether `canfilter.merge` is needed:
+// bxCAN has 14 banks shared between two instances, FlexCAN has 8 to
+// 128 message buffers depending on the part, and the MCP2515 has 6.
+// A driver asks this once and either programs its filters or widens
+// them.
+pub fn filter_slots_of(controller: Int) -> Int []
+    todo("can-nv.canhal.filter_slots_of")
+
+// A controller in words, for a log or a build diagnostic.
+pub fn controller_name(controller: Int) -> Str []
+    todo("can-nv.canhal.controller_name")

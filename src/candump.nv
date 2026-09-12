@@ -1,0 +1,188 @@
+// candump.nv — the log line every CAN tool prints, read and written.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE FORMAT IS A DE FACTO STANDARD AND THAT IS WHY IT IS HERE.
+// `candump` ships with can-utils on every Linux machine that speaks
+// CAN, its output is what every question on every forum is pasted in,
+// and its log files are what a car's traffic gets handed over as.  A
+// package that spoke a format of its own would be a package whose
+// captures no other tool could read.
+//
+// A LIBRARY DOES NOT PRINT.  These functions RETURN the line and PARSE
+// one, and the writing is the caller's — so `[]` throughout and this
+// module builds for a device, which is what a firmware with a debug
+// UART actually wants.
+//
+// READING MATTERS AS MUCH AS WRITING, and more for testing: a captured
+// log replayed through `parse_line` is a table-driven test of a whole
+// application, with no bus and no hardware, and that is the shape this
+// project prefers everywhere else too.
+//
+// THE TIMESTAMP IS THE CALLER'S.  A `core` package has no clock, so a
+// line is rendered with the timestamp the caller supplies and a line
+// with none is rendered without one.
+
+use canframe
+
+// ── The line ─────────────────────────────────────────────────────────
+
+// One log line's worth of facts.
+//
+// A plain struct rather than a `@value` one: `interface` is text, and
+// the type is for a host reading a capture file.  A device rendering a
+// line uses `render_frame` below and never builds one of these.
+//
+// THE FRAME IS FOUR FLAT FIELDS.  A boxed struct stores pointer-shaped
+// slots, so a `@value` struct cannot be one of its fields (E2015) —
+// `line_frame` assembles a `CanFrame` from them, which costs a caller
+// one call and keeps `CanFrame` unboxed everywhere it matters.
+pub struct CanLogLine
+    // Which interface the frame was seen on — `can0`, `vcan1`.
+    interface: Str
+    // Seconds since the epoch, or -1 when the line carried no
+    // timestamp.
+    seconds: Int
+    // Microseconds within the second.
+    micros: Int
+    // The frame's identifier.
+    id: Int
+    // The frame's `CAN_FLAG_*` bits.
+    flags: Int
+    // The frame's payload length.
+    len: Int
+    // The frame's packed payload.
+    data: Int
+
+// Render a frame in candump's own shape:
+// `can0  123   [3]  11 22 33`.
+//
+// Two spaces after the interface, the identifier in upper-case hex
+// padded to three or eight digits by format, the length in brackets,
+// and the payload bytes in upper-case hex separated by single spaces.
+// A remote frame renders `remote request` in place of the payload,
+// which is what candump does and what a parser on the other end
+// expects.
+//
+// ```novo
+// use candump
+// use canframe
+//
+// fn main() [io]
+//     println(candump.render_frame("can0", canframe.frame(0x123, 3, 0x332211)))
+// ```
+pub fn render_frame(interface: Str, f: CanFrame) -> Str []
+    todo("can-nv.candump.render_frame")
+
+// The same with candump's absolute timestamp in front:
+// `(1234567890.123456) can0  123   [3]  11 22 33`.
+//
+// The seconds and microseconds are the caller's, because a `core`
+// package has no clock — which also makes a rendered log
+// reproducible, and a reproducible log is a log a test can compare
+// byte for byte.
+pub fn render_line(interface: Str, seconds: Int, micros: Int, f: CanFrame) -> Str []
+    todo("can-nv.candump.render_line")
+
+// Parse one candump line, with or without a timestamp.
+//
+// ```novo
+// use candump
+//
+// fn main() [io]
+//     match candump.parse_line("can0  123   [3]  11 22 33")
+//         Ok(l)  => println("${candump.line_interface(l)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_line(line: Str) -> Result<CanLogLine, CanError> []
+    todo("can-nv.candump.parse_line")
+
+// The interface a parsed line named.
+pub fn line_interface(l: CanLogLine) -> Str []
+    todo("can-nv.candump.line_interface")
+
+// The seconds a parsed line carried, or -1.
+pub fn line_seconds(l: CanLogLine) -> Int []
+    todo("can-nv.candump.line_seconds")
+
+// The microseconds a parsed line carried.
+pub fn line_micros(l: CanLogLine) -> Int []
+    todo("can-nv.candump.line_micros")
+
+// The frame a parsed line carried.
+pub fn line_frame(l: CanLogLine) -> CanFrame []
+    todo("can-nv.candump.line_frame")
+
+// Whether a parsed line carried a timestamp at all.
+pub fn line_has_time(l: CanLogLine) -> Bool []
+    todo("can-nv.candump.line_has_time")
+
+// ── The compact form ─────────────────────────────────────────────────
+
+// Render a frame in the `cansend` argument shape: `123#112233`.
+//
+// The form a person types and the form a log-replay script passes on a
+// command line, so a package that renders captures should render this
+// one too.  An extended identifier is eight hex digits, a remote frame
+// is `123#R3`, and a CAN FD frame uses `##` with a flags nibble — all
+// of which are can-utils conventions rather than anything in the
+// specification, and all of which a tool that means to interoperate
+// has to match exactly.
+//
+// ```novo
+// use candump
+// use canframe
+//
+// fn main() [io]
+//     println(candump.render_compact(canframe.frame(0x123, 3, 0x332211)))
+// ```
+pub fn render_compact(f: CanFrame) -> Str []
+    todo("can-nv.candump.render_compact")
+
+// Parse the compact form.
+//
+// Answers a FAULT FRAME on bad input rather than a `Result`, because a
+// `@value` struct cannot be a `Result` payload (E2015).
+// `canframe.is_fault` is the question and `canframe.fault_of` is the
+// reason — the same shape every fallible answer in this package has.
+pub fn parse_compact(s: Str) -> CanFrame []
+    todo("can-nv.candump.parse_compact")
+
+// Render a CAN FD frame's header in the compact form, with the payload
+// bytes the caller supplies through `byte_at`.
+//
+// A named function rather than a lambda, because a lambda that becomes
+// a value at `@tier(embedded)` is refused — and because the caller's
+// payload is in the caller's buffer, which is where an FD payload
+// lives.
+pub fn render_fd_compact(f: CanFdFrame, byte_at: fn(Int) -> Int) -> Str []
+    todo("can-nv.candump.render_fd_compact")
+
+// ── The bytes on their own ───────────────────────────────────────────
+
+// A payload rendered as upper-case hex pairs separated by single
+// spaces: `11 22 33`.
+//
+// The half of a line a firmware with a debug UART wants without the
+// rest, and the reason this module is `core` rather than a host
+// utility.
+pub fn render_payload(f: CanFrame) -> Str []
+    todo("can-nv.candump.render_payload")
+
+// An identifier rendered as candump renders it: three upper-case hex
+// digits for a standard identifier and eight for an extended one.
+//
+// The padding is not decoration.  `123` and `00000123` are different
+// frames on the same bus, and the digit count is the only thing in the
+// line that says which — so a renderer that trimmed leading zeros
+// would produce logs that cannot be read back correctly.
+//
+// ```novo
+// use candump
+//
+// fn main() [io]
+//     println(candump.render_id(0x123, false))   // 123
+//     println(candump.render_id(0x123, true))    // 00000123
+// ```
+pub fn render_id(id: Int, extended: Bool) -> Str []
+    todo("can-nv.candump.render_id")

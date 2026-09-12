@@ -1,0 +1,150 @@
+// canfilter_tests.nv — the acceptance arithmetic, and the merge that
+// fits nine filters into four hardware slots.
+//
+// RED ON PURPOSE: every assertion against a FUNCTION reaches
+// `not implemented: can-nv.canfilter.<fn>`.
+//
+// THE VECTOR IS SocketCAN's `struct can_filter`, which is the same
+// arithmetic every CAN controller's acceptance hardware does: mask the
+// arriving identifier, mask the configured one, compare.  The
+// assertions below are that rule and its three consequences — a wider
+// mask accepts more, an inverted filter accepts the complement, and a
+// filter over one identifier width never matches the other.
+
+use std.test
+use canfilter
+use canframe
+
+// Whether a check refused.  An optional is matched rather than
+// compared, so the two-line helper is what every assertion below
+// goes through.
+fn refused(e: ?CanError) -> Bool
+    match e
+        Some(_) => true
+        None    => false
+
+@test
+fn test_a_bit_set_in_the_mask_is_a_bit_that_must_match() [io]
+    test.case("0x100 through 0x700 accepts the whole 0x100 block and nothing else")
+    let f = canfilter.filter(0x100, 0x700)
+    test.assert(canfilter.accepts_id(f, 0x100, false))
+    test.assert(canfilter.accepts_id(f, 0x1FF, false))
+    test.assert(canfilter.accepts_id(f, 0x0FF, false) == false)
+    test.assert(canfilter.accepts_id(f, 0x200, false) == false)
+
+@test
+fn test_a_mask_of_zero_accepts_everything() [io]
+    test.case("no bit has to match, which is what accept_all is")
+    test.assert(canfilter.accepts_id(canfilter.accept_all(), 0x000, false))
+    test.assert(canfilter.accepts_id(canfilter.accept_all(), 0x7FF, false))
+    test.assert_eq(canfilter.width(canfilter.accept_all()), 2048)
+
+@test
+fn test_a_full_mask_accepts_exactly_one_identifier() [io]
+    let f = canfilter.exact(0x123)
+    test.assert(canfilter.accepts_id(f, 0x123, false))
+    test.assert(canfilter.accepts_id(f, 0x124, false) == false)
+    test.assert_eq(canfilter.width(f), 1)
+    test.assert_eq(canfilter.filter_mask(f), canframe.CAN_SFF_MASK)
+
+@test
+fn test_a_filter_over_one_identifier_width_never_matches_the_other() [io]
+    test.case("a separate check from the mask, and the one a caller forgets — an extended frame with the same number is a different frame")
+    let std = canfilter.filter(0x100, 0x700)
+    test.assert(canfilter.accepts_id(std, 0x100, true) == false)
+
+    let ext = canfilter.filter_ext(0x100, 0x700)
+    test.assert(canfilter.accepts_id(ext, 0x100, false) == false)
+    test.assert(canfilter.accepts_id(ext, 0x100, true))
+
+@test
+fn test_inverting_the_sense_accepts_the_complement() [io]
+    test.case("SocketCAN's CAN_INV_FILTER, and the shape a caller wants for everything-except")
+    let f = canfilter.filter(0x100, 0x700)
+    let inv = canfilter.inverted(f)
+    test.assert(canfilter.filter_is_inverted(inv))
+    test.assert(canfilter.accepts_id(inv, 0x1FF, false) == false)
+    test.assert(canfilter.accepts_id(inv, 0x2FF, false))
+
+    test.case("and inverting twice is the original")
+    test.assert(canfilter.filter_is_inverted(canfilter.inverted(inv)) == false)
+
+@test
+fn test_remote_frames_are_excluded_unless_the_caller_asks() [io]
+    test.case("a node that answers its own remote frames is a surprise, so it is opt-in")
+    let f = canfilter.exact(0x123)
+    test.assert(canfilter.accepts(f, canframe.frame(0x123, 0, 0)))
+    test.assert(canfilter.accepts(f, canframe.remote_frame(0x123, 8)) == false)
+    test.assert(canfilter.accepts(canfilter.allowing_remote(f),
+                                  canframe.remote_frame(0x123, 8)))
+
+@test
+fn test_the_width_says_whether_a_filter_is_doing_its_job() [io]
+    test.case("a filter a caller believed was narrow answering 512 is the bug found before it reaches a bus")
+    test.assert_eq(canfilter.width(canfilter.filter(0x100, 0x700)), 256)
+    test.assert_eq(canfilter.width(canfilter.filter(0x100, 0x7F0)), 16)
+    test.assert_eq(canfilter.width(canfilter.filter(0x100, 0x400)), 1024)
+
+@test
+fn test_a_filter_with_bits_outside_its_mask_can_never_match() [io]
+    test.case("the comparison masks both sides, so those bits change nothing and the filter accepts more than its author wrote")
+    test.assert(refused(canfilter.check_filter(canfilter.filter(0x123, 0x700))))
+
+    test.case("and a filter whose identifier is already inside its mask has nothing to say")
+    test.assert(refused(canfilter.check_filter(canfilter.filter(0x100, 0x700))) == false)
+
+@test
+fn test_a_merge_never_rejects_what_either_input_accepted() [io]
+    test.case("the property that makes it safe to program into hardware and evaluate the precise filters in software afterwards")
+    let a = canfilter.exact(0x100)
+    let b = canfilter.exact(0x101)
+    let m = canfilter.merge(a, b)
+    test.assert(canfilter.accepts_id(m, 0x100, false))
+    test.assert(canfilter.accepts_id(m, 0x101, false))
+    test.assert_eq(canfilter.width(m), 2)
+
+    test.case("two identifiers that differ in a high bit cost more")
+    let wide = canfilter.merge(canfilter.exact(0x100), canfilter.exact(0x200))
+    test.assert(canfilter.accepts_id(wide, 0x100, false))
+    test.assert(canfilter.accepts_id(wide, 0x200, false))
+    test.assert(canfilter.width(wide) > 2)
+
+@test
+fn test_the_cost_of_a_merge_is_a_number_a_driver_can_budget() [io]
+    test.case("a merge that lets through 4096 extra identifiers on a bus carrying 200 has switched the filter off")
+    test.assert_eq(canfilter.false_accept_width(canfilter.exact(0x100),
+                                                canfilter.exact(0x101)),
+                                                0)
+    test.assert(canfilter.false_accept_width(canfilter.exact(0x100),
+                                             canfilter.exact(0x200)) > 0)
+
+@test
+fn test_two_filters_of_different_widths_cannot_be_merged() [io]
+    test.case("the question to ask before merging, because there is no single filter that covers both formats")
+    test.assert(canfilter.can_merge(canfilter.exact(0x100),
+                                    canfilter.exact(0x101)))
+    test.assert(canfilter.can_merge(canfilter.exact(0x100),
+                                    canfilter.exact_ext(0x101)) == false)
+    test.case("nor can an inverted filter be merged with an ordinary one")
+    test.assert(canfilter.can_merge(canfilter.exact(0x100),
+                                    canfilter.inverted(canfilter.exact(0x101))) == false)
+
+@test
+fn test_a_redundant_filter_is_findable() [io]
+    test.case("the other half of fitting nine filters into four slots: two of the nine are the same filter written twice")
+    let wide = canfilter.filter(0x100, 0x700)
+    let narrow = canfilter.exact(0x123)
+    test.assert(canfilter.covers(wide, narrow))
+    test.assert(canfilter.covers(narrow, wide) == false)
+    test.assert(canfilter.covers(canfilter.accept_all(), wide))
+
+@test
+fn test_overlap_is_not_coverage() [io]
+    test.case("two filters can share identifiers without either containing the other, which is why both questions exist")
+    let a = canfilter.filter(0x100, 0x700)
+    let b = canfilter.filter(0x120, 0x7E0)
+    test.assert(canfilter.overlaps(a, b))
+    test.assert(canfilter.covers(b, a) == false)
+
+    test.assert(canfilter.overlaps(canfilter.exact(0x100),
+                                   canfilter.exact(0x200)) == false)

@@ -1,0 +1,237 @@
+// canisotp_tests.nv — ISO 15765-2: the four frame types, the flow
+// control handshake, and the separation time byte that is not linear.
+//
+// RED ON PURPOSE: every assertion against a FUNCTION reaches
+// `not implemented: can-nv.canisotp.<fn>`.
+//
+// THE VECTORS ARE ISO 15765-2:2016's OWN TABLES.  The protocol control
+// information nibbles are table 9; the separation time encoding —
+// 0x00 to 0x7F milliseconds, 0xF1 to 0xF9 as 100 to 900 microseconds,
+// everything else reserved — is table 18; the timer names and their
+// 1000 ms defaults are table 20.  A first frame carrying 0x10 0x14 is
+// the canonical example every implementation is tested against: a
+// twenty-byte message.
+
+use std.test
+use canisotp
+use canframe
+
+// Whether a check refused.  An optional is matched rather than
+// compared, so the two-line helper is what every assertion below
+// goes through.
+fn refused(e: ?CanError) -> Bool
+    match e
+        Some(_) => true
+        None    => false
+
+fn first_of_twenty() -> CanFrame
+    canframe.frame(0x7E8, 8, canframe.pack2(0x10, 0x14))
+
+@test
+fn test_the_high_nibble_of_the_first_byte_names_the_frame_type() [io]
+    test.case("ISO 15765-2 table 9: 0 single, 1 first, 2 consecutive, 3 flow control")
+    test.assert_eq(canisotp.pci_type(canframe.frame(0x7E0, 8, 0x02)),
+                   canisotp.CAN_ISOTP_SINGLE)
+    test.assert_eq(canisotp.pci_type(first_of_twenty()),
+                   canisotp.CAN_ISOTP_FIRST)
+    test.assert_eq(canisotp.pci_type(canframe.frame(0x7E8, 8, 0x21)),
+                   canisotp.CAN_ISOTP_CONSECUTIVE)
+    test.assert_eq(canisotp.pci_type(canframe.frame(0x7E0, 3, 0x30)),
+                   canisotp.CAN_ISOTP_FLOW)
+
+@test
+fn test_a_first_frames_length_is_twelve_bits_across_two_bytes() [io]
+    test.case("0x10 0x14 is twenty bytes, and twelve bits is where the 4095 limit comes from")
+    test.assert_eq(canisotp.first_len(first_of_twenty()), 20)
+    test.assert_eq(canisotp.CAN_ISOTP_MAX_MESSAGE, 4095)
+
+    test.case("0x1F 0xFF is the longest a first frame can declare")
+    test.assert_eq(canisotp.first_len(canframe.frame(0x7E8, 8,
+                                                     canframe.pack2(0x1F, 0xFF))),
+                                                     4095)
+
+@test
+fn test_a_single_frame_is_the_whole_message() [io]
+    test.assert_eq(canisotp.single_len(canframe.frame(0x7E0, 8, 0x02)), 2)
+    test.assert_eq(canisotp.CAN_ISOTP_SINGLE_MAX, 7)
+
+    test.case("and asking a frame that is not one answers -1 rather than a plausible length")
+    test.assert_eq(canisotp.single_len(first_of_twenty()), 0 - 1)
+
+@test
+fn test_a_consecutive_frames_sequence_number_starts_at_one() [io]
+    test.case("the first frame is implicitly 0, so a sender that numbered its first consecutive frame 0 has its whole message rejected")
+    test.assert_eq(canisotp.consecutive_index(canframe.frame(0x7E8, 8, 0x21)), 1)
+    test.assert_eq(canisotp.consecutive_index(canframe.frame(0x7E8, 8, 0x2F)), 15)
+
+    test.case("and it wraps at sixteen rather than stopping")
+    test.assert_eq(canisotp.next_index(15), 0)
+    test.assert_eq(canisotp.next_index(0), 1)
+    test.assert_eq(canisotp.next_index(1), 2)
+
+@test
+fn test_the_separation_time_byte_is_not_linear() [io]
+    test.case("ISO 15765-2 table 18: 0x00 to 0x7F are milliseconds and 0xF1 to 0xF9 are 100 to 900 microseconds")
+    test.assert_eq(canisotp.st_min_us(0x00), 0)
+    test.assert_eq(canisotp.st_min_us(0x0A), 10000)
+    test.assert_eq(canisotp.st_min_us(0x7F), 127000)
+    test.assert_eq(canisotp.st_min_us(0xF1), 100)
+    test.assert_eq(canisotp.st_min_us(0xF9), 900)
+
+    test.case("a reserved value is treated as 127 ms, which is what a conforming receiver does rather than guessing")
+    test.assert_eq(canisotp.st_min_us(0x80), 127000)
+    test.assert_eq(canisotp.st_min_us(0xFA), 127000)
+
+    test.case("a sender that read 0xF1 as 241 milliseconds is 2400 times too slow")
+    test.assert(canisotp.st_min_us(0xF1) != 241000)
+
+@test
+fn test_the_encoding_goes_back_the_other_way_rounding_up() [io]
+    test.case("rounding UP, because a separation time shorter than the receiver asked for overruns it")
+    test.assert_eq(canisotp.st_min_encode(100), 0xF1)
+    test.assert_eq(canisotp.st_min_encode(10000), 0x0A)
+    test.assert_eq(canisotp.st_min_encode(0), 0x00)
+
+@test
+fn test_a_flow_control_frame_carries_three_numbers() [io]
+    test.case("the status, the block size and the separation time — which together are the whole of what makes ISO-TP survive a real bus")
+    let f = canisotp.flow_frame(0x7E0, canisotp.CAN_ISOTP_CONTINUE, 8, 0xF1)
+    test.assert_eq(canframe.frame_byte(f, 0), 0x30)
+    test.assert_eq(canframe.frame_byte(f, 1), 8)
+    test.assert_eq(canframe.frame_byte(f, 2), 0xF1)
+    test.assert_eq(canisotp.flow_status(f), canisotp.CAN_ISOTP_CONTINUE)
+    test.assert_eq(canisotp.flow_block_size(f), 8)
+
+@test
+fn test_a_block_size_of_zero_means_no_limit() [io]
+    test.case("what a host with plenty of buffer asks for, and what a microcontroller must not")
+    test.assert_eq(canisotp.CAN_ISOTP_NO_BLOCK_LIMIT, 0)
+    let f = canisotp.flow_frame(0x7E0, canisotp.CAN_ISOTP_CONTINUE, 0, 0)
+    test.assert_eq(canisotp.flow_block_size(f), 0)
+
+@test
+fn test_a_message_longer_than_the_buffer_is_refused_before_it_starts() [io]
+    test.case("an overflow is the receiver saying so in a frame, not a truncated reassembly nobody notices")
+    test.assert(canisotp.should_send_overflow(4095, 64))
+    test.assert(canisotp.should_send_overflow(20, 64) == false)
+
+    let s = canisotp.begin_receive(canisotp.session(),
+                                   canframe.frame(0x7E8, 8,
+                                                  canframe.pack2(0x1F, 0xFF)),
+                                                  64)
+    test.assert_eq(canisotp.session_state(s), canisotp.CAN_ISOTP_STATE_FAILED)
+    test.assert(refused(canisotp.session_fault(s)))
+
+@test
+fn test_a_twenty_byte_message_takes_two_consecutive_frames() [io]
+    test.case("six bytes in the first frame, seven in each consecutive one")
+    test.assert_eq(canisotp.CAN_ISOTP_FIRST_MAX, 6)
+    test.assert_eq(canisotp.CAN_ISOTP_CONSECUTIVE_MAX, 7)
+    test.assert_eq(canisotp.consecutive_count(20), 2)
+    test.assert_eq(canisotp.consecutive_count(13), 1)
+    test.assert_eq(canisotp.consecutive_count(14), 2)
+
+@test
+fn test_a_receive_begins_from_a_first_frame() [io]
+    var s = canisotp.begin_receive(canisotp.session(), first_of_twenty(), 64)
+    test.assert_eq(canisotp.session_state(s), canisotp.CAN_ISOTP_STATE_RECEIVING)
+    test.assert_eq(canisotp.session_total(s), 20)
+    test.assert_eq(canisotp.session_done(s), 6)
+    test.assert_eq(canisotp.session_index(s), 1)
+    test.assert(canisotp.session_is_finished(s) == false)
+
+@test
+fn test_a_consecutive_frame_out_of_order_fails_the_transfer() [io]
+    test.case("ISO-TP has no retransmission, so a gap means a lost frame and a receiver that carried on would hand its caller a message with a hole in it")
+    var s = canisotp.begin_receive(canisotp.session(), first_of_twenty(), 64)
+    s = canisotp.take_consecutive(s, canframe.frame(0x7E8, 8, 0x22))
+    test.assert_eq(canisotp.session_state(s), canisotp.CAN_ISOTP_STATE_FAILED)
+    test.assert(refused(canisotp.session_fault(s)))
+
+@test
+fn test_the_right_consecutive_frame_advances_it() [io]
+    var s = canisotp.begin_receive(canisotp.session(), first_of_twenty(), 64)
+    s = canisotp.take_consecutive(s, canframe.frame(0x7E8, 8, 0x21))
+    test.assert_eq(canisotp.session_index(s), 2)
+    test.assert_eq(canisotp.session_done(s), 13)
+    test.assert(canisotp.session_is_finished(s) == false)
+
+@test
+fn test_a_wait_is_counted_and_a_stalled_transfer_ends() [io]
+    test.case("a receiver may say wait as often as it likes, so the sender needs a limit or a stalled transfer is forever")
+    test.assert_eq(canisotp.CAN_ISOTP_MAX_WAITS, 10)
+    var s = canisotp.begin_send(canisotp.session(), 20)
+    s = canisotp.take_flow(s, canisotp.flow_frame(0x7E0, canisotp.CAN_ISOTP_WAIT, 0, 0))
+    test.assert_eq(canisotp.session_waits(s), 1)
+    test.assert_eq(canisotp.session_state(s), canisotp.CAN_ISOTP_STATE_WAIT_FLOW)
+
+@test
+fn test_a_continue_adopts_the_receivers_terms() [io]
+    test.case("the block size and separation time are the RECEIVER's to choose, which is the whole point of the handshake")
+    var s = canisotp.begin_send(canisotp.session(), 20)
+    s = canisotp.take_flow(s, canisotp.flow_frame(0x7E0, canisotp.CAN_ISOTP_CONTINUE,
+                                                  4, 0xF1))
+    test.assert_eq(canisotp.session_state(s), canisotp.CAN_ISOTP_STATE_SENDING)
+    test.assert_eq(canisotp.session_block_left(s), 4)
+    test.assert_eq(canisotp.session_st_min_us(s), 100)
+
+@test
+fn test_an_overflow_ends_the_transfer_from_the_senders_side_too() [io]
+    var s = canisotp.begin_send(canisotp.session(), 4000)
+    s = canisotp.take_flow(s, canisotp.flow_frame(0x7E0, canisotp.CAN_ISOTP_OVERFLOW,
+                                                  0, 0))
+    test.assert_eq(canisotp.session_state(s), canisotp.CAN_ISOTP_STATE_FAILED)
+    test.assert(canisotp.session_is_finished(s))
+
+@test
+fn test_a_flow_control_frame_is_due_when_the_block_runs_out() [io]
+    var s = canisotp.begin_send(canisotp.session(), 20)
+    s = canisotp.take_flow(s, canisotp.flow_frame(0x7E0, canisotp.CAN_ISOTP_CONTINUE,
+                                                  1, 0))
+    test.assert(canisotp.flow_due(s) == false)
+    s = canisotp.sent_consecutive(s, 7)
+    test.assert(canisotp.flow_due(s))
+
+@test
+fn test_the_three_timers_are_a_thousand_milliseconds_each() [io]
+    test.case("ISO 15765-2 table 20, and four separate names because four different faults share one symptom")
+    test.assert_eq(canisotp.CAN_ISOTP_N_AS_MS, 1000)
+    test.assert_eq(canisotp.CAN_ISOTP_N_BS_MS, 1000)
+    test.assert_eq(canisotp.CAN_ISOTP_N_CR_MS, 1000)
+
+@test
+fn test_a_deadline_is_answered_rather_than_waited_for() [io]
+    test.case("a core package has no clock, which is also what makes the four timers a table rather than a bus run")
+    let s = canisotp.begin_send(canisotp.session(), 20)
+    test.assert_eq(canisotp.deadline_ms(s, 5000), 6000)
+    test.assert(canisotp.timed_out(s, 5000, 5999) == false)
+    test.assert(canisotp.timed_out(s, 5000, 6001))
+
+    let after = canisotp.on_timeout(s)
+    test.assert_eq(canisotp.session_state(after), canisotp.CAN_ISOTP_STATE_FAILED)
+    test.assert(refused(canisotp.session_fault(after)))
+
+@test
+fn test_extended_addressing_costs_one_byte_everywhere() [io]
+    test.case("the first payload byte becomes an address and everything shifts down, so a single frame carries six rather than seven")
+    test.assert_eq(canisotp.addressing_overhead(false), 0)
+    test.assert_eq(canisotp.addressing_overhead(true), 1)
+    test.assert_eq(canisotp.single_max(false), 7)
+    test.assert_eq(canisotp.single_max(true), 6)
+    test.assert_eq(canisotp.consecutive_max(false), 7)
+    test.assert_eq(canisotp.consecutive_max(true), 6)
+
+@test
+fn test_the_frame_builders_produce_what_the_readers_read() [io]
+    test.case("a round trip, which is the property a codec is for")
+    let sf = canisotp.single_frame(0x7E0, canframe.pack2(0x10, 0x00), 2)
+    test.assert_eq(canisotp.pci_type(sf), canisotp.CAN_ISOTP_SINGLE)
+    test.assert_eq(canisotp.single_len(sf), 2)
+
+    let ff = canisotp.first_frame(0x7E8, 20, 0)
+    test.assert_eq(canisotp.pci_type(ff), canisotp.CAN_ISOTP_FIRST)
+    test.assert_eq(canisotp.first_len(ff), 20)
+
+    let cf = canisotp.consecutive_frame(0x7E8, 3, 0, 7)
+    test.assert_eq(canisotp.pci_type(cf), canisotp.CAN_ISOTP_CONSECUTIVE)
+    test.assert_eq(canisotp.consecutive_index(cf), 3)

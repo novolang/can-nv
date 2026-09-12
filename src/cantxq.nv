@@ -1,0 +1,209 @@
+// cantxq.nv — a bounded transmit queue that does not invert the bus's
+// own ordering.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A FIFO IS THE WRONG QUEUE FOR CAN, and that is the only reason this
+// module exists.  CAN arbitration is by identifier: when two nodes
+// start a frame at the same moment the numerically smaller identifier
+// wins and the other backs off and retries.  That is a real-time
+// guarantee — the highest-priority message on a bus has a bounded
+// latency — and a transmit queue that sends in arrival order throws it
+// away.  An emergency stop sitting behind six telemetry frames is a
+// priority inversion the protocol went to some trouble to prevent, and
+// nothing in a FIFO can notice it.
+//
+// So `dequeue_index` answers the queued frame that WINS ARBITRATION
+// rather than the oldest, and `dequeue_fifo_index` is there beside it
+// for the caller who really does want arrival order — a logger
+// replaying a capture, a test that must be deterministic.  Both are
+// named, so a driver's choice is visible at its call site rather than
+// implied by which package it picked.
+//
+// THE STORAGE IS THE CALLER'S.  This module holds heapless-nv's
+// bookkeeping and answers INDICES into an array the caller owns —
+// which on a device is a fixed `[CanFrame; N]` in a `.bss` section
+// sized to that product's burst.  A queue that owned its frames would
+// have to allocate, and a `@value` struct cannot own a buffer anyway
+// (SPEC § 14.3).
+//
+// NOT IN THE DEVICE PROBE, on purpose.  This is the one module in the
+// package that names a dependency, and keeping it out of
+// `tests/embedded_probe.nv` keeps the probe's closure to this
+// package's own sources.  It would build for a device — heapless-nv
+// makes its own claim — and the README says so.
+
+use canframe
+
+// ── The queue ────────────────────────────────────────────────────────
+
+// A bounded transmit queue: which slots of the caller's array are
+// occupied, and in what order they arrived.
+//
+// The frames themselves are the caller's.  What this holds is a
+// heapless-nv `BoundedFifo`'s bookkeeping plus the count, which is
+// four integers.
+pub @value
+struct CanTxQueue
+    // The index of the oldest occupied slot.
+    head: Int
+    // How many slots are occupied.
+    count: Int
+    // How many slots the caller's array has.
+    capacity: Int
+    // How many frames have been dropped since the queue was made,
+    // which is the number a health check wants and which a queue that
+    // silently dropped would not have.
+    dropped: Int
+
+// A queue over a caller's array of `capacity` frames.
+//
+// ```novo
+// use cantxq
+//
+// fn main() [io]
+//     println("${cantxq.capacity(cantxq.queue(16))}")   // 16
+// ```
+pub fn queue(capacity: Int) -> CanTxQueue []
+    todo("can-nv.cantxq.queue")
+
+// How many frames are queued.
+pub fn len(q: CanTxQueue) -> Int []
+    todo("can-nv.cantxq.len")
+
+// How many slots the caller's array has.
+pub fn capacity(q: CanTxQueue) -> Int []
+    todo("can-nv.cantxq.capacity")
+
+// Whether nothing is queued.
+pub fn is_empty(q: CanTxQueue) -> Bool []
+    todo("can-nv.cantxq.is_empty")
+
+// Whether every slot is occupied.
+pub fn is_full(q: CanTxQueue) -> Bool []
+    todo("can-nv.cantxq.is_full")
+
+// How many frames have been dropped since the queue was made.
+pub fn dropped(q: CanTxQueue) -> Int []
+    todo("can-nv.cantxq.dropped")
+
+// ── Putting a frame in ───────────────────────────────────────────────
+
+// Which slot of the caller's array the next frame goes in, or -1 when
+// the queue is full.
+//
+// The caller writes the frame there itself and then calls `enqueued`,
+// which is heapless-nv's own two-step shape: the bookkeeping is this
+// package's and the storage is the caller's, so nothing here ever
+// holds a frame.
+//
+// ```novo
+// use cantxq
+//
+// fn main() [io]
+//     println("${cantxq.enqueue_at(cantxq.queue(16))}")   // 0
+// ```
+pub fn enqueue_at(q: CanTxQueue) -> Int []
+    todo("can-nv.cantxq.enqueue_at")
+
+// The queue after a frame has been written to `enqueue_at`'s slot.
+pub fn enqueued(q: CanTxQueue) -> CanTxQueue []
+    todo("can-nv.cantxq.enqueued")
+
+// The queue with the drop counter raised, for a caller that had no
+// room.
+//
+// Nothing here panics when full: `enqueue_at` answers -1 and the
+// caller decides.  That is heapless-nv's rule and it is the right one
+// for a transmit path in an interrupt, where a panic is a reset.
+pub fn dropped_one(q: CanTxQueue) -> CanTxQueue []
+    todo("can-nv.cantxq.dropped_one")
+
+// ── Taking one out ───────────────────────────────────────────────────
+
+// Which queued slot holds the frame that wins arbitration against
+// every other queued frame, or -1 when the queue is empty.
+//
+// The function this module exists for.
+//
+// `key_at` answers the ARBITRATION KEY of the frame in the caller's
+// slot `i` — `canframe.arbitration_key`, the one number whose numeric
+// order is the bus's own order.  A key rather than a frame for two
+// reasons: a `@value` struct cannot appear in a fn value's signature
+// (E2015), and a driver that keeps its pending identifiers in a
+// parallel array of `Int`s — which a real one does, because that is
+// what it programmed into the mailbox registers — never has to
+// reconstruct a frame to answer it.
+//
+// Named rather than a lambda, because a lambda that becomes a value at
+// `@tier(embedded)` is refused.
+//
+// ```novo
+// use cantxq
+//
+// fn main() [io]
+//     println("${cantxq.len(cantxq.queue(8))}")   // 0
+// ```
+pub fn dequeue_index(q: CanTxQueue, key_at: fn(Int) -> Int) -> Int []
+    todo("can-nv.cantxq.dequeue_index")
+
+// Which queued slot holds the OLDEST frame, or -1 when the queue is
+// empty.
+//
+// Arrival order, for the caller who wants it: a logger replaying a
+// capture, or a test that must be deterministic regardless of
+// identifier.  Named rather than implied, so the choice is visible at
+// the call site.
+pub fn dequeue_fifo_index(q: CanTxQueue) -> Int []
+    todo("can-nv.cantxq.dequeue_fifo_index")
+
+// The queue after the frame in slot `i` has been handed to the
+// controller.
+pub fn dequeued(q: CanTxQueue, i: Int) -> CanTxQueue []
+    todo("can-nv.cantxq.dequeued")
+
+// The queue with everything discarded, the drop counter raised by
+// what was in it.
+//
+// What a driver does on a bus-off transition: those frames are not
+// going anywhere, and a queue that kept them would deliver stale
+// commands the moment the bus recovered — which for an actuator is
+// worse than delivering nothing.
+pub fn cleared(q: CanTxQueue) -> CanTxQueue []
+    todo("can-nv.cantxq.cleared")
+
+// ── Making room ──────────────────────────────────────────────────────
+
+// Which queued slot holds the frame that LOSES arbitration against
+// every other queued frame, or -1 when the queue is empty.
+//
+// The frame to overwrite when a high-priority frame arrives at a full
+// queue.  A driver that dropped the NEW frame instead would drop
+// exactly the frame that mattered, which is the failure mode of every
+// queue that treats fullness as a property of arrival rather than of
+// priority.
+pub fn lowest_priority_index(q: CanTxQueue, key_at: fn(Int) -> Int) -> Int []
+    todo("can-nv.cantxq.lowest_priority_index")
+
+// Whether a frame with this arbitration key should displace something
+// rather than be dropped: true when the queue is full and the key
+// beats its lowest-priority member's.
+pub fn should_displace(q: CanTxQueue, key: Int, key_at: fn(Int) -> Int) -> Bool []
+    todo("can-nv.cantxq.should_displace")
+
+// Whether a frame with this identifier is already queued.
+//
+// The check a periodic sender needs: a status message sent every 10 ms
+// into a queue that is draining slower than that accumulates copies,
+// and the newest is the only one worth sending.  `replace_at` is what
+// follows.
+pub fn holds_id(q: CanTxQueue, id: Int, id_at: fn(Int) -> Int) -> Bool []
+    todo("can-nv.cantxq.holds_id")
+
+// Which queued slot holds a frame with this identifier, or -1.
+pub fn index_of_id(q: CanTxQueue, id: Int, id_at: fn(Int) -> Int) -> Int []
+    todo("can-nv.cantxq.index_of_id")
+
+// Why a frame cannot be queued, or nothing.
+pub fn check_enqueue(q: CanTxQueue, f: CanFrame) -> ?CanError []
+    todo("can-nv.cantxq.check_enqueue")

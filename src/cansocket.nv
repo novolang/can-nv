@@ -1,0 +1,319 @@
+// cansocket.nv — SocketCAN: the same bus, through a Linux socket.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE ONE MODULE IN THIS PACKAGE THAT PERFORMS, and the manifest names
+// it in `host_modules` for that reason.  Its rows are `[net]` for the
+// socket and `[fs]` for the one thing a socket cannot answer — an
+// interface's kernel index, which lives in `/sys/class/net/<if>/ifindex`
+// and which a bind needs before it can name a bus.
+//
+// THE POINT OF THE ROW IS THAT THE REST OF THE PACKAGE DOES NOT MOVE.
+// A frame built on a device and a frame built here are the same
+// `CanFrame`; a filter programmed into an STM32's bxCAN and a filter
+// handed to `setsockopt` are the same `CanFilter`; an ISO-TP session
+// driven from a laptop and one driven from a microcontroller are the
+// same state machine.  What changes is sixteen bytes of struct layout
+// and which function performs, which is exactly the amount of a CAN
+// program that should be platform-specific.
+//
+// THE WIRE STRUCT IS SIXTEEN BYTES AND ITS LAYOUT IS THE CONTRACT.
+// Linux's `struct can_frame` is a 32-bit identifier carrying three
+// flag bits in its high bits, a length byte, three bytes of padding
+// and eight payload bytes.  `frame_to_wire` and `frame_from_wire` are
+// that layout, and they are `[]` — a caller that wants to write a
+// capture file, or to speak to something other than a socket, gets the
+// encoding without the socket.  The CAN FD variant is 72 bytes with a
+// flags byte where the first padding byte is, and reading one as the
+// other gives a frame that looks almost right.
+//
+// A VIRTUAL INTERFACE IS THE TESTABLE PATH, and the README says so:
+// `vcan0` needs no hardware, behaves identically, and is how every
+// SocketCAN test in every project is written.
+
+use canframe
+use canfilter
+use canbus
+
+// ── The wire layout ──────────────────────────────────────────────────
+
+// How many bytes a classic `struct can_frame` occupies: 16.
+pub const CAN_WIRE_LEN = 16
+// How many bytes a `struct canfd_frame` occupies: 72.
+pub const CAN_FD_WIRE_LEN = 72
+
+// The bit in the wire identifier that marks an extended identifier.
+pub const CAN_WIRE_EFF_FLAG = 0x80000000
+// The bit that marks a remote transmission request.
+pub const CAN_WIRE_RTR_FLAG = 0x40000000
+// The bit that marks an error frame.
+pub const CAN_WIRE_ERR_FLAG = 0x20000000
+
+// Byte `i` of the sixteen a classic frame occupies on the wire.
+//
+// `[]`, so a caller writing a capture file or speaking to something
+// that is not a socket gets the encoding without the socket.
+//
+// ```novo
+// use cansocket
+// use canframe
+//
+// fn main() [io]
+//     let f = canframe.frame(0x123, 3, 0x332211)
+//     println("${cansocket.frame_to_wire(f, 4)}")   // 3, the length byte
+// ```
+pub fn frame_to_wire(f: CanFrame, i: Int) -> Int []
+    todo("can-nv.cansocket.frame_to_wire")
+
+// A frame read out of the sixteen bytes at `off`.
+//
+// Answers a zeroed frame when fewer than sixteen bytes are available,
+// because a `@value` struct cannot be a `Result` payload (SPEC
+// § 14.5); `check_wire` is the refusal beside it.
+pub fn frame_from_wire(buf: [u8], off: Int) -> CanFrame []
+    todo("can-nv.cansocket.frame_from_wire")
+
+// A CAN FD frame's header read out of the seventy-two bytes at `off`.
+//
+// The payload stays in the caller's buffer at `off + 8`, which is
+// where it already is — an FD payload is 64 bytes and a `@value`
+// struct does not own one.
+pub fn fd_frame_from_wire(buf: [u8], off: Int) -> CanFdFrame []
+    todo("can-nv.cansocket.fd_frame_from_wire")
+
+// Byte `i` of the seventy-two an FD frame occupies, with the payload
+// supplied by the caller's own accessor.
+//
+// A named function rather than a lambda, because a lambda that becomes
+// a value at `@tier(embedded)` is refused — and because the payload is
+// the caller's.
+pub fn fd_frame_to_wire(f: CanFdFrame, byte_at: fn(Int) -> Int, i: Int) -> Int []
+    todo("can-nv.cansocket.fd_frame_to_wire")
+
+// Why bytes cannot be read as a frame, or nothing.
+pub fn check_wire(buf: [u8], off: Int) -> ?CanError []
+    todo("can-nv.cansocket.check_wire")
+
+// ── The socket ───────────────────────────────────────────────────────
+
+// An open CAN socket.
+//
+// The descriptor plus what the caller needs to know about it without
+// asking the kernel again — which interface it is bound to, and
+// whether FD frames may cross it.
+pub struct CanSocket
+    // The file descriptor.
+    fd: Int
+    // The interface it is bound to.
+    interface: Str
+    // Whether `CAN_RAW_FD_FRAMES` was enabled, which decides whether a
+    // read gives sixteen bytes or seventy-two.
+    fd_frames: Bool
+
+// Open a raw CAN socket and bind it to an interface.
+//
+// `[net, fs]` — the socket, and the one read of
+// `/sys/class/net/<if>/ifindex` that a bind needs.  A raw CAN socket
+// requires `CAP_NET_RAW`, which is why the refusal names permission
+// explicitly: "operation not permitted" against a socket call is the
+// least helpful message in Linux networking.
+//
+// ```novo
+// use cansocket
+//
+// fn main() [io, net, fs]
+//     match cansocket.open("vcan0")
+//         Ok(s)  => println(cansocket.interface_of(s))
+//         Err(e) => println(e.message())
+// ```
+pub fn open(interface: Str) -> Result<CanSocket, CanError> [net, fs]
+    todo("can-nv.cansocket.open")
+
+// Open a socket that also carries CAN FD frames.
+//
+// A separate constructor rather than a flag, because enabling
+// `CAN_RAW_FD_FRAMES` changes the size of every read for the life of
+// the socket — and a caller that toggled it halfway through a receive
+// loop would read a 72-byte structure as sixteen and get a frame that
+// looks almost right.
+pub fn open_fd(interface: Str) -> Result<CanSocket, CanError> [net, fs]
+    todo("can-nv.cansocket.open_fd")
+
+// Open a socket bound to EVERY CAN interface on the machine.
+//
+// SocketCAN's `ifindex` of 0, and what a gateway or a logger wants.
+// A frame read from one of these does not say which interface it came
+// from unless the caller asked for it, which `receive_from` is for.
+pub fn open_all() -> Result<CanSocket, CanError> [net, fs]
+    todo("can-nv.cansocket.open_all")
+
+// Close it.  Calling this twice is not an error.
+pub fn close(s: CanSocket) -> ?CanError [net]
+    todo("can-nv.cansocket.close")
+
+// The interface it is bound to.
+pub fn interface_of(s: CanSocket) -> Str [net]
+    todo("can-nv.cansocket.interface_of")
+
+// The file descriptor, for a caller polling several sockets at once.
+pub fn fd_of(s: CanSocket) -> Int [net]
+    todo("can-nv.cansocket.fd_of")
+
+// Whether FD frames may cross this socket.
+pub fn carries_fd(s: CanSocket) -> Bool [net]
+    todo("can-nv.cansocket.carries_fd")
+
+// ── Moving frames ────────────────────────────────────────────────────
+
+// Send a frame.
+//
+// A CAN write is all-or-nothing — the kernel takes the whole
+// sixteen-byte structure or refuses it — so there is no short write
+// here and no byte count to return, which is the one way this differs
+// from every other socket in this project.
+pub fn send(s: CanSocket, f: CanFrame) -> ?CanError [net]
+    todo("can-nv.cansocket.send")
+
+// Send a CAN FD frame, with the payload supplied by the caller's
+// accessor.
+pub fn send_fd(s: CanSocket, f: CanFdFrame, byte_at: fn(Int) -> Int) -> ?CanError [net]
+    todo("can-nv.cansocket.send_fd")
+
+// Take the next frame.
+//
+// Answers `canframe.none()` when nothing has arrived and a FAULT frame
+// when the socket refused.  Nothing and a failure are not the same
+// thing and a caller must be able to tell them apart, which is what
+// `canframe.is_none` and `canframe.is_fault` are for — a `@value`
+// struct cannot be an optional or a `Result` payload (E2015), so the
+// frame carries its own status.
+pub fn receive(s: CanSocket) -> CanFrame [net]
+    todo("can-nv.cansocket.receive")
+
+// Take the next frame's raw bytes into the caller's buffer, and answer
+// how many arrived — 0 for nothing.
+//
+// The allocation-free path, and the one a capture writer wants: the
+// sixteen or seventy-two bytes go straight to a file, and
+// `frame_from_wire` decodes them only if the program cares what they
+// say.
+pub fn receive_into(s: CanSocket, mut dst: Cursor) -> Result<Int, CanError> [net]
+    todo("can-nv.cansocket.receive_into")
+
+// Take the next frame and say which interface it arrived on.
+//
+// The index is the kernel's, and `interface_name` turns it back into a
+// name.  For a socket bound to one interface it is always that one;
+// for `open_all` it is the answer the caller opened that way to get.
+pub fn receive_from(s: CanSocket) -> CanFrame [net]
+    todo("can-nv.cansocket.receive_from")
+
+// The interface index the last `receive_from` reported.
+//
+// A separate reader rather than a second return value, because a
+// `@value` struct cannot be a tuple element (SPEC § 14.5) and
+// `CanFrame` is one.
+pub fn last_interface_index(s: CanSocket) -> Int [net]
+    todo("can-nv.cansocket.last_interface_index")
+
+// How long a receive waits before answering nothing, in
+// milliseconds; 0 means do not wait at all.
+pub fn set_receive_timeout(s: CanSocket, ms: Int) -> ?CanError [net]
+    todo("can-nv.cansocket.set_receive_timeout")
+
+// ── Filters, in the kernel ───────────────────────────────────────────
+
+// Install the caller's filters, replacing whatever was there.
+//
+// The kernel evaluates exactly what `canfilter.accepts_id` does, which
+// is why the same values serve both — a program can filter in the
+// kernel on Linux and in a peripheral's registers on a device with one
+// list of filters and no conversion.
+//
+// An EMPTY list is not "accept everything": it is "accept nothing",
+// and it is the documented way to make a send-only socket that wakes
+// nobody up.  A caller that meant everything passes
+// `canfilter.accept_all`.
+pub fn set_filters(s: CanSocket, filters: [CanFilter]) -> ?CanError [net]
+    todo("can-nv.cansocket.set_filters")
+
+// Ask the kernel to deliver error frames as well as data frames, for
+// the kinds in `mask`.
+//
+// Off by default, which is the kernel's choice and a surprising one:
+// without this a program on a bus that is failing sees nothing at all
+// rather than an error, and the symptom is silence.
+pub fn set_error_mask(s: CanSocket, mask: Int) -> ?CanError [net]
+    todo("can-nv.cansocket.set_error_mask")
+
+// Whether frames this program sends are also delivered back to it.
+//
+// Off by default.  A gateway that turns it on and does not filter its
+// own traffic back out has built a loop.
+pub fn set_loopback(s: CanSocket, on: Bool) -> ?CanError [net]
+    todo("can-nv.cansocket.set_loopback")
+
+// Whether frames sent by OTHER sockets of this program are delivered
+// here.  On by default, which surprises the same caller in the other
+// direction.
+pub fn set_receive_own(s: CanSocket, on: Bool) -> ?CanError [net]
+    todo("can-nv.cansocket.set_receive_own")
+
+// ── The machine's interfaces ─────────────────────────────────────────
+
+// Every CAN interface on this machine, in name order.
+//
+// `[fs]` — a directory listing under `/sys/class/net/`, and no socket
+// at all.  What a tool prints when the interface it was asked for does
+// not exist, which is the most common way a SocketCAN program fails.
+pub fn interfaces() -> Result<[Str], CanError> [fs]
+    todo("can-nv.cansocket.interfaces")
+
+// Whether this machine has a CAN interface by that name.
+pub fn interface_exists(name: Str) -> Bool [fs]
+    todo("can-nv.cansocket.interface_exists")
+
+// The kernel index of an interface, which a bind needs.
+pub fn interface_index(name: Str) -> Result<Int, CanError> [fs]
+    todo("can-nv.cansocket.interface_index")
+
+// The name of an interface index, or empty.
+pub fn interface_name(index: Int) -> Result<Str, CanError> [fs]
+    todo("can-nv.cansocket.interface_name")
+
+// The bit rate an interface is configured for, or -1 when the kernel
+// does not say — which is the case for a virtual interface, since
+// `vcan0` has no bit rate at all.
+pub fn interface_bitrate(name: Str) -> Result<Int, CanError> [fs]
+    todo("can-nv.cansocket.interface_bitrate")
+
+// The error counters and confinement state the kernel reports for an
+// interface.
+//
+// The two counters the kernel reports for an interface, read
+// separately because a `@value` struct cannot be a `Result` payload
+// (E2015) — `canbus.bus_state_of` assembles the state a peripheral
+// driver answers directly, so a diagnostic written against a device
+// works against a host and the other way round.
+pub fn interface_tx_errors(name: Str) -> Result<Int, CanError> [fs]
+    todo("can-nv.cansocket.interface_tx_errors")
+
+// The receive error counter the kernel reports for an interface.
+pub fn interface_rx_errors(name: Str) -> Result<Int, CanError> [fs]
+    todo("can-nv.cansocket.interface_rx_errors")
+
+// Whether an interface is virtual — `vcan` or `vxcan` — and therefore
+// needs no hardware.
+//
+// The testable path, and the one every SocketCAN test in every project
+// uses: a virtual interface behaves identically, carries no bit rate
+// and never goes bus-off.
+//
+// ```novo
+// use cansocket
+//
+// fn main() [io, fs]
+//     println("${cansocket.is_virtual("vcan0")}")   // true
+// ```
+pub fn is_virtual(name: Str) -> Bool [fs]
+    todo("can-nv.cansocket.is_virtual")

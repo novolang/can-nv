@@ -1,0 +1,111 @@
+// canerr.nv — what a CAN operation can be wrong about.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A BUS ERROR IS NOT A PROGRAM ERROR, and the type says so by not
+// carrying one.  A CAN controller reports bit errors, stuff errors,
+// form errors, CRC errors and acknowledgement errors continuously and
+// as a matter of course — a node alone on a bus produces an
+// acknowledgement error on every frame it sends, forever, and that is
+// the protocol working.  Those are `canbus`'s subject: counters and a
+// confinement state, not a `Result`.
+//
+// What is here is what a CALLER got wrong — an identifier too wide for
+// its format, a payload length CAN FD does not have, an ISO-TP
+// sequence out of order — and what the SOCKET refused.
+//
+// Every variant is prefixed `Can`, because a variant is constructed by
+// name rather than by the type the expression expects: an unprefixed
+// `Overflow` or `Timeout` in this package would bind whichever
+// package's variant of that name the assembly declared first.
+
+// What went wrong.
+pub enum CanError
+    // The identifier does not fit its format: above 0x7FF on a
+    // standard frame, or above 0x1FFFFFFF on an extended one.
+    CanIdTooWide(id: Int, extended: Bool)
+    // A classic frame's length is above 8.
+    CanLengthTooLong(len: Int)
+    // A CAN FD frame's length is one of the ones the format does not
+    // have — 9, 10, 11, 13 and the rest of the gaps above 8.
+    CanFdLengthNotEncodable(len: Int)
+    // A remote frame carries a payload, which it cannot.
+    CanRemoteWithPayload(id: Int)
+    // A frame is FD-format on a classic-only controller, or the bit
+    // rate switch is asked for on a bus with no data phase.
+    CanFdNotSupported
+    // The transmit queue is full.  Not a panic and not a drop: the
+    // caller is told, and decides whether the frame it could not
+    // queue is worth dropping an older one for.
+    CanQueueFull(capacity: Int)
+    // A filter's identifier has bits the mask does not cover, so the
+    // filter would never match anything.  A silent no-match is the
+    // hardest CAN fault to find, which is why this is refused rather
+    // than accepted.
+    CanFilterUnreachable(id: Int, mask: Int)
+    // An ISO-TP consecutive frame arrived with the wrong sequence
+    // number.  `want` and `got` are the four-bit counters.
+    CanIsoTpBadSequence(want: Int, got: Int)
+    // An ISO-TP first frame declares a length the receiver cannot
+    // hold.
+    CanIsoTpTooLong(len: Int, capacity: Int)
+    // An ISO-TP flow control frame refused the transfer.
+    CanIsoTpOverflow
+    // An ISO-TP timer expired.  `which` names it — N_As, N_Bs, N_Cr —
+    // because the four timers mean four different faults and a single
+    // "timeout" sends a reader to a specification to find out which.
+    CanIsoTpTimeout(which: Str)
+    // A candump-shaped line does not parse.  `at` is the character
+    // offset it disagreed at.
+    CanBadLogLine(at: Int)
+    // The socket layer refused: no such interface, no permission to
+    // open a raw socket, the interface is down.
+    CanSocketRefused(detail: Str)
+    // The interface named does not exist on this machine.
+    CanNoSuchInterface(name: Str)
+
+// The one-line report: what was refused, and the number that decided
+// it.
+//
+// `Result<_, CanError>` requires this impl: SPEC § 3.4 admits a
+// `Result` error type only if it implements `Error`.
+//
+// ```novo
+// use canerr
+//
+// fn main() [io]
+//     println(canerr.describe(CanFdNotSupported))
+// ```
+impl Error for CanError
+    fn message(self) -> Str
+        todo("can-nv.canerr.CanError.message")
+
+// The same sentence as `message`, as a free function, for a caller
+// that has an error value rather than a `Result` to call `.message()`
+// on.
+//
+// ```novo
+// use canerr
+//
+// fn main() [io]
+//     println(canerr.describe(CanIdTooWide(0x800, false)))
+// ```
+pub fn describe(e: CanError) -> Str []
+    todo("can-nv.canerr.describe")
+
+// Whether retrying the same operation could succeed — a full queue, a
+// flow-control overflow, a timer — as against a value that will be
+// refused every time it is offered.
+//
+// The distinction a gateway's retry loop needs.  An identifier too
+// wide does not become narrower on a second attempt, and a loop that
+// retried it would spin.
+//
+// ```novo
+// use canerr
+//
+// fn main() [io]
+//     println("${canerr.is_transient(CanQueueFull(16))}")   // true
+// ```
+pub fn is_transient(e: CanError) -> Bool []
+    todo("can-nv.canerr.is_transient")

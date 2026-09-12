@@ -1,0 +1,305 @@
+// canhost_tests.nv — the candump format, the peripheral trait, the
+// wire layout, and the error type.
+//
+// RED ON PURPOSE: every assertion against a FUNCTION reaches
+// `not implemented: can-nv.<module>.<fn>`.
+//
+// THE VECTORS ARE can-utils' OWN OUTPUT.  `can0  123   [3]  11 22 33`
+// is what `candump can0` prints for a three-byte frame on identifier
+// 0x123, and `123#112233` is what `cansend` takes for the same frame.
+// Those two strings are a de facto standard: every question about CAN
+// on the internet is pasted in the first and every answer is given in
+// the second, so a package that renders them differently is a package
+// whose output nobody recognises.
+//
+// AND THE TRAIT IS DRIVEN WITHOUT A BUS.  `CanBench` below implements
+// `CanPeripheral[]` — every method declares nothing — so the functions
+// written over the trait are callable with no controller, no socket
+// and no permissions.  That is the property the effect parameter
+// exists for, and the reason `canhal` sits in a `core` package.
+
+use std.test
+use candump
+use canhal
+use cansocket
+use canframe
+use canfilter
+use canbus
+use canerr
+
+// Whether a check refused.  An optional is matched rather than
+// compared, so the two-line helper is what every assertion below
+// goes through.
+fn refused(e: ?CanError) -> Bool
+    match e
+        Some(_) => true
+        None    => false
+
+// ── candump ──────────────────────────────────────────────────────────
+
+@test
+fn test_a_frame_renders_as_candump_prints_it() [io]
+    test.case("two spaces after the interface, the identifier in hex, the length in brackets, the bytes in upper case")
+    let f = canframe.frame(0x123, 3, canframe.pack4(0x11, 0x22, 0x33, 0))
+    test.assert_eq(candump.render_frame("can0", f), "can0  123   [3]  11 22 33")
+
+@test
+fn test_the_identifier_padding_is_what_says_which_format_it_is() [io]
+    test.case("three hex digits for a standard identifier and eight for an extended one, and 123 and 00000123 are different frames")
+    test.assert_eq(candump.render_id(0x123, false), "123")
+    test.assert_eq(candump.render_id(0x123, true), "00000123")
+    test.assert_eq(candump.render_id(0x7FF, false), "7FF")
+
+@test
+fn test_the_timestamped_line_carries_the_callers_clock() [io]
+    test.case("a core package has no clock, which also makes a rendered log reproducible and therefore comparable byte for byte")
+    let f = canframe.frame(0x123, 1, 0xAB)
+    test.assert_eq(candump.render_line("can0", 1234567890, 123456, f),
+                   "(1234567890.123456) can0  123   [1]  AB")
+
+@test
+fn test_a_line_parses_back_into_the_frame_it_came_from() [io]
+    test.case("a captured log replayed through this is a table-driven test of a whole application, with no bus")
+    match candump.parse_line("can0  123   [3]  11 22 33")
+        Ok(l)  =>
+            test.assert_eq(candump.line_interface(l), "can0")
+            test.assert(candump.line_has_time(l) == false)
+            test.assert_eq(canframe.frame_id(candump.line_frame(l)), 0x123)
+            test.assert_eq(canframe.frame_len(candump.line_frame(l)), 3)
+            test.assert_eq(canframe.frame_byte(candump.line_frame(l), 2), 0x33)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_timestamped_line_parses_its_timestamp() [io]
+    match candump.parse_line("(1234567890.123456) can0  123   [1]  AB")
+        Ok(l)  =>
+            test.assert(candump.line_has_time(l))
+            test.assert_eq(candump.line_seconds(l), 1234567890)
+            test.assert_eq(candump.line_micros(l), 123456)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_line_that_is_not_one_is_refused_with_an_offset() [io]
+    match candump.parse_line("this is not a candump line")
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_compact_form_is_what_a_person_types() [io]
+    test.case("cansend's argument shape, which a replay script passes on a command line")
+    let f = canframe.frame(0x123, 3, canframe.pack4(0x11, 0x22, 0x33, 0))
+    test.assert_eq(candump.render_compact(f), "123#112233")
+    test.assert_eq(candump.render_compact(canframe.remote_frame(0x123, 3)), "123#R3")
+    test.assert_eq(candump.render_compact(canframe.frame_ext(0x123, 0, 0)),
+                   "00000123#")
+
+@test
+fn test_the_compact_form_parses_into_a_fault_frame_on_bad_input() [io]
+    test.case("a @value struct cannot be a Result payload (E2015), so the answer carries its own refusal")
+    let good = candump.parse_compact("123#112233")
+    test.assert(canframe.is_frame(good))
+    test.assert_eq(canframe.frame_id(good), 0x123)
+    test.assert_eq(canframe.frame_len(good), 3)
+
+    let bad = candump.parse_compact("not a frame")
+    test.assert(canframe.is_fault(bad))
+    test.assert(refused(canframe.fault_of(bad)))
+
+@test
+fn test_a_payload_renders_on_its_own() [io]
+    test.case("the half a firmware with a debug UART wants, which is why this module is core rather than a host utility")
+    test.assert_eq(candump.render_payload(
+        canframe.frame(0x123, 2, canframe.pack2(0x0A, 0xFF))),
+        "0A FF")
+    test.assert_eq(candump.render_payload(canframe.frame(0x123, 0, 0)), "")
+
+// ── The wire layout ──────────────────────────────────────────────────
+
+@test
+fn test_the_classic_wire_struct_is_sixteen_bytes() [io]
+    test.case("a 32-bit identifier with three flag bits in its high bits, a length byte, three of padding, eight of payload")
+    test.assert_eq(cansocket.CAN_WIRE_LEN, 16)
+    let f = canframe.frame(0x123, 3, canframe.pack4(0x11, 0x22, 0x33, 0))
+    test.assert_eq(cansocket.frame_to_wire(f, 0), 0x23)
+    test.assert_eq(cansocket.frame_to_wire(f, 1), 0x01)
+    test.assert_eq(cansocket.frame_to_wire(f, 2), 0x00)
+    test.assert_eq(cansocket.frame_to_wire(f, 3), 0x00)
+    test.assert_eq(cansocket.frame_to_wire(f, 4), 3)
+    test.assert_eq(cansocket.frame_to_wire(f, 8), 0x11)
+    test.assert_eq(cansocket.frame_to_wire(f, 10), 0x33)
+
+@test
+fn test_the_flag_bits_ride_in_the_identifier_word() [io]
+    test.case("Linux's can_id is not an identifier: it is an identifier with three bits of metadata above it")
+    test.assert_eq(cansocket.CAN_WIRE_EFF_FLAG, 0x80000000)
+    test.assert_eq(cansocket.CAN_WIRE_RTR_FLAG, 0x40000000)
+    test.assert_eq(cansocket.CAN_WIRE_ERR_FLAG, 0x20000000)
+
+    let e = canframe.frame_ext(0x123, 0, 0)
+    test.assert_eq(cansocket.frame_to_wire(e, 3), 0x80)
+
+@test
+fn test_an_fd_wire_struct_is_seventy_two_bytes() [io]
+    test.case("and reading one as sixteen gives a frame that looks almost right, which is why the socket's mode is fixed at open")
+    test.assert_eq(cansocket.CAN_FD_WIRE_LEN, 72)
+
+@test
+fn test_bytes_that_are_not_a_frame_are_refused() [io]
+    let short: [u8] = [0x23 as u8, 0x01 as u8]
+    test.assert(refused(cansocket.check_wire(short, 0)))
+
+// ── The peripheral trait ─────────────────────────────────────────────
+
+// A controller over nothing at all.
+//
+// Every method declares `[]`, so every `canhal` function driven
+// through it is `[]` too.  A real peripheral driver declares `[hw]`
+// and `cansocket`'s would declare `[net]`, and the same call sites are
+// charged that instead.
+struct CanBench
+    slots: Int
+
+impl CanPeripheral[] for CanBench
+    fn can_transmit(self, f: CanFrame) -> CanTxAccepted []
+        canhal.accepted(0, 0 - 1)
+
+    fn can_tx_done(self, mailbox: Int) -> Bool []
+        true
+
+    fn can_tx_abort(self, mailbox: Int) -> ?CanError []
+        None
+
+    fn can_receive(self) -> CanFrame []
+        canframe.none()
+
+    fn can_set_filter(self, slot: Int, f: CanFilter) -> ?CanError []
+        None
+
+    fn can_filter_slots(self) -> Int
+        self.slots
+
+    fn can_bus_state(self) -> CanBusState []
+        canbus.bus_state()
+
+    fn can_recover(self) -> ?CanError []
+        None
+
+fn bench() -> CanBench
+    CanBench { slots: 4 }
+
+@test
+fn test_a_peripheral_that_performs_nothing_makes_every_call_free() [io]
+    test.case("the property the effect parameter exists for, and the reason canhal sits in a core package")
+    let p = bench()
+    let a = canhal.transmit_checked(p, canframe.frame(0x123, 0, 0))
+    test.assert(canhal.tx_ok(a))
+
+@test
+fn test_a_transmit_answers_a_mailbox_rather_than_completion() [io]
+    test.case("a controller takes a frame into a mailbox and arbitrates afterwards, which can take arbitrarily long and can fail")
+    let a = canhal.accepted(2, 0 - 1)
+    test.assert(canhal.tx_ok(a))
+    test.assert_eq(canhal.accepted_mailbox(a), 2)
+    test.assert_eq(canhal.tx_status(a), canhal.CAN_TX_ACCEPTED)
+    test.assert(refused(canhal.tx_fault(a)) == false)
+
+@test
+fn test_a_displaced_frame_is_reported_so_it_can_be_requeued() [io]
+    test.case("a controller aborts its lowest-priority pending frame to make room, and a trait that hid that would lose it silently")
+    test.assert(canhal.accepted_displaced_any(canhal.accepted(0, 0 - 1)) == false)
+    test.assert(canhal.accepted_displaced_any(canhal.accepted(0, 2)))
+    test.assert_eq(canhal.accepted_displaced(canhal.accepted(0, 2)), 2)
+
+@test
+fn test_a_refusal_carries_its_reason() [io]
+    let full = canhal.tx_refused(canhal.CAN_TX_FULL)
+    test.assert(canhal.tx_ok(full) == false)
+    test.assert(refused(canhal.tx_fault(full)))
+    test.assert_eq(canhal.accepted_mailbox(full), 0 - 1)
+
+    let off = canhal.tx_refused(canhal.CAN_TX_BUS_OFF)
+    test.assert(canhal.tx_ok(off) == false)
+
+@test
+fn test_a_filtered_receive_answers_nothing_rather_than_an_optional() [io]
+    let p = bench()
+    let f = canhal.receive_filtered(p, canfilter.exact(0x123), 8)
+    test.assert(canframe.is_none(f))
+
+@test
+fn test_recovering_a_node_that_is_not_bus_off_does_nothing() [io]
+    let p = bench()
+    test.assert(refused(canhal.recover_if_bus_off(p)) == false)
+
+// ── The boards ───────────────────────────────────────────────────────
+
+@test
+fn test_neither_board_this_project_supports_has_a_can_controller() [io]
+    test.case("saying so plainly is more useful than implying otherwise — what those parts need is an MCP2515 over SPI")
+    test.assert_eq(canhal.controller_of("nrf52840-dk"), canhal.CAN_CONTROLLER_NONE)
+    test.assert_eq(canhal.controller_of("nrf52832-dk"), canhal.CAN_CONTROLLER_NONE)
+    test.assert_eq(canhal.controller_of("rp2040"), canhal.CAN_CONTROLLER_NONE)
+
+@test
+fn test_the_parts_that_do_have_one_are_named() [io]
+    test.case("so a reader choosing a part has the list in the package rather than in a search")
+    test.assert_eq(canhal.controller_of("stm32f407"), canhal.CAN_CONTROLLER_BXCAN)
+    test.assert_eq(canhal.controller_of("stm32g474"), canhal.CAN_CONTROLLER_FDCAN)
+    test.assert_eq(canhal.controller_of("esp32"), canhal.CAN_CONTROLLER_TWAI)
+
+@test
+fn test_only_some_controllers_handle_fd() [io]
+    test.assert(canhal.supports_fd(canhal.CAN_CONTROLLER_FDCAN))
+    test.assert(canhal.supports_fd(canhal.CAN_CONTROLLER_MCP2518FD))
+    test.assert(canhal.supports_fd(canhal.CAN_CONTROLLER_BXCAN) == false)
+    test.assert(canhal.supports_fd(canhal.CAN_CONTROLLER_TWAI) == false)
+    test.assert(canhal.supports_fd(canhal.CAN_CONTROLLER_NONE) == false)
+
+@test
+fn test_the_filter_slot_counts_decide_whether_a_merge_is_needed() [io]
+    test.case("the MCP2515 has six, and a program with nine filters has to widen two of them")
+    test.assert_eq(canhal.filter_slots_of(canhal.CAN_CONTROLLER_MCP2515), 6)
+    test.assert(canhal.filter_slots_of(canhal.CAN_CONTROLLER_BXCAN) > 0)
+    test.assert_eq(canhal.filter_slots_of(canhal.CAN_CONTROLLER_NONE), 0)
+
+@test
+fn test_every_controller_has_a_name() [io]
+    test.assert(str.len(canhal.controller_name(canhal.CAN_CONTROLLER_FDCAN)) > 0)
+    test.assert(str.len(canhal.controller_name(canhal.CAN_CONTROLLER_NONE)) > 0)
+
+// ── The error type ───────────────────────────────────────────────────
+
+@test
+fn test_every_error_variant_says_something() [io]
+    test.assert(str.len(canerr.describe(CanIdTooWide(0x800, false))) > 0)
+    test.assert(str.len(canerr.describe(CanLengthTooLong(9))) > 0)
+    test.assert(str.len(canerr.describe(CanFdLengthNotEncodable(9))) > 0)
+    test.assert(str.len(canerr.describe(CanRemoteWithPayload(0x123))) > 0)
+    test.assert(str.len(canerr.describe(CanFdNotSupported)) > 0)
+    test.assert(str.len(canerr.describe(CanQueueFull(16))) > 0)
+    test.assert(str.len(canerr.describe(CanFilterUnreachable(0x123, 0x700))) > 0)
+    test.assert(str.len(canerr.describe(CanIsoTpBadSequence(1, 2))) > 0)
+    test.assert(str.len(canerr.describe(CanIsoTpTooLong(4095, 64))) > 0)
+    test.assert(str.len(canerr.describe(CanIsoTpOverflow)) > 0)
+    test.assert(str.len(canerr.describe(CanIsoTpTimeout("N_Bs"))) > 0)
+    test.assert(str.len(canerr.describe(CanBadLogLine(12))) > 0)
+    test.assert(str.len(canerr.describe(CanSocketRefused("permission denied"))) > 0)
+    test.assert(str.len(canerr.describe(CanNoSuchInterface("can9"))) > 0)
+
+@test
+fn test_a_transient_fault_is_worth_retrying_and_a_value_fault_is_not() [io]
+    test.case("an identifier too wide does not become narrower on a second attempt, and a loop that retried it would spin")
+    test.assert(canerr.is_transient(CanQueueFull(16)))
+    test.assert(canerr.is_transient(CanIsoTpTimeout("N_Bs")))
+    test.assert(canerr.is_transient(CanIdTooWide(0x800, false)) == false)
+    test.assert(canerr.is_transient(CanFdNotSupported) == false)
+
+@test
+fn test_the_error_trait_and_the_free_function_agree() [io]
+    test.assert_eq(CanFdNotSupported.message(), canerr.describe(CanFdNotSupported))
+
+@test
+fn test_the_four_timer_names_are_distinguishable() [io]
+    test.case("a single timeout sends a reader to a specification to find out which of four timers it was")
+    test.assert(canerr.describe(CanIsoTpTimeout("N_Bs"))
+                != canerr.describe(CanIsoTpTimeout("N_Cr")))

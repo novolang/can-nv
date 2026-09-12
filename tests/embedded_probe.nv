@@ -1,0 +1,211 @@
+// embedded_probe.nv — this package's device claim, as a program that
+// either builds for a Cortex-M or does not.
+//
+// It is not a test.  `scripts/shard_audit.sh`'s `core-embedded` row
+// copies it and the modules it names into a package of its own and
+// runs
+//
+//   novo build --target=nrf52-qemu src/probe.nv
+//
+// which produces a real Cortex-M4 ELF or fails.
+//
+// WHAT THE CLAIM COVERS: frames, filters and ISO-TP — `canframe`,
+// `canfilter` and `canisotp`.  Those three are what a node runs, and
+// they run in a receive interrupt: a frame arrives, a filter decides
+// whether anyone cares, and an ISO-TP session decides what to do with
+// it.  All three are `@value` structs of machine words in the caller's
+// own frame, which is the property this file exists to keep true.
+//
+// WHAT IS DELIBERATELY OUT.  `cansocket` is `host` and named in the
+// manifest's `host_modules`, so the audit leaves it behind.  `cantxq`
+// is the one module that names heapless-nv, and leaving it out keeps
+// the probe's closure to this package's own sources — it would build,
+// since heapless-nv makes its own device claim, and the README says
+// so.  `canbus`, `candump` and `canhal` are `core` and would build
+// too; they are not named here because the claim this file makes
+// should be the claim the README makes.
+//
+// THE PROBE NAMES ONLY THIS PACKAGE'S TYPES.
+//
+// WHAT THE TIER ACTUALLY CHECKS AT 0.0.1 is narrower than it will be.
+// Every body under `src/` is a `todo()`, so what links today is the
+// SIGNATURES and the types: `@value` structs of `Int` and `Bool` in
+// and out, with no allocator anywhere in the shape.  There is no
+// arithmetic in the binary yet, so this probe does not prove a frame
+// is filtered without allocating; it proves that nothing in the shape
+// of the surface needs an allocator or a host.  Keeping it green once
+// the bodies land is a named cost of the implementation step.
+
+use canframe
+use canfilter
+use canisotp
+
+// A powertrain node's own numbers, as a firmware holds them: an engine
+// speed frame at 0x0C0, a diagnostic response at 0x7E8, and a filter
+// that accepts the 0x100 block and nothing else.
+const ENGINE_ID: Int = 0x0C0
+const DIAG_ID: Int = 0x7E8
+const BLOCK_ID: Int = 0x100
+const BLOCK_MASK: Int = 0x700
+
+// Every answer this probe checks, folded into one number so a single
+// comparison decides the run.  A firmware image has one line of
+// output; making it depend on all of them is what stops a passing run
+// from meaning "the first call linked".
+@tier(embedded)
+fn score() -> Int
+    var n = 0
+
+    // ── A frame is three integers, payload included ──────────────────
+    let f = canframe.frame(ENGINE_ID, 3, canframe.pack4(0x11, 0x22, 0x33, 0))
+    if canframe.frame_id(f) == ENGINE_ID
+        n = n + 1
+    if canframe.frame_len(f) == 3
+        n = n + 1
+    if canframe.frame_byte(f, 0) == 0x11
+        n = n + 1
+    if canframe.frame_byte(f, 2) == 0x33
+        n = n + 1
+    // Past the declared length is 0, not whatever the word holds.
+    if canframe.frame_byte(f, 7) == 0
+        n = n + 1
+    if canframe.is_extended(f) == false
+        n = n + 1
+    if canframe.is_remote(f) == false
+        n = n + 1
+
+    // A byte at a time, which is what a receive interrupt does.
+    var g = canframe.frame(DIAG_ID, 0, 0)
+    g = canframe.frame_with_byte(g, 0, 0x02)
+    g = canframe.frame_with_byte(g, 1, 0x10)
+    if canframe.frame_len(g) == 2
+        n = n + 1
+    if canframe.frame_byte(g, 1) == 0x10
+        n = n + 1
+
+    // An extended identifier is a different frame from the same
+    // number, which is why there are two constructors rather than a
+    // Bool.
+    let e = canframe.frame_ext(0x18DAF110, 8, 0)
+    if canframe.is_extended(e)
+        n = n + 1
+
+    // A remote frame's length is a request, not a description.
+    let r = canframe.remote_frame(ENGINE_ID, 8)
+    if canframe.is_remote(r)
+        n = n + 1
+
+    // The smaller identifier wins the bus, and the key is the number
+    // that says so.
+    if canframe.wins_arbitration(canframe.frame(0x100, 0, 0),
+                                 canframe.frame(0x200, 0, 0))
+        n = n + 1
+    let hi_key = canframe.arbitration_key(canframe.frame(0x100, 0, 0))
+    let lo_key = canframe.arbitration_key(canframe.frame(0x200, 0, 0))
+    if hi_key < lo_key
+        n = n + 1
+
+    // Not a frame, twice: nothing arrived, and something refused.
+    if canframe.is_none(canframe.none())
+        n = n + 1
+    if canframe.is_frame(canframe.none()) == false
+        n = n + 1
+    if canframe.is_fault(canframe.fault(canframe.CAN_FAULT_MALFORMED))
+        n = n + 1
+    let refused = canframe.fault(canframe.CAN_FAULT_REFUSED)
+    if canframe.fault_code(refused) == canframe.CAN_FAULT_REFUSED
+        n = n + 1
+    if canframe.is_frame(f)
+        n = n + 1
+
+    // A CAN FD length is not a byte count: 48 bytes is code 14, and
+    // 9 bytes is not a length the format has.
+    if canframe.dlc_for(48) == 14
+        n = n + 1
+    if canframe.fd_len_is_valid(9) == false
+        n = n + 1
+    if canframe.fd_len_is_valid(12)
+        n = n + 1
+    if canframe.fd_padded_len(9) == 12
+        n = n + 1
+    if canframe.classic_len_for_dlc(15) == 8
+        n = n + 1
+
+    // ── A filter is what stops the interrupt firing all day ──────────
+    let filt = canfilter.filter(BLOCK_ID, BLOCK_MASK)
+    if canfilter.accepts_id(filt, 0x1FF, false)
+        n = n + 1
+    if canfilter.accepts_id(filt, 0x2FF, false) == false
+        n = n + 1
+    // A filter over standard identifiers never accepts an extended
+    // frame, which is a separate check from the mask.
+    if canfilter.accepts_id(filt, 0x100, true) == false
+        n = n + 1
+    if canfilter.width(filt) == 256
+        n = n + 1
+    if canfilter.width(canfilter.exact(ENGINE_ID)) == 1
+        n = n + 1
+    if canfilter.accepts(filt, canframe.frame(BLOCK_ID, 0, 0))
+        n = n + 1
+    // Inverting the sense is how a caller says "everything except".
+    if canfilter.accepts_id(canfilter.inverted(filt), 0x1FF, false) == false
+        n = n + 1
+    // Merging two filters into one hardware slot never rejects what
+    // either accepted.
+    let merged = canfilter.merge(canfilter.exact(0x100), canfilter.exact(0x101))
+    if canfilter.accepts_id(merged, 0x100, false)
+        n = n + 1
+    if canfilter.accepts_id(merged, 0x101, false)
+        n = n + 1
+    if canfilter.covers(canfilter.accept_all(), filt)
+        n = n + 1
+
+    // ── ISO-TP: a message longer than a frame ────────────────────────
+    let first = canframe.frame(DIAG_ID, 8, canframe.pack2(0x10, 0x14))
+    if canisotp.pci_type(first) == canisotp.CAN_ISOTP_FIRST
+        n = n + 1
+    if canisotp.first_len(first) == 20
+        n = n + 1
+    if canisotp.consecutive_count(20) == 2
+        n = n + 1
+    // A consecutive frame's sequence number starts at 1 and wraps at
+    // 16; a sender that numbered its first one 0 is rejected whole.
+    if canisotp.next_index(15) == 0
+        n = n + 1
+    // The separation time byte is not linear: 0xF1 is 100 microseconds
+    // and 10 is ten milliseconds.
+    if canisotp.st_min_us(0xF1) == 100
+        n = n + 1
+    if canisotp.st_min_us(10) == 10000
+        n = n + 1
+    var s = canisotp.session()
+    if canisotp.session_state(s) == canisotp.CAN_ISOTP_STATE_IDLE
+        n = n + 1
+    s = canisotp.begin_receive(s, first, 64)
+    if canisotp.session_total(s) == 20
+        n = n + 1
+    if canisotp.session_is_finished(s) == false
+        n = n + 1
+    // A message longer than the receiver's buffer gets an overflow
+    // rather than a truncated reassembly.
+    if canisotp.should_send_overflow(4095, 64)
+        n = n + 1
+    if canisotp.single_max(true) == 6
+        n = n + 1
+
+    n
+
+@tier(rt)
+fn main() [hw, time]
+    bsp.board.init()
+    // 40 is the number of checks in `score` on the path a linked build
+    // takes.  The count is printed on a failure rather than only
+    // compared, so a device that disagrees with the host says HOW MANY
+    // it lost and a bisect has somewhere to start.
+    let n = score()
+    if n == 40
+        hal.uart.write("PASS: can-embedded\n")
+    else
+        hal.uart.write("FAIL: can-embedded\n")
+    loop
+        core.rt.sleep_ms(1000)

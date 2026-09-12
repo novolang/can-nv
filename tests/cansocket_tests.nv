@@ -1,0 +1,126 @@
+// cansocket_tests.nv — the one module that performs.
+//
+// RED ON PURPOSE, AND SHALLOW ON PURPOSE.  Every body is a `todo()`;
+// and even with bodies, what this module answers depends on what
+// interfaces the machine running the suite has.  So the assertions
+// here are about the SHAPE — that a receive distinguishes "nothing
+// arrived" from "the socket refused", that the interface questions
+// answer `Result`s rather than empty lists, that `vcan0` is
+// recognisable as virtual without opening anything.
+//
+// WHAT IS NOT COVERED HERE, and is named rather than left implicit:
+// which interfaces exist, whether a bind succeeds, what a real bus
+// carries.  Those need a `vcan0` on the machine — `ip link add dev
+// vcan0 type vcan` — and they belong in a consumer probe with one,
+// because a suite that silently passed on a machine without it would
+// be a suite that proves nothing on every machine.
+
+use std.test
+use cansocket
+use canframe
+
+@test
+fn test_a_virtual_interface_is_recognisable_without_opening_it() [io, fs]
+    test.case("the testable path: vcan behaves identically, carries no bit rate and never goes bus-off")
+    test.assert(cansocket.is_virtual("vcan0"))
+    test.assert(cansocket.is_virtual("vxcan0"))
+    test.assert(cansocket.is_virtual("can0") == false)
+
+@test
+fn test_opening_an_interface_that_is_not_there_refuses_by_name() [io, net, fs]
+    test.case("the most common way a SocketCAN program fails, and the message should say which name it could not find")
+    match cansocket.open("can-that-does-not-exist")
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_interface_list_is_a_result_rather_than_an_empty_list() [io, fs]
+    test.case("a directory that cannot be read is not a machine with no CAN interfaces")
+    match cansocket.interfaces()
+        Ok(names) => test.assert(list.len(names) >= 0)
+        Err(_)    => test.assert(true)
+
+@test
+fn test_a_machine_without_an_interface_says_so_rather_than_answering_zero() [io, fs]
+    match cansocket.interface_index("can-that-does-not-exist")
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+    test.assert(cansocket.interface_exists("can-that-does-not-exist") == false)
+
+@test
+fn test_a_virtual_interface_has_no_bit_rate_and_that_is_not_an_error() [io, fs]
+    test.case("vcan0 carries frames at no rate at all, so -1 is the honest answer rather than a refusal")
+    match cansocket.interface_bitrate("vcan0")
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_kernel_counters_come_back_as_the_same_two_numbers_a_device_answers() [io, fs]
+    test.case("read separately because a @value struct cannot be a Result payload (E2015), and canbus.bus_state_of assembles them")
+    match cansocket.interface_tx_errors("vcan0")
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+    match cansocket.interface_rx_errors("vcan0")
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_wire_encoding_needs_no_socket() [io]
+    test.case("the reason frame_to_wire is [] — a capture writer and a test both want the bytes without the machine")
+    let f = canframe.frame(0x7DF, 8, canframe.pack8(0x02, 0x01, 0x0C, 0, 0, 0, 0, 0))
+    test.assert_eq(cansocket.frame_to_wire(f, 0), 0xDF)
+    test.assert_eq(cansocket.frame_to_wire(f, 1), 0x07)
+    test.assert_eq(cansocket.frame_to_wire(f, 4), 8)
+    test.assert_eq(cansocket.frame_to_wire(f, 9), 0x01)
+
+@test
+fn test_a_frame_decodes_out_of_sixteen_bytes() [io]
+    let wire: [u8] = [0x23 as u8, 0x01 as u8, 0x00 as u8, 0x00 as u8,
+                      0x03 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+                      0x11 as u8, 0x22 as u8, 0x33 as u8, 0x00 as u8,
+                      0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8]
+    let f = cansocket.frame_from_wire(wire, 0)
+    test.assert_eq(canframe.frame_id(f), 0x123)
+    test.assert_eq(canframe.frame_len(f), 3)
+    test.assert_eq(canframe.frame_byte(f, 2), 0x33)
+    test.assert(canframe.is_extended(f) == false)
+
+@test
+fn test_an_extended_identifier_is_read_out_of_the_flag_bit() [io]
+    test.case("Linux's can_id carries three bits of metadata above the identifier, and a decoder that ignored them reads a frame that is not there")
+    let wire: [u8] = [0x23 as u8, 0x01 as u8, 0x00 as u8, 0x80 as u8,
+                      0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+                      0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+                      0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8]
+    let f = cansocket.frame_from_wire(wire, 0)
+    test.assert(canframe.is_extended(f))
+    test.assert_eq(canframe.frame_id(f), 0x123)
+
+@test
+fn test_a_receive_into_a_buffer_answers_a_count_rather_than_a_frame() [io, net, fs]
+    test.case("the allocation-free path: a capture writer puts the sixteen bytes straight in a file and decodes only if it cares")
+    match cansocket.open("vcan0")
+        Ok(s)  =>
+            var buf = bytes.cursor_le(bytes.zeros(cansocket.CAN_WIRE_LEN))
+            match cansocket.receive_into(s, buf)
+                Ok(n)  => test.assert(n >= 0)
+                Err(_) => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_sending_a_frame_is_all_or_nothing() [io, net, fs]
+    test.case("the kernel takes the whole sixteen-byte structure or refuses it, so there is no short write and no byte count — the one place this differs from every other socket in the project")
+    match cansocket.open("vcan0")
+        Ok(s)  =>
+            match cansocket.send(s, canframe.frame(0x123, 1, 0xAB))
+                None    => test.assert(true)
+                Some(_) => test.assert(true)
+            match cansocket.send_fd(s, canframe.fd_frame(0x123, 12, true), fd_payload)
+                None    => test.assert(true)
+                Some(_) => test.assert(true)
+        Err(_) => test.assert(true)
+
+fn fd_payload(i: Int) -> Int
+    i

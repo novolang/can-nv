@@ -1,0 +1,399 @@
+// canisotp.nv — ISO 15765-2: a message longer than eight bytes, over a
+// bus whose frames carry eight.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE PROTOCOL IS FOUR FRAME TYPES AND THREE OF THEM ARE A HANDSHAKE.
+// A single frame carries up to seven bytes and is the whole message.
+// Anything longer is a first frame, then a FLOW CONTROL frame from the
+// receiver saying how many consecutive frames it will take and how
+// fast, then consecutive frames numbered 0 to 15 and wrapping.  The
+// flow control frame is what makes ISO-TP work on a real bus: a
+// diagnostic tool sending 4 KB at bus speed into a microcontroller
+// with a 128-byte buffer would overrun it, and `block_size` and
+// `st_min` are the receiver saying so before it happens.
+//
+// THE STATE IS A `@value` STRUCT AND THE BUFFER IS THE CALLER'S.  A
+// session's whole state is a message length, a byte offset, a
+// four-bit sequence counter, a block counter and two timers' worth of
+// deadline — seven integers.  The payload it is assembling is the
+// caller's buffer, which on a device is a fixed array in `.bss` sized
+// to the largest message that product expects.  That is the same rule
+// heapless-nv follows and the reason this module builds for a
+// Cortex-M.
+//
+// TIME IS THE CALLER'S.  A `core` package has no clock, so every
+// function that would wait takes `now_ms` and every function that
+// would set a timer ANSWERS a deadline.  `deadline_ms` is what the
+// caller arms; `timed_out` is the question it asks.  That is also what
+// makes the four timers testable as a table rather than as a bus run.
+//
+// WHAT IS NOT HERE: the addressing modes beyond normal and extended,
+// the CAN FD escape that lets a first frame declare a 32-bit length,
+// and the 15765-4 diagnostic identifiers.  The first two are named in
+// the README as the first things to add; the third is UDS's, not this
+// package's.
+
+use canframe
+
+// ── The four frame types ─────────────────────────────────────────────
+
+// Protocol control information type 0: the whole message in one frame.
+pub const CAN_ISOTP_SINGLE = 0
+// Type 1: the first frame of a segmented message, carrying the total
+// length.
+pub const CAN_ISOTP_FIRST = 1
+// Type 2: a consecutive frame, carrying a four-bit sequence number.
+pub const CAN_ISOTP_CONSECUTIVE = 2
+// Type 3: a flow control frame, which only the receiver sends.
+pub const CAN_ISOTP_FLOW = 3
+
+// Flow status: carry on.
+pub const CAN_ISOTP_CONTINUE = 0
+// Flow status: wait — the receiver is not ready and will send another
+// flow control frame.  A sender must honour it or overrun the
+// receiver; a sender that sees too many in a row gives up, which is
+// what `wait_limit` is for.
+pub const CAN_ISOTP_WAIT = 1
+// Flow status: overflow — the message is longer than the receiver can
+// hold, and the transfer is over.
+pub const CAN_ISOTP_OVERFLOW = 2
+
+// The most payload bytes a single frame carries under normal
+// addressing: 7.
+pub const CAN_ISOTP_SINGLE_MAX = 7
+// The most payload bytes a first frame carries: 6.
+pub const CAN_ISOTP_FIRST_MAX = 6
+// The most payload bytes a consecutive frame carries: 7.
+pub const CAN_ISOTP_CONSECUTIVE_MAX = 7
+// The longest message a 12-bit first-frame length can declare: 4095.
+pub const CAN_ISOTP_MAX_MESSAGE = 4095
+
+// A `block_size` of 0 means "send the whole message without stopping
+// for another flow control frame", which is what a host with plenty of
+// buffer asks for and what a microcontroller must not.
+pub const CAN_ISOTP_NO_BLOCK_LIMIT = 0
+
+// ── Reading a frame's control information ────────────────────────────
+
+// Which of the four types a frame's first payload byte names.
+//
+// ```novo
+// use canisotp
+// use canframe
+//
+// fn main() [io]
+//     let f = canframe.frame(0x7E8, 8, canframe.pack2(0x10, 0x14))
+//     println("${canisotp.pci_type(f)}")   // 1, a first frame
+// ```
+pub fn pci_type(f: CanFrame) -> Int []
+    todo("can-nv.canisotp.pci_type")
+
+// The payload length a single frame declares, or -1 when the frame is
+// not one.
+pub fn single_len(f: CanFrame) -> Int []
+    todo("can-nv.canisotp.single_len")
+
+// The total message length a first frame declares — twelve bits
+// across two bytes, which is where the 4095 limit comes from.
+//
+// ```novo
+// use canisotp
+// use canframe
+//
+// fn main() [io]
+//     let f = canframe.frame(0x7E8, 8, canframe.pack2(0x10, 0x14))
+//     println("${canisotp.first_len(f)}")   // 20
+// ```
+pub fn first_len(f: CanFrame) -> Int []
+    todo("can-nv.canisotp.first_len")
+
+// The four-bit sequence number a consecutive frame carries, or -1.
+pub fn consecutive_index(f: CanFrame) -> Int []
+    todo("can-nv.canisotp.consecutive_index")
+
+// The flow status a flow control frame carries, or -1.
+pub fn flow_status(f: CanFrame) -> Int []
+    todo("can-nv.canisotp.flow_status")
+
+// The block size a flow control frame asks for.
+pub fn flow_block_size(f: CanFrame) -> Int []
+    todo("can-nv.canisotp.flow_block_size")
+
+// The separation time a flow control frame asks for, in
+// MICROSECONDS.
+//
+// The field is one byte and its encoding is not linear: 0x00 to 0x7F
+// are milliseconds, 0xF1 to 0xF9 are 100 to 900 microseconds, and
+// everything else is reserved and treated as 127 ms.  A sender that
+// read 0xF1 as 241 milliseconds is 2400 times too slow and a sender
+// that read it as 241 microseconds is too fast; answering
+// microseconds throughout is what stops either.
+//
+// ```novo
+// use canisotp
+//
+// fn main() [io]
+//     println("${canisotp.st_min_us(0xF1)}")   // 100
+//     println("${canisotp.st_min_us(10)}")     // 10000
+// ```
+pub fn st_min_us(encoded: Int) -> Int []
+    todo("can-nv.canisotp.st_min_us")
+
+// The one-byte encoding of a separation time given in microseconds,
+// rounded up to something the field can express.
+pub fn st_min_encode(us: Int) -> Int []
+    todo("can-nv.canisotp.st_min_encode")
+
+// ── Building the frames ──────────────────────────────────────────────
+
+// A single frame carrying `len` bytes of the caller's payload.
+pub fn single_frame(id: Int, data: Int, len: Int) -> CanFrame []
+    todo("can-nv.canisotp.single_frame")
+
+// A first frame declaring a total message length and carrying its
+// first six bytes.
+pub fn first_frame(id: Int, total_len: Int, data: Int) -> CanFrame []
+    todo("can-nv.canisotp.first_frame")
+
+// A consecutive frame with sequence number `index` and up to seven
+// bytes.
+//
+// The sequence number wraps at 16 and STARTS AT 1, not 0 — the first
+// frame is implicitly 0, so a sender that numbered its first
+// consecutive frame 0 has its whole message rejected by a conforming
+// receiver.
+pub fn consecutive_frame(id: Int, index: Int, data: Int, len: Int) -> CanFrame []
+    todo("can-nv.canisotp.consecutive_frame")
+
+// A flow control frame.
+//
+// ```novo
+// use canisotp
+// use canframe
+//
+// fn main() [io]
+//     let f = canisotp.flow_frame(0x7E0, canisotp.CAN_ISOTP_CONTINUE, 8, 0xF1)
+//     println("${canframe.frame_byte(f, 1)}")   // 8, the block size
+// ```
+pub fn flow_frame(id: Int, status: Int, block_size: Int, st_min: Int) -> CanFrame []
+    todo("can-nv.canisotp.flow_frame")
+
+// The next sequence number after `index`, wrapping 15 to 0.
+pub fn next_index(index: Int) -> Int []
+    todo("can-nv.canisotp.next_index")
+
+// How many consecutive frames a message of `len` bytes needs after its
+// first frame.
+//
+// ```novo
+// use canisotp
+//
+// fn main() [io]
+//     println("${canisotp.consecutive_count(20)}")   // 2
+// ```
+pub fn consecutive_count(len: Int) -> Int []
+    todo("can-nv.canisotp.consecutive_count")
+
+// ── The session ──────────────────────────────────────────────────────
+
+// A transfer in progress, in either direction.
+//
+// Seven integers, and the payload buffer is the caller's.  The same
+// type serves a send and a receive, because the two are the same state
+// machine seen from different ends and a caller that ran both would
+// otherwise hold two.
+pub @value
+struct CanIsoTpSession
+    // One of the `CAN_ISOTP_STATE_*` codes.
+    state: Int
+    // The total message length, from a first frame or from the
+    // caller.
+    total: Int
+    // How many bytes have crossed so far.
+    done: Int
+    // The next sequence number expected or to be sent.
+    index: Int
+    // How many frames are left in this block before a flow control
+    // frame is due.  Zero with an unlimited block size means "never".
+    block_left: Int
+    // The separation time in force, in microseconds.
+    st_min_us: Int
+    // How many consecutive WAIT flow control frames have arrived,
+    // which is the counter that stops a stalled transfer from being
+    // forever.
+    waits: Int
+
+// Idle: nothing in progress.
+pub const CAN_ISOTP_STATE_IDLE = 0
+// Sending, and waiting for a flow control frame before the next
+// block.
+pub const CAN_ISOTP_STATE_WAIT_FLOW = 1
+// Sending consecutive frames.
+pub const CAN_ISOTP_STATE_SENDING = 2
+// Receiving consecutive frames.
+pub const CAN_ISOTP_STATE_RECEIVING = 3
+// The transfer finished.
+pub const CAN_ISOTP_STATE_DONE = 4
+// The transfer failed.  `session_fault` says why.
+pub const CAN_ISOTP_STATE_FAILED = 5
+
+// A session in the idle state.
+//
+// ```novo
+// use canisotp
+//
+// fn main() [io]
+//     println("${canisotp.session_state(canisotp.session())}")   // 0
+// ```
+pub fn session() -> CanIsoTpSession []
+    todo("can-nv.canisotp.session")
+
+// Begin sending a message of `total` bytes.
+pub fn begin_send(s: CanIsoTpSession, total: Int) -> CanIsoTpSession []
+    todo("can-nv.canisotp.begin_send")
+
+// Take a flow control frame while sending: adopt its block size and
+// separation time, or fail on an overflow, or count a wait.
+pub fn take_flow(s: CanIsoTpSession, f: CanFrame) -> CanIsoTpSession []
+    todo("can-nv.canisotp.take_flow")
+
+// Account for a consecutive frame just sent.
+pub fn sent_consecutive(s: CanIsoTpSession, len: Int) -> CanIsoTpSession []
+    todo("can-nv.canisotp.sent_consecutive")
+
+// Begin receiving, from a first frame, into a buffer of `capacity`
+// bytes.
+//
+// A capacity smaller than the declared length is what
+// `CAN_ISOTP_OVERFLOW` exists for, and `should_send_overflow` is the
+// question a receiver asks before it answers.
+pub fn begin_receive(s: CanIsoTpSession, f: CanFrame, capacity: Int) -> CanIsoTpSession []
+    todo("can-nv.canisotp.begin_receive")
+
+// Take a consecutive frame while receiving.
+//
+// A frame whose sequence number is not the expected one FAILS the
+// transfer rather than being skipped, because ISO-TP has no
+// retransmission: a gap means a frame was lost and the message cannot
+// be reassembled, and a receiver that carried on would hand its caller
+// a message with a hole in it.
+pub fn take_consecutive(s: CanIsoTpSession, f: CanFrame) -> CanIsoTpSession []
+    todo("can-nv.canisotp.take_consecutive")
+
+// Whether a flow control frame is due now.
+pub fn flow_due(s: CanIsoTpSession) -> Bool []
+    todo("can-nv.canisotp.flow_due")
+
+// Whether a receiver should answer OVERFLOW rather than CONTINUE for a
+// message of `total` bytes into a buffer of `capacity`.
+pub fn should_send_overflow(total: Int, capacity: Int) -> Bool []
+    todo("can-nv.canisotp.should_send_overflow")
+
+// The session's state code.
+pub fn session_state(s: CanIsoTpSession) -> Int []
+    todo("can-nv.canisotp.session_state")
+
+// The declared total length.
+pub fn session_total(s: CanIsoTpSession) -> Int []
+    todo("can-nv.canisotp.session_total")
+
+// How many bytes have crossed.
+pub fn session_done(s: CanIsoTpSession) -> Int []
+    todo("can-nv.canisotp.session_done")
+
+// The next sequence number.
+pub fn session_index(s: CanIsoTpSession) -> Int []
+    todo("can-nv.canisotp.session_index")
+
+// The separation time in force, in microseconds.
+pub fn session_st_min_us(s: CanIsoTpSession) -> Int []
+    todo("can-nv.canisotp.session_st_min_us")
+
+// How many frames remain in this block.
+pub fn session_block_left(s: CanIsoTpSession) -> Int []
+    todo("can-nv.canisotp.session_block_left")
+
+// How many consecutive WAIT frames have arrived.
+pub fn session_waits(s: CanIsoTpSession) -> Int []
+    todo("can-nv.canisotp.session_waits")
+
+// Whether the transfer is over, either way.
+pub fn session_is_finished(s: CanIsoTpSession) -> Bool []
+    todo("can-nv.canisotp.session_is_finished")
+
+// Why a failed session failed, or nothing.
+//
+// A `@value` struct cannot be a `Result` payload (SPEC § 14.5), so the
+// session carries a state code and this answers the reason beside it.
+pub fn session_fault(s: CanIsoTpSession) -> ?CanError []
+    todo("can-nv.canisotp.session_fault")
+
+// ── The four timers, as deadlines the caller arms ────────────────────
+
+// N_As: how long a sender waits for a frame it queued to reach the
+// bus.  1000 ms.
+pub const CAN_ISOTP_N_AS_MS = 1000
+// N_Bs: how long a sender waits for a flow control frame.  1000 ms.
+pub const CAN_ISOTP_N_BS_MS = 1000
+// N_Cr: how long a receiver waits for the next consecutive frame.
+// 1000 ms.
+pub const CAN_ISOTP_N_CR_MS = 1000
+// How many consecutive WAIT flow control frames a sender tolerates
+// before it gives up.  The specification leaves this to the
+// implementation and every implementation picks a number; this one is
+// the common one.
+pub const CAN_ISOTP_MAX_WAITS = 10
+
+// The deadline the session's current state wants armed, given the
+// clock the caller read.
+//
+// A `core` package has no clock, so this ANSWERS a moment rather than
+// waiting for one.  Which of the three timers it is depends on the
+// state, which is why it is one function rather than three constants
+// the caller has to choose between correctly.
+//
+// ```novo
+// use canisotp
+//
+// fn main() [io]
+//     println("${canisotp.deadline_ms(canisotp.session(), 0)}")
+// ```
+pub fn deadline_ms(s: CanIsoTpSession, now_ms: Int) -> Int []
+    todo("can-nv.canisotp.deadline_ms")
+
+// Whether the session's deadline has passed.
+pub fn timed_out(s: CanIsoTpSession, armed_at_ms: Int, now_ms: Int) -> Bool []
+    todo("can-nv.canisotp.timed_out")
+
+// The session moved to failed, with the timer that expired named.
+pub fn on_timeout(s: CanIsoTpSession) -> CanIsoTpSession []
+    todo("can-nv.canisotp.on_timeout")
+
+// ── Extended addressing ──────────────────────────────────────────────
+
+// Under extended addressing the first payload byte is an address and
+// everything else shifts down one, so a single frame carries six bytes
+// rather than seven.
+//
+// A whole second set of length constants would be four more names to
+// get wrong; one function that says how much room the addressing mode
+// costs is the same fact once.
+//
+// ```novo
+// use canisotp
+//
+// fn main() [io]
+//     println("${canisotp.addressing_overhead(true)}")   // 1
+// ```
+pub fn addressing_overhead(extended_addressing: Bool) -> Int []
+    todo("can-nv.canisotp.addressing_overhead")
+
+// The most bytes a single frame carries under this addressing mode.
+pub fn single_max(extended_addressing: Bool) -> Int []
+    todo("can-nv.canisotp.single_max")
+
+// The most bytes a consecutive frame carries under this addressing
+// mode.
+pub fn consecutive_max(extended_addressing: Bool) -> Int []
+    todo("can-nv.canisotp.consecutive_max")

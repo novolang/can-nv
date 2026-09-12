@@ -1,0 +1,68 @@
+[package]
+name        = "can-nv"
+version     = "0.0.1"
+description = "The CAN bus on a microcontroller and on Linux behind one interface: classic and CAN FD frames as values, acceptance filters and masks, the error-confinement state machine, a bounded transmit queue that sends by arbitration priority, ISO-TP segmented transport, a candump-shaped log line, the embedded-can peripheral trait, and SocketCAN over raw sockets.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`, with one host module named below.
+#
+# The row's own note is "the bus on a microcontroller and on Linux
+# behind one interface", and the microcontroller is the half that
+# decides the layer: a frame, a filter and an ISO-TP session are
+# arithmetic over integers a caller already holds, and an interrupt
+# handler on a part with 64 KB of RAM is where they run.  The plan
+# placed the row at `host` because SocketCAN is the visible half; the
+# narrow layer is declared here and the wide module named, which is
+# `docs/publishing.md` § A package with a core and a host half, and it
+# is what makes the device claim in `tests/embedded_probe.nv` a thing
+# the audit BUILDS.
+layer       = "core"
+
+# `cansocket` is the one module that performs: an `AF_CAN` raw socket
+# on Linux, bound to an interface whose index is read from
+# `/sys/class/net/`.  `[net]` and `[fs]`, and nothing else.
+host_modules = ["cansocket"]
+
+category    = "embedded"
+
+tags        = ["can", "canbus", "can-fd", "socketcan", "iso-tp", "candump", "embedded", "automotive", "no-alloc"]
+repository  = "https://github.com/novolang/can-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "A CAN frame that fits in three integers"
+
+[dependencies]
+# heapless-nv, for the transmit queue's bookkeeping and nothing else.
+#
+# A transmit queue is the one place in this package that is a
+# COLLECTION rather than a value, and heapless-nv is the package whose
+# whole rule is that the bookkeeping is its and the storage is the
+# caller's — which is exactly what a driver with a fixed frame array in
+# a `.bss` section wants.  `cantxq` adds the one thing a plain FIFO
+# cannot do: choose by arbitration priority, so a queue does not invert
+# the bus's own ordering.
+#
+# `^0.0.1` pins exactly 0.0.1 under the caret rule, which is what a
+# `0.0.x` range means.  heapless-nv is `core`, so `dep-layer` holds.
+#
+# NOT named by any module the device probe reaches: `canframe`,
+# `canfilter` and `canisotp` name nothing outside the language, which
+# keeps the probe's module closure to this package's own sources.
+#
+# NOT crc-nv.  A CAN frame's CRC is computed and checked by the
+# controller's hardware and never appears in software — a package that
+# carried one would be offering to do the one job the peripheral
+# already does.
+heapless-nv = "^0.0.1"

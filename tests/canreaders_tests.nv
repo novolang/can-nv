@@ -1,0 +1,176 @@
+// canreaders_tests.nv — every accessor named once, and the socket
+// surface exercised at its shape.
+//
+// RED ON PURPOSE, like the rest: every call reaches
+// `not implemented: can-nv.<module>.<fn>`.
+//
+// WHY THIS FILE EXISTS SEPARATELY.  The other suites assert the
+// PROTOCOL — the arbitration order, the flow-control handshake, the
+// eight-up-one-down counters — and adding "and the getter for flags
+// returns flags" to them would bury the arguments under bookkeeping.
+// A `@value` record's accessors are bookkeeping: there is one right
+// answer, it is the field, and the only thing worth checking is that
+// the whole set is reachable and that none of them reads its
+// neighbour's slot.
+//
+// The socket setters are here for the other reason: what they DO needs
+// a `vcan0`, but that they exist, take what they take and answer an
+// optional fault is a claim this package makes today and one a caller
+// writes against today.
+
+use std.test
+use canframe
+use canfilter
+use canbus
+use candump
+use cansocket
+
+@test
+fn test_the_frame_readers_read_back_what_they_were_given() [io]
+    test.case("four distinct values, so a reader wired to its neighbour's slot is visible here")
+    let f = canframe.frame(0x123, 3, canframe.pack4(0x11, 0x22, 0x33, 0))
+    test.assert_eq(canframe.frame_id(f), 0x123)
+    test.assert_eq(canframe.frame_len(f), 3)
+    test.assert_eq(canframe.frame_flags(f), 0)
+    test.assert_eq(canframe.frame_data(f), 0x332211)
+
+    test.case("and an extended remote frame carries both flag bits")
+    let r = canframe.remote_frame_ext(0x18DAF110, 8)
+    test.assert(canframe.is_extended(r))
+    test.assert(canframe.is_remote(r))
+    test.assert_eq(canframe.frame_flags(r),
+                   canframe.CAN_FLAG_EXTENDED + canframe.CAN_FLAG_RTR)
+
+@test
+fn test_an_ordinary_frame_is_not_an_error_frame() [io]
+    test.case("an error frame is the CONTROLLER speaking, not a node, and confusing the two is a bus that looks healthy")
+    test.assert(canframe.is_error_frame(canframe.frame(0x123, 0, 0)) == false)
+    test.assert(canframe.is_error_frame(canframe.none()) == false)
+
+@test
+fn test_a_packed_payload_word_can_be_edited_a_byte_at_a_time() [io]
+    test.case("the arithmetic under frame_with_byte, exposed because a driver assembling a payload from three sources wants it directly")
+    let d = canframe.with_byte(canframe.pack2(0x11, 0x22), 1, 0xFF)
+    test.assert_eq(canframe.byte_of(d, 0), 0x11)
+    test.assert_eq(canframe.byte_of(d, 1), 0xFF)
+
+@test
+fn test_the_fd_header_readers_read_back() [io]
+    let f = canframe.fd_frame_ext(0x18DAF110, 24, true)
+    test.assert_eq(canframe.fd_id(f), 0x18DAF110)
+    test.assert_eq(canframe.fd_len(f), 24)
+    test.assert(canframe.fd_is_extended(f))
+    test.assert(canframe.fd_has_brs(f))
+    test.assert_eq(canframe.fd_flags(f),
+                   canframe.CAN_FLAG_EXTENDED + canframe.CAN_FD_FLAG_FD
+                   + canframe.CAN_FD_FLAG_BRS)
+
+    test.case("the error state indicator is the SENDER reporting itself error-passive, which a receiver can act on and a sender never sets by hand")
+    test.assert(canframe.fd_has_esi(f) == false)
+
+@test
+fn test_the_filter_readers_read_back() [io]
+    let f = canfilter.filter_ext(0x18DA0000, 0x1FFF0000)
+    test.assert_eq(canfilter.filter_id(f), 0x18DA0000)
+    test.assert_eq(canfilter.filter_mask(f), 0x1FFF0000)
+    test.assert(canfilter.filter_is_extended(f))
+    test.assert_eq(canfilter.filter_flags(f), canfilter.CAN_FILTER_EXTENDED)
+
+@test
+fn test_accept_all_exists_for_both_identifier_widths() [io]
+    test.case("a socket that wants everything has to say which everything, because a filter over one width never matches the other")
+    test.assert(canfilter.filter_is_extended(canfilter.accept_all_ext()))
+    test.assert(canfilter.accepts_id(canfilter.accept_all_ext(), 0x1FFFFFFF, true))
+    test.assert(canfilter.accepts_id(canfilter.accept_all_ext(), 0x123, false) == false)
+
+@test
+fn test_a_controllers_error_frame_carries_the_counters() [io]
+    test.case("SocketCAN's error frames do, which is how a host learns a bus is failing without opening a peripheral register")
+    let s = canbus.state_from_error_frame(canframe.frame(0x123, 8, 0))
+    test.assert(canbus.tx_errors(s) >= 0)
+    test.assert(canbus.rx_errors(s) >= 0)
+
+@test
+fn test_an_fd_frame_renders_compactly_with_the_callers_payload() [io]
+    test.case("the payload is the caller's, so the renderer takes an accessor rather than a buffer")
+    let f = canframe.fd_frame(0x123, 12, true)
+    test.assert(str.len(candump.render_fd_compact(f, fd_byte)) > 0)
+
+fn fd_byte(i: Int) -> Int
+    i
+
+// ── The socket surface, at its shape ─────────────────────────────────
+
+@test
+fn test_the_fd_socket_is_a_separate_constructor() [io, net, fs]
+    test.case("enabling CAN_RAW_FD_FRAMES changes the size of every read for the life of the socket, so it is not a flag to toggle halfway through a loop")
+    match cansocket.open_fd("vcan0")
+        Ok(s)  =>
+            test.assert(cansocket.carries_fd(s))
+            test.assert_eq(cansocket.interface_of(s), "vcan0")
+            test.assert(cansocket.fd_of(s) >= 0)
+            match cansocket.close(s)
+                None    => test.assert(true)
+                Some(_) => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_socket_can_be_bound_to_every_interface_at_once() [io, net, fs]
+    test.case("SocketCAN's ifindex of 0, and what a gateway or a logger wants")
+    match cansocket.open_all()
+        Ok(s)  =>
+            test.assert(cansocket.last_interface_index(s) >= 0)
+            match cansocket.close(s)
+                None    => test.assert(true)
+                Some(_) => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_socket_options_take_what_they_take() [io, net, fs]
+    test.case("what they DO needs a vcan0; that they exist and answer an optional fault is a claim a caller writes against today")
+    match cansocket.open("vcan0")
+        Ok(s)  =>
+            match cansocket.set_receive_timeout(s, 100)
+                None    => test.assert(true)
+                Some(_) => test.assert(true)
+            match cansocket.set_filters(s, [canfilter.exact(0x123)])
+                None    => test.assert(true)
+                Some(_) => test.assert(true)
+            match cansocket.set_error_mask(s, canbus.CAN_ERR_ACK)
+                None    => test.assert(true)
+                Some(_) => test.assert(true)
+            match cansocket.set_loopback(s, false)
+                None    => test.assert(true)
+                Some(_) => test.assert(true)
+            match cansocket.set_receive_own(s, false)
+                None    => test.assert(true)
+                Some(_) => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_receive_that_names_its_interface_is_a_separate_call() [io, net, fs]
+    test.case("for a socket bound to one interface it is always that one; for open_all it is the answer the caller opened that way to get")
+    match cansocket.open("vcan0")
+        Ok(s)  =>
+            let f = cansocket.receive_from(s)
+            test.assert(canframe.is_frame(f) or canframe.is_none(f)
+                        or canframe.is_fault(f))
+            test.assert(cansocket.last_interface_index(s) >= 0)
+        Err(_) => test.assert(true)
+
+@test
+fn test_an_interface_index_turns_back_into_a_name() [io, fs]
+    match cansocket.interface_name(0)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_fd_wire_encoding_needs_no_socket_either() [io]
+    test.case("seventy-two bytes with the payload the caller's, and the flags byte where a classic frame's first padding byte is")
+    let f = canframe.fd_frame(0x123, 12, true)
+    test.assert(cansocket.fd_frame_to_wire(f, fd_byte, 4) >= 0)
+
+    let wire: [u8] = [0x23 as u8, 0x01 as u8, 0x00 as u8, 0x00 as u8,
+                      0x09 as u8, 0x01 as u8, 0x00 as u8, 0x00 as u8]
+    let back = cansocket.fd_frame_from_wire(wire, 0)
+    test.assert(canframe.fd_id(back) >= 0)

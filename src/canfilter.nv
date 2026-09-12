@@ -1,0 +1,236 @@
+// canfilter.nv — acceptance filters and masks, as values.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A FILTER IS A CONTROLLER'S ONLY DEFENCE.  A busy CAN bus carries
+// thousands of frames a second and a node cares about perhaps five of
+// them; a controller that interrupted on all of them would spend its
+// life in an interrupt handler.  Every CAN peripheral therefore has
+// hardware acceptance filters, and this module is the arithmetic for
+// deciding what to program into them and for deciding the same thing
+// in software when there are more filters than the hardware has.
+//
+// THE SAME VALUE PROGRAMS A REGISTER AND ANSWERS A QUESTION.  `accepts`
+// is the software evaluation of exactly what the hardware does — mask
+// the identifier, compare — so a filter that is programmed into a
+// peripheral and a filter that is evaluated in a receive callback
+// cannot disagree.  A driver with four hardware slots and nine filters
+// programs a WIDENED filter into the hardware (`merge`) and evaluates
+// the precise ones in software, which is the only correct way to do it
+// and is impossible to write without both halves in one place.
+//
+// A `@value` STRUCT OF THREE INTEGERS, so a filter table is an array
+// in a `.bss` section and costs nothing to hold.
+//
+// AN UNREACHABLE FILTER IS REFUSED.  A filter whose identifier has
+// bits its mask does not cover can never match: the comparison masks
+// both sides, so those bits are ignored and the filter accepts more
+// than its author wrote — or, with `inverted` set, rejects more.  It
+// is the single hardest CAN fault to find, because nothing anywhere
+// reports it and the symptom is frames that do not arrive.
+// `check_filter` is the refusal.
+
+// ── The filter ───────────────────────────────────────────────────────
+
+// One acceptance filter: an identifier, a mask over it, and flags.
+//
+// A bit set in `mask` is a bit that must MATCH.  A mask of 0 accepts
+// everything, and a mask of `CAN_SFF_MASK` accepts exactly one
+// standard identifier.
+pub @value
+struct CanFilter
+    // The identifier to compare against, already masked.
+    id: Int
+    // Which bits of the identifier must match.
+    mask: Int
+    // `CAN_FILTER_*` bits.
+    flags: Int
+
+// The filter matches extended (29-bit) identifiers rather than
+// standard ones.
+pub const CAN_FILTER_EXTENDED = 0x01
+// The filter's sense is inverted: a frame that matches is REJECTED.
+// SocketCAN's `CAN_INV_FILTER`, and the shape a caller wants for "I
+// want everything except the diagnostic traffic".
+pub const CAN_FILTER_INVERTED = 0x02
+// The filter also matches remote transmission requests.  Off by
+// default, because a node that answers its own remote frames is a
+// surprise a caller should ask for.
+pub const CAN_FILTER_ALLOW_RTR = 0x04
+
+// Build a filter over standard identifiers.
+//
+// ```novo
+// use canfilter
+//
+// fn main() [io]
+//     let f = canfilter.filter(0x100, 0x700)
+//     println("${canfilter.accepts_id(f, 0x123, false)}")   // true
+// ```
+pub fn filter(id: Int, mask: Int) -> CanFilter []
+    todo("can-nv.canfilter.filter")
+
+// Build a filter over extended identifiers.
+pub fn filter_ext(id: Int, mask: Int) -> CanFilter []
+    todo("can-nv.canfilter.filter_ext")
+
+// A filter that accepts exactly one standard identifier.
+//
+// ```novo
+// use canfilter
+//
+// fn main() [io]
+//     println("${canfilter.filter_mask(canfilter.exact(0x123))}")   // 2047
+// ```
+pub fn exact(id: Int) -> CanFilter []
+    todo("can-nv.canfilter.exact")
+
+// A filter that accepts exactly one extended identifier.
+pub fn exact_ext(id: Int) -> CanFilter []
+    todo("can-nv.canfilter.exact_ext")
+
+// A filter that accepts every standard identifier.
+pub fn accept_all() -> CanFilter []
+    todo("can-nv.canfilter.accept_all")
+
+// A filter that accepts every extended identifier.
+pub fn accept_all_ext() -> CanFilter []
+    todo("can-nv.canfilter.accept_all_ext")
+
+// The same filter with its sense inverted: what it accepted it now
+// rejects.
+pub fn inverted(f: CanFilter) -> CanFilter []
+    todo("can-nv.canfilter.inverted")
+
+// The same filter, also accepting remote frames.
+pub fn allowing_remote(f: CanFilter) -> CanFilter []
+    todo("can-nv.canfilter.allowing_remote")
+
+// The identifier.
+pub fn filter_id(f: CanFilter) -> Int []
+    todo("can-nv.canfilter.filter_id")
+
+// The mask.
+pub fn filter_mask(f: CanFilter) -> Int []
+    todo("can-nv.canfilter.filter_mask")
+
+// The flag bits.
+pub fn filter_flags(f: CanFilter) -> Int []
+    todo("can-nv.canfilter.filter_flags")
+
+// Whether the filter is over extended identifiers.
+pub fn filter_is_extended(f: CanFilter) -> Bool []
+    todo("can-nv.canfilter.filter_is_extended")
+
+// Whether the filter's sense is inverted.
+pub fn filter_is_inverted(f: CanFilter) -> Bool []
+    todo("can-nv.canfilter.filter_is_inverted")
+
+// ── Evaluating one ───────────────────────────────────────────────────
+
+// Whether the filter accepts a frame with this identifier and format.
+//
+// The exact arithmetic a peripheral's acceptance hardware does, so a
+// filter evaluated here and the same filter programmed into a
+// controller cannot disagree.  A filter over extended identifiers
+// never accepts a standard frame and the other way round, which is a
+// separate check from the mask and the one a caller forgets.
+//
+// ```novo
+// use canfilter
+//
+// fn main() [io]
+//     let f = canfilter.filter(0x100, 0x700)
+//     println("${canfilter.accepts_id(f, 0x1FF, false)}")   // true
+//     println("${canfilter.accepts_id(f, 0x2FF, false)}")   // false
+// ```
+pub fn accepts_id(f: CanFilter, id: Int, extended: Bool) -> Bool []
+    todo("can-nv.canfilter.accepts_id")
+
+// Whether the filter accepts this frame, its remote flag included.
+pub fn accepts(f: CanFilter, fr: CanFrame) -> Bool []
+    todo("can-nv.canfilter.accepts")
+
+// How many identifiers the filter accepts.
+//
+// The number that says whether a filter is doing its job: 1 is an
+// exact match, 2048 is every standard identifier, and a filter that a
+// caller believed was narrow answering 512 is the bug found before it
+// reaches a bus.
+//
+// ```novo
+// use canfilter
+//
+// fn main() [io]
+//     println("${canfilter.width(canfilter.filter(0x100, 0x700))}")   // 256
+// ```
+pub fn width(f: CanFilter) -> Int []
+    todo("can-nv.canfilter.width")
+
+// Why a filter cannot be used, or nothing.
+//
+// An identifier with bits outside its mask is the one that matters:
+// the comparison masks both sides, so those bits change nothing and
+// the filter accepts more than its author wrote.  Nothing anywhere
+// reports it, and the symptom is frames that do not arrive.
+//
+// ```novo
+// use canfilter
+//
+// fn main() [io]
+//     println("${canfilter.filter_id(canfilter.filter(0x123, 0x700))}")
+// ```
+pub fn check_filter(f: CanFilter) -> ?CanError []
+    todo("can-nv.canfilter.check_filter")
+
+// ── Fitting more filters than the hardware has ───────────────────────
+
+// The narrowest single filter that accepts everything both of these
+// do, and possibly more.
+//
+// The function a driver with four hardware slots and nine filters
+// needs.  What it answers is a WIDENING — it never rejects a frame
+// either input would have accepted — so the hardware filter is safe to
+// program and the precise ones are evaluated in software afterwards.
+// `false_accept_width` says how much was given away.
+//
+// Two filters of different identifier formats cannot be merged, and
+// the answer is then `accept_all` of neither — `can_merge` is the
+// question to ask first.
+//
+// ```novo
+// use canfilter
+//
+// fn main() [io]
+//     let m = canfilter.merge(canfilter.exact(0x100), canfilter.exact(0x101))
+//     println("${canfilter.width(m)}")   // 2
+// ```
+pub fn merge(a: CanFilter, b: CanFilter) -> CanFilter []
+    todo("can-nv.canfilter.merge")
+
+// Whether two filters can be merged at all: same identifier format,
+// same sense.
+pub fn can_merge(a: CanFilter, b: CanFilter) -> Bool []
+    todo("can-nv.canfilter.can_merge")
+
+// How many identifiers the merge of these two accepts that neither of
+// them did.
+//
+// The cost of the widening, as a number a driver can compare against a
+// budget: a merge that lets through 4096 extra identifiers on a bus
+// carrying 200 is a merge that has switched the filter off.
+pub fn false_accept_width(a: CanFilter, b: CanFilter) -> Int []
+    todo("can-nv.canfilter.false_accept_width")
+
+// Whether `a` accepts everything `b` does, so `b` adds nothing beside
+// it.
+//
+// The check that finds a redundant filter, which is the other half of
+// fitting nine filters into four slots: two of the nine are usually
+// the same filter written twice.
+pub fn covers(a: CanFilter, b: CanFilter) -> Bool []
+    todo("can-nv.canfilter.covers")
+
+// Whether any identifier is accepted by both.
+pub fn overlaps(a: CanFilter, b: CanFilter) -> Bool []
+    todo("can-nv.canfilter.overlaps")
