@@ -1,6 +1,6 @@
 [package]
 name        = "can-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "The CAN bus on a microcontroller and on Linux behind one interface: classic and CAN FD frames as values, acceptance filters and masks, the error-confinement state machine, a bounded transmit queue that sends by arbitration priority, ISO-TP segmented transport, a candump-shaped log line, the embedded-can peripheral trait, and SocketCAN over raw sockets.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
