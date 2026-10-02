@@ -197,7 +197,7 @@ pub fn receive(s: CanSocket) -> CanFrame [net]
 // sixteen or seventy-two bytes go straight to a file, and
 // `frame_from_wire` decodes them only if the program cares what they
 // say.
-pub fn receive_into(s: CanSocket, mut dst: Cursor) -> Result<Int, CanError> [net]
+pub fn receive_into(s: CanSocket, var dst: Cursor) -> Result<Int, CanError> [net]
     todo("can-nv.cansocket.receive_into")
 
 // Take the next frame and say which interface it arrived on.
