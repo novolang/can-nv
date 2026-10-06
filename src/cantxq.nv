@@ -20,18 +20,13 @@
 // named, so a driver's choice is visible at its call site rather than
 // implied by which package it picked.
 //
-// THE STORAGE IS THE CALLER'S.  This module holds heapless-nv's
-// bookkeeping and answers INDICES into an array the caller owns —
-// which on a device is a fixed `[CanFrame; N]` in a `.bss` section
-// sized to that product's burst.  A queue that owned its frames would
-// have to allocate, and a `@value` struct cannot own a buffer anyway
-// (SPEC § 14.3).
-//
-// NOT IN THE DEVICE PROBE, on purpose.  This is the one module in the
-// package that names a dependency, and keeping it out of
-// `tests/embedded_probe.nv` keeps the probe's closure to this
-// package's own sources.  It would build for a device — heapless-nv
-// makes its own claim — and the README says so.
+// THE STORAGE IS THE CALLER'S.  This module holds the bookkeeping and
+// answers INDICES into storage the caller declares.  On a device that
+// is a `Vec[CanFrame; N]` from the language's fixed-capacity family
+// (SPEC section 14.8), a module-level `var` sized to that product's
+// burst.  The queue cannot own that storage itself, because a
+// capacity is an integer literal in the type and a package cannot be
+// generic over it.
 
 use canframe
 
@@ -40,9 +35,8 @@ use canframe
 // A bounded transmit queue: which slots of the caller's array are
 // occupied, and in what order they arrived.
 //
-// The frames themselves are the caller's.  What this holds is a
-// heapless-nv `BoundedFifo`'s bookkeeping plus the count, which is
-// four integers.
+// The frames themselves are the caller's.  What this holds is a ring's
+// bookkeeping and a drop count, which is four integers.
 pub @value
 struct CanTxQueue
     // The index of the oldest occupied slot.
@@ -92,10 +86,9 @@ pub fn dropped(q: CanTxQueue) -> Int []
 // Which slot of the caller's array the next frame goes in, or -1 when
 // the queue is full.
 //
-// The caller writes the frame there itself and then calls `enqueued`,
-// which is heapless-nv's own two-step shape: the bookkeeping is this
-// package's and the storage is the caller's, so nothing here ever
-// holds a frame.
+// The caller writes the frame there itself and then calls `enqueued`.
+// The bookkeeping is this package's and the storage is the caller's,
+// so nothing here ever holds a frame.
 //
 // ```novo
 // use cantxq
@@ -114,8 +107,8 @@ pub fn enqueued(q: CanTxQueue) -> CanTxQueue []
 // room.
 //
 // Nothing here panics when full: `enqueue_at` answers -1 and the
-// caller decides.  That is heapless-nv's rule and it is the right one
-// for a transmit path in an interrupt, where a panic is a reset.
+// caller decides.  A transmit path runs in an interrupt, where a panic
+// is a reset.
 pub fn dropped_one(q: CanTxQueue) -> CanTxQueue []
     todo("can-nv.cantxq.dropped_one")
 

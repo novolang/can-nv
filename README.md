@@ -84,6 +84,8 @@ novo pkg add can-nv
 
 ## Example
 
+This example compiles; every call in it panics until 0.1.0.
+
 ```novo
 use canframe
 use canfilter
@@ -205,7 +207,16 @@ and the compiler checks that claim on every build. Eight of the nine modules
 carry no effects and are inside the claim: `canframe`, `canfilter`,
 `canisotp`, `canbus`, `cantxq`, `candump`, `canhal` and `canerr`.
 
-`tests/embedded_probe.nv` is that claim as a program that either builds or
+`cansocket` is outside the claim. It names `std.net`, and one host-only
+function anywhere in a compilation unit is an undefined symbol at link time
+on a device, whether or not the firmware calls it. The manifest names it in
+`host_modules`, so a device build leaves it out.
+
+The registry measures the tiers per module, and its page for this package
+shows the split: the embedded, rt and wasm tiers list the eight modules above,
+and `cansocket` is absent from them. The system and app tiers cover all nine.
+
+`tests/embedded_probe.nv` is the claim as a program that either builds or
 does not. It covers `canframe`, `canfilter` and `canisotp`, which is the
 receive path an interrupt handler runs.
 
@@ -213,23 +224,20 @@ receive path an interrupt handler runs.
 novo build --target=nrf52-qemu tests/embedded_probe.nv
 ```
 
-That command was run against this release. It produces a Cortex-M4
-executable, `embedded_probe.elf`. The probe builds; it is not run, because
-every function it calls is a `todo()` that would panic on the first line.
+The command produces a Cortex-M4 executable, `embedded_probe.elf`. The probe
+builds and is not run, because every function it calls is a `todo()` that
+would panic on the first line.
 
-`cansocket` is outside the claim. It names `std.net`, and one host-only
-function anywhere in a compilation unit is an undefined symbol at link time
-on a device, whether or not the firmware calls it.
-
-**Neither board this project supports has a CAN controller.** The nRF52840
-has none and the RP2040 has none. Those parts need an external MCP2515, or an
-MCP2518FD for CAN FD, driven over SPI, which is a board's driver rather than
-anything this package supplies. `canhal.controller_of` answers
-`CAN_CONTROLLER_NONE` for `nrf52840-dk`, `nrf52832-dk` and `rp2040`, so a
-firmware build fails with a name in the message rather than on a bench. The
-parts with a controller on the die are STM32 (bxCAN on the F1, F4 and L4;
-FDCAN on the G0, G4, H7 and U5), NXP's FlexCAN in the i.MX RT, S32K and LPC
-families, the ESP32's TWAI, Atmel SAM C and E, and Infineon AURIX.
+**A CAN controller is on the die of some parts and not others.** The
+nRF52840, the nRF52832 and the RP2040 have none. Those parts need an
+external MCP2515, or an MCP2518FD for CAN FD, driven over SPI, which is a
+board's driver rather than anything this package supplies.
+`canhal.controller_of` answers `CAN_CONTROLLER_NONE` for `nrf52840-dk`,
+`nrf52832-dk` and `rp2040`, so a firmware build fails with a name in the
+message rather than on a bench. The parts with a controller on the die are
+STM32 (bxCAN on the F1, F4 and L4; FDCAN on the G0, G4, H7 and U5), NXP's
+FlexCAN in the i.MX RT, S32K and LPC families, the ESP32's TWAI, Atmel SAM C
+and E, and Infineon AURIX.
 
 ## What is not included
 
@@ -237,8 +245,8 @@ families, the ESP32's TWAI, Atmel SAM C and E, and Infineon AURIX.
   chip select. That belongs with the board.
 - **CAN database files.** The `.dbc` format names the signals a bus carries
   and gives each one a scale and an offset. `canframe.signal_be` and
-  `signal_le` are the arithmetic underneath it, and the parser is a package
-  that does not exist yet.
+  `signal_le` are the arithmetic underneath it. A DBC parser is a package
+  of its own.
 - **UDS and J1939.** Both sit on ISO-TP rather than in it. J1939 redefines
   the 29-bit identifier as a structured field, which makes it a package of
   its own.
@@ -251,9 +259,10 @@ families, the ESP32's TWAI, Atmel SAM C and E, and Infineon AURIX.
 
 ## Related packages
 
-- [heapless-nv](https://novo-lang.org/packages/heapless-nv) is the
-  fixed-capacity containers this package's transmit queue is built on. A
-  bounded queue on a device needs storage that is not the heap.
+- The language's fixed-capacity collections, `Vec[T; N]` and its family
+  (SPEC section 14.8), are the storage a transmit queue's frames live in on a
+  device. `cantxq` keeps the bookkeeping and answers indices into that
+  storage.
 - [bitfield-nv](https://novo-lang.org/packages/bitfield-nv) describes a
   hardware register's bits. A driver for an external CAN controller
   configures it through registers, and that is where the descriptions go.

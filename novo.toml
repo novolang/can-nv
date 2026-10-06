@@ -1,6 +1,6 @@
 [package]
 name        = "can-nv"
-version     = "0.0.2"
+version     = "0.0.3"
 description = "The CAN bus on a microcontroller and on Linux behind one interface: classic and CAN FD frames as values, acceptance filters and masks, the error-confinement state machine, a bounded transmit queue that sends by arbitration priority, ISO-TP segmented transport, a candump-shaped log line, the embedded-can peripheral trait, and SocketCAN over raw sockets.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
@@ -44,25 +44,12 @@ novo        = ">= 0.8.9"
 "README.md" = "A CAN frame that fits in three integers"
 
 [dependencies]
-# heapless-nv, for the transmit queue's bookkeeping and nothing else.
-#
-# A transmit queue is the one place in this package that is a
-# COLLECTION rather than a value, and heapless-nv is the package whose
-# whole rule is that the bookkeeping is its and the storage is the
-# caller's — which is exactly what a driver with a fixed frame array in
-# a `.bss` section wants.  `cantxq` adds the one thing a plain FIFO
-# cannot do: choose by arbitration priority, so a queue does not invert
-# the bus's own ordering.
-#
-# `^0.0.1` pins exactly 0.0.1 under the caret rule, which is what a
-# `0.0.x` range means.  heapless-nv is `core`, so `dep-layer` holds.
-#
-# NOT named by any module the device probe reaches: `canframe`,
-# `canfilter` and `canisotp` name nothing outside the language, which
-# keeps the probe's module closure to this package's own sources.
+# None.  Every module is arithmetic over values the caller holds, and
+# `cansocket` reaches the kernel through the standard library's
+# `std.net`.  The transmit queue's frames live in storage the caller
+# declares, which on a device is one of the language's fixed-capacity
+# collections (SPEC section 14.8), so the queue needs no collection
+# package.
 #
 # NOT crc-nv.  A CAN frame's CRC is computed and checked by the
-# controller's hardware and never appears in software — a package that
-# carried one would be offering to do the one job the peripheral
-# already does.
-heapless-nv = "^0.0.1"
+# controller's hardware and never appears in software.

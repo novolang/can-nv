@@ -17,9 +17,9 @@
 // session's whole state is a message length, a byte offset, a
 // four-bit sequence counter, a block counter and two timers' worth of
 // deadline — seven integers.  The payload it is assembling is the
-// caller's buffer, which on a device is a fixed array in `.bss` sized
-// to the largest message that product expects.  That is the same rule
-// heapless-nv follows and the reason this module builds for a
+// caller's buffer, which on a device is a fixed-capacity collection
+// sized to the largest message that product expects.  Keeping the
+// buffer out of the state is the reason this module builds for a
 // Cortex-M.
 //
 // TIME IS THE CALLER'S.  A `core` package has no clock, so every

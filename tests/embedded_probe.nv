@@ -17,13 +17,10 @@
 // own frame, which is the property this file exists to keep true.
 //
 // WHAT IS DELIBERATELY OUT.  `cansocket` is `host` and named in the
-// manifest's `host_modules`, so the audit leaves it behind.  `cantxq`
-// is the one module that names heapless-nv, and leaving it out keeps
-// the probe's closure to this package's own sources — it would build,
-// since heapless-nv makes its own device claim, and the README says
-// so.  `canbus`, `candump` and `canhal` are `core` and would build
-// too; they are not named here because the claim this file makes
-// should be the claim the README makes.
+// manifest's `host_modules`, so the audit leaves it behind.
+// `cantxq`, `canbus`, `candump` and `canhal` are `core` and check
+// clean at the embedded tier too; they are not named here because this
+// file covers the receive path an interrupt handler runs.
 //
 // THE PROBE NAMES ONLY THIS PACKAGE'S TYPES.
 //

@@ -57,7 +57,7 @@ fn test_a_fresh_queue_is_empty_and_has_dropped_nothing() [io]
 
 @test
 fn test_enqueueing_is_two_steps_because_the_storage_is_the_callers() [io]
-    test.case("heapless-nv's own shape: this answers a slot, the caller writes the frame, and nothing here ever holds one")
+    test.case("this answers a slot, the caller writes the frame, and nothing here ever holds one")
     var q = cantxq.queue(4)
     test.assert_eq(cantxq.enqueue_at(q), 0)
     q = cantxq.enqueued(q)

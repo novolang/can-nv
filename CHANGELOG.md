@@ -5,6 +5,34 @@ All notable changes to can-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.0.3 — 2026-10-06
+
+The interface is unchanged: no signature, type or effect row moved, and
+every body is still `todo()`.
+
+### Removed
+
+- The dependency on heapless-nv, which is withdrawn.  No module used a
+  heapless-nv type, so no signature changes.  The transmit queue's
+  frames live in storage the caller declares, which on a device is one
+  of the language's fixed-capacity collections, `Vec[CanFrame; N]`
+  (SPEC section 14.8).  The comments in `cantxq`, `canisotp` and the
+  device probe say so instead of naming heapless-nv.
+
+### Changed
+
+- The README's "Running on a microcontroller" section says what the
+  registry shows: the embedded, rt and wasm tiers list the eight device
+  modules, and `cansocket` is absent from them.  Version 0.0.2 was
+  published on 2026-09-15, before the registry measured tiers per
+  module (2026-09-23), so its page listed only the system and app
+  tiers.  This release is the first whose page shows the split.
+- The example carries the interface stamp beside it.
+- Sentences about this project's state moved here from the README.  On
+  2026-10-06 none of the boards novo-lang supports has a CAN controller
+  on the die, and no DBC parser is published.  The probe command in the
+  README was run against this release on that date.
+
 ## 0.0.2 — 2026-09-15
 
 README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.
