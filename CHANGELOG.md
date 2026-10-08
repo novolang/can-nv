@@ -5,6 +5,13 @@ All notable changes to can-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.1 (2026-10-08)
+
+The toolchain floor is 0.19.4.  A build that resolves embedded-hal-nv
+afresh takes 0.3.2, whose floor is 0.19.4, so 0.1.0's floor of 0.19.3
+named a toolchain the dependency does not build on.  Nothing else
+changed.
+
 ## 0.1.0 (2026-10-08)
 
 The first release with bodies.  0.0.3, the interface release, had a

@@ -1,6 +1,6 @@
 [package]
 name        = "can-nv"
-version     = "0.1.0"
+version     = "0.1.1"
 description = "The CAN bus on a microcontroller and on Linux behind one interface: classic and CAN FD frames as values, acceptance filters by mask and by list, the error-confinement state machine, a bit-timing solver, a transmit queue that sends by arbitration priority and a receive ring over the caller's frames, ISO-TP, candump lines, drivers for ST's bxCAN and FDCAN (Bosch M_CAN), a loopback controller for tests and emulators, and SocketCAN over raw sockets.  Nothing is allocated after start-up on a device."
 license     = "Apache-2.0"
 
@@ -21,9 +21,10 @@ category    = "embedded"
 tags        = ["can", "canbus", "can-fd", "socketcan", "iso-tp", "candump", "embedded", "automotive", "no-alloc"]
 repository  = "https://github.com/novolang/can-nv"
 maintainers = ["novo-lang"]
-# The toolchain floor: embedded-hal-nv 0.3.0, which `canboard` is
-# written over, calls hal.can, which 0.19.3 first has.
-novo        = ">= 0.19.3"
+# The toolchain floor: `canboard` is written over embedded-hal-nv, and a
+# build that resolves it afresh takes 0.3.2, whose Watchdog bodies call
+# hal.watchdog, which 0.19.4 first has.
+novo        = ">= 0.19.4"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
