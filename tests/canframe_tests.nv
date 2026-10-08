@@ -91,8 +91,14 @@ fn test_the_smaller_identifier_wins_the_bus() [io]
                                           canframe.frame(0x100, 0, 0)) == false)
 
     test.case("a standard identifier beats an extended one sharing its first eleven bits, because the extension bit is recessive")
+    // The first eleven bits of a 29-bit identifier are its top eleven,
+    // so the extended frame that shares 0x123's is 0x123 << 18.
     test.assert(canframe.wins_arbitration(canframe.frame(0x123, 0, 0),
-                                          canframe.frame_ext(0x123, 0, 0)))
+                                          canframe.frame_ext(0x123 << 18, 0, 0)))
+
+    test.case("and an extended identifier whose top eleven bits are smaller wins against a larger standard one")
+    test.assert(canframe.wins_arbitration(canframe.frame_ext(0x123, 0, 0),
+                                          canframe.frame(0x123, 0, 0)))
 
     test.case("and a data frame beats a remote frame with the same identifier, for the same reason")
     test.assert(canframe.wins_arbitration(canframe.frame(0x123, 0, 0),
@@ -107,8 +113,11 @@ fn test_the_arbitration_key_orders_the_same_way_the_bus_does() [io]
 
     test.case("and it agrees with wins_arbitration on every pair, which is what makes it safe to sort by")
     let std_key = canframe.arbitration_key(canframe.frame(0x123, 0, 0))
-    let ext_key = canframe.arbitration_key(canframe.frame_ext(0x123, 0, 0))
+    let ext_key = canframe.arbitration_key(canframe.frame_ext(0x123 << 18, 0, 0))
     test.assert(std_key < ext_key)
+    let rtr_key = canframe.arbitration_key(canframe.remote_frame(0x123, 0))
+    test.assert(std_key < rtr_key)
+    test.assert(rtr_key < ext_key)
 
 @test
 fn test_nothing_arrived_is_not_a_frame_and_says_so() [io]
@@ -170,6 +179,9 @@ fn test_the_gaps_are_why_a_payload_is_padded() [io]
 
     test.assert_eq(canframe.fd_padded_len(9), 12)
     test.assert_eq(canframe.fd_padded_len(33), 48)
+    test.assert_eq(canframe.fd_padded_len(48), 48)
+    test.assert_eq(canframe.fd_padded_len(49), 64)
+    test.assert_eq(canframe.fd_padded_len(64), 64)
     test.assert_eq(canframe.fd_padded_len(8), 8)
 
 @test
@@ -217,3 +229,91 @@ fn test_the_flag_bits_do_not_collide() [io]
     test.assert_eq(canframe.CAN_FLAG_ERROR, 0x04)
     test.assert_eq(canframe.CAN_FLAG_NONE, 0x80)
     test.assert_eq(canframe.CAN_FLAG_FAULT, 0x100)
+
+@test
+fn test_an_fd_receive_says_nothing_or_a_refusal_the_same_way() [io]
+    test.assert(canframe.fd_is_none(canframe.fd_none()))
+    test.assert(canframe.fd_is_frame(canframe.fd_none()) == false)
+    let bad = canframe.fd_fault(canframe.CAN_FAULT_BAD_LENGTH)
+    test.assert(canframe.fd_is_fault(bad))
+    test.assert(canframe.fd_is_frame(bad) == false)
+    test.assert(canframe.fd_is_fd(canframe.fd_frame(0x123, 12, false)))
+    test.case("a classic frame received on the FD path keeps its header and has the FD flag clear")
+    let c = canframe.fd_of_classic(canframe.remote_frame_ext(0x18DAF110, 4))
+    test.assert(canframe.fd_is_fd(c) == false)
+    test.assert(canframe.fd_is_extended(c))
+    test.assert_eq(canframe.fd_len(c), 4)
+
+// Whether `e` is the refusal `CanIdTooWide` for an extended identifier.
+fn too_wide_ext(e: ?CanError) -> Bool
+    match e
+        Some(CanIdTooWide(_, ext)) => ext
+        _                          => false
+
+@test
+fn test_a_byte_outside_the_eight_changes_nothing() [io]
+    let f = canframe.frame(0x123, 2, 0x2211)
+    test.assert_eq(canframe.frame_len(canframe.frame_with_byte(f, 8, 0xFF)), 2)
+    test.assert_eq(canframe.frame_data(canframe.frame_with_byte(f, 0 - 1, 0xFF)), 0x2211)
+    test.assert_eq(canframe.byte_of(0x2211, 8), 0)
+    test.assert_eq(canframe.byte_of(0x2211, 0 - 1), 0)
+    test.assert_eq(canframe.with_byte(0x2211, 8, 0xFF), 0x2211)
+
+@test
+fn test_an_extended_remote_frame_sends_its_own_rtr_bit_last() [io]
+    let k = canframe.arbitration_key(canframe.remote_frame_ext(0x18DAF110, 0))
+    test.assert_eq(k & 1, 1)
+    test.assert(canframe.wins_arbitration(canframe.frame_ext(0x18DAF110, 0, 0), canframe.remote_frame_ext(0x18DAF110, 0)))
+
+@test
+fn test_a_remote_frame_given_a_payload_is_refused() [io]
+    let f = canframe.frame_with_byte(canframe.remote_frame(0x123, 1), 0, 5)
+    match canframe.check_frame(f)
+        Some(CanRemoteWithPayload(id)) => test.assert_eq(id, 0x123)
+        _                              => test.assert(false)
+
+@test
+fn test_every_fault_code_answers_its_error() [io]
+    test.assert_eq(canframe.fault_code(canframe.frame(0x123, 0, 0)), 0)
+    match canframe.fault_of(canframe.fault(canframe.CAN_FAULT_ID_TOO_WIDE))
+        Some(CanIdTooWide(_, _)) => test.assert(true)
+        _                        => test.assert(false)
+    match canframe.fault_of(canframe.fault(canframe.CAN_FAULT_BAD_LENGTH))
+        Some(CanLengthTooLong(_)) => test.assert(true)
+        _                         => test.assert(false)
+    match canframe.fault_of(canframe.fault(canframe.CAN_FAULT_REFUSED))
+        Some(CanSocketRefused(d)) => test.assert_eq(d, "the controller or the socket refused")
+        _                         => test.assert(false)
+    match canframe.fault_of(canframe.fault(canframe.CAN_FAULT_DISCONNECTED))
+        Some(CanSocketRefused(d)) => test.assert_eq(d, "the peer went away")
+        _                         => test.assert(false)
+    match canframe.fault_of(canframe.fault(canframe.CAN_FAULT_MALFORMED))
+        Some(CanBadLogLine(_)) => test.assert(true)
+        _                      => test.assert(false)
+
+@test
+fn test_a_signal_outside_the_payload_reads_as_zero_and_a_whole_payload_reads_whole() [io]
+    let d = canframe.pack8(1, 2, 3, 4, 5, 6, 7, 8)
+    test.assert_eq(canframe.signal_be(d, 60, 8), 0)
+    test.assert_eq(canframe.signal_be(d, 0, 0), 0)
+    test.assert_eq(canframe.signal_le(d, 0 - 1, 8), 0)
+    test.assert_eq(canframe.signal_le(d, 0, 0), 0)
+    test.case("64 bits is the payload itself, byte 0 first in Motorola order and last in Intel order")
+    test.assert_eq(canframe.signal_be(d, 0, 64), 0x0102030405060708)
+    test.assert_eq(canframe.signal_le(d, 0, 64), d)
+
+@test
+fn test_negative_and_oversized_lengths_and_codes() [io]
+    test.assert_eq(canframe.dlc_for(0 - 1), 0 - 1)
+    test.assert_eq(canframe.fd_len_for_dlc(0 - 1), 0)
+    test.assert_eq(canframe.classic_len_for_dlc(0 - 1), 0)
+    test.assert_eq(canframe.fd_padded_len(65), 0 - 1)
+
+@test
+fn test_an_fd_header_with_an_identifier_too_wide_is_refused() [io]
+    test.assert(too_wide_ext(canframe.check_fd_frame(canframe.fd_frame_ext(0x20000000, 8, false))))
+    test.assert(too_wide_ext(canframe.check_fd_frame(canframe.fd_frame_ext(0 - 1, 8, false))))
+    match canframe.check_fd_frame(canframe.fd_frame(0x800, 8, true))
+        Some(CanIdTooWide(id, ext)) => test.assert(id == 0x800 and not ext)
+        _                           => test.assert(false)
+    test.assert(canframe.check_fd_frame(canframe.fd_frame_ext(0x1FFFFFFF, 64, true)) == None)

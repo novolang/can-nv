@@ -1,0 +1,281 @@
+// The loopback controller, the receive ring and the transmit queue
+// driven together through `canhal.CanPeripheral`: what a program does
+// on a board, with the bus in memory.
+
+use std.test
+use canframe
+use canfilter
+use canbus
+use canhal
+use canloop
+use canring
+use cantxq
+
+// The program's transmit queue storage, which `key_at` reads.
+var txq_frames: Vec[CanFrame; 8] = Vec.new()
+
+fn key_at(i: Int) -> Int [mutate]
+    canframe.arbitration_key(txq_frames[i])
+
+fn prepare_txq() [mutate]
+    txq_frames.clear()
+    for _i in 0..8
+        let _ = txq_frames.push(canframe.none())
+
+@test
+fn test_a_frame_sent_in_internal_mode_comes_back() [io, mutate]
+    let c = canloop.reset(canloop.LOOP_INTERNAL)
+    let a = c.can_transmit(canframe.frame(0x123, 3, 0x332211))
+    test.assert(canhal.tx_ok(a))
+    test.assert(c.can_tx_done(canhal.accepted_mailbox(a)))
+    let f = c.can_receive()
+    test.assert(canframe.is_frame(f))
+    test.assert_eq(canframe.frame_id(f), 0x123)
+    test.assert_eq(canframe.frame_byte(f, 2), 0x33)
+    test.assert(canframe.is_none(c.can_receive()))
+    test.assert_eq(canbus.state_of(c.can_bus_state()), canbus.CAN_STATE_ERROR_ACTIVE)
+
+@test
+fn test_the_bus_sends_the_pending_frame_that_wins_first() [io, mutate]
+    let c = canloop.reset(canloop.LOOP_INTERNAL)
+    let _ = c.can_transmit(canframe.frame(0x300, 0, 0))
+    let _ = c.can_transmit(canframe.frame(0x100, 0, 0))
+    let _ = c.can_transmit(canframe.frame(0x200, 0, 0))
+    test.assert_eq(canframe.frame_id(c.can_receive()), 0x100)
+    test.assert_eq(canframe.frame_id(c.can_receive()), 0x200)
+    test.assert_eq(canframe.frame_id(c.can_receive()), 0x300)
+
+@test
+fn test_a_fourth_frame_displaces_the_one_that_loses() [io, mutate]
+    let c = canloop.reset(canloop.LOOP_INTERNAL)
+    let _ = c.can_transmit(canframe.frame(0x300, 0, 0))
+    let _ = c.can_transmit(canframe.frame(0x600, 0, 0))
+    let _ = c.can_transmit(canframe.frame(0x200, 0, 0))
+    test.case("0x100 outranks 0x600, which sat in mailbox 1")
+    let a = c.can_transmit(canframe.frame(0x100, 0, 0))
+    test.assert(canhal.tx_ok(a))
+    test.assert_eq(canhal.accepted_displaced(a), 1)
+    test.case("0x700 outranks nothing pending, so the mailboxes are full for it")
+    let b = c.can_transmit(canframe.frame(0x700, 0, 0))
+    test.assert_eq(canhal.tx_status(b), canhal.CAN_TX_FULL)
+
+@test
+fn test_mask_list_and_inverted_filters_decide_what_is_received() [io, mutate]
+    let c = canloop.reset(canloop.LOOP_INTERNAL)
+    test.assert(refused(c.can_set_filter(0, canfilter.filter(0x100, 0x700))) == false)
+    test.assert(refused(c.can_set_filter(1, canfilter.list(0x2A0, 0x2A5))) == false)
+    for id in [0x123, 0x2A0, 0x2A1, 0x2A5, 0x300]
+        let _ = c.can_transmit(canframe.frame(id, 0, 0))
+        canloop.run()
+    test.assert_eq(canframe.frame_id(c.can_receive()), 0x123)
+    test.assert_eq(canframe.frame_id(c.can_receive()), 0x2A0)
+    test.assert_eq(canframe.frame_id(c.can_receive()), 0x2A5)
+    test.assert(canframe.is_none(c.can_receive()))
+
+    test.case("an inverted filter takes everything but what it matches")
+    let d = canloop.reset(canloop.LOOP_INTERNAL)
+    let _ = d.can_set_filter(0, canfilter.inverted(canfilter.filter(0x700, 0x700)))
+    let _ = d.can_transmit(canframe.frame(0x7DF, 0, 0))
+    let _ = d.can_transmit(canframe.frame(0x123, 0, 0))
+    test.assert_eq(canframe.frame_id(d.can_receive()), 0x123)
+    test.assert(canframe.is_none(d.can_receive()))
+
+    test.case("and a slot past the last is refused")
+    test.assert(refused(d.can_set_filter(14, canfilter.accept_all())))
+
+@test
+fn test_a_full_fifo_counts_what_it_lost() [io, mutate]
+    let c = canloop.reset(canloop.LOOP_INTERNAL)
+    for i in 0..20
+        let _ = c.can_transmit(canframe.frame(i, 0, 0))
+        canloop.run()
+    test.assert_eq(canloop.pending_rx(), canloop.LOOP_RX_DEPTH)
+    test.assert_eq(canloop.overruns(), 4)
+    test.assert_eq(canframe.frame_id(c.can_receive()), 0)
+
+@test
+fn test_a_node_alone_goes_bus_off_after_thirty_two_frames_and_recovers() [io, mutate]
+    let c = canloop.reset(canloop.LOOP_ALONE)
+    canloop.set_error_frames(true)
+    var sent = 0
+    while canbus.may_transmit(c.can_bus_state())
+        let a = canhal.transmit_checked(c, canframe.frame(0x123, 0, 0))
+        test.assert(canhal.tx_ok(a))
+        canloop.run()
+        sent = sent + 1
+    test.assert_eq(sent, canbus.would_go_bus_off_alone())
+    test.assert_eq(canbus.state_of(c.can_bus_state()), canbus.CAN_STATE_BUS_OFF)
+
+    test.case("an error frame reported each failure with the counters in it")
+    let e = c.can_receive()
+    test.assert(canframe.is_error_frame(e))
+    test.assert_eq(canbus.error_kinds(e), canbus.CAN_ERR_ACK)
+    test.assert_eq(canbus.tx_errors(canbus.state_from_error_frame(e)), 8)
+
+    test.case("a bus-off node refuses to transmit rather than spinning")
+    test.assert_eq(canhal.tx_status(canhal.transmit_checked(c, canframe.frame(0x123, 0, 0))),
+        canhal.CAN_TX_BUS_OFF)
+
+    test.case("and recovery brings it back error-active, counters cleared")
+    canloop.set_mode(canloop.LOOP_INTERNAL)
+    test.assert(refused(canhal.recover_if_bus_off(c)) == false)
+    test.assert_eq(canbus.state_of(c.can_bus_state()), canbus.CAN_STATE_ERROR_ACTIVE)
+    test.assert_eq(canbus.tx_errors(c.can_bus_state()), 0)
+    test.assert(canhal.tx_ok(c.can_transmit(canframe.frame(0x123, 0, 0))))
+
+@test
+fn test_the_error_states_pass_in_order() [io, mutate]
+    let c = canloop.reset(canloop.LOOP_ALONE)
+    var seen_warning = false
+    var seen_passive = false
+    while canbus.may_transmit(c.can_bus_state())
+        let _ = c.can_transmit(canframe.frame(0x123, 0, 0))
+        canloop.run()
+        let st = canbus.state_of(c.can_bus_state())
+        if st == canbus.CAN_STATE_ERROR_WARNING
+            test.assert(seen_passive == false)
+            seen_warning = true
+        if st == canbus.CAN_STATE_ERROR_PASSIVE
+            test.assert(seen_warning)
+            seen_passive = true
+    test.assert(seen_passive)
+
+@test
+fn test_a_ring_behind_the_controller_keeps_order_and_counts_overruns() [io, mutate]
+    let c = canloop.reset(canloop.LOOP_INTERNAL)
+    var frames: Vec[CanFrame; 4] = Vec.new()
+    for _i in 0..4
+        let _ = frames.push(canframe.none())
+    var r = canring.ring(4)
+    for i in 0..6
+        let _ = c.can_transmit(canframe.frame(0x10 + i, 1, i))
+        let f = c.can_receive()
+        let at = canring.put_at(r)
+        if at >= 0
+            frames[at] = f
+            r = canring.put(r)
+        else
+            r = canring.overran(r)
+    test.assert_eq(canring.ring_len(r), 4)
+    test.assert_eq(canring.ring_overruns(r), 2)
+    var want = 0x10
+    while not canring.ring_is_empty(r)
+        let i = canring.take_at(r)
+        test.assert_eq(canframe.frame_id(frames[i]), want)
+        r = canring.taken(r)
+        want = want + 1
+    test.assert_eq(want, 0x14)
+
+@test
+fn test_a_transmit_queue_feeds_the_controller_by_priority() [io, mutate]
+    let c = canloop.reset(canloop.LOOP_INTERNAL)
+    prepare_txq()
+    var q = cantxq.queue(8)
+    for id in [0x500, 0x050, 0x300, 0x400, 0x100]
+        let at = cantxq.enqueue_at(q)
+        txq_frames[at] = canframe.frame(id, 0, 0)
+        q = cantxq.enqueued(q)
+    var order: Vec[Int; 8] = Vec.new()
+    while not cantxq.is_empty(q)
+        let i = cantxq.dequeue_index(q, key_at)
+        let a = c.can_transmit(txq_frames[i])
+        test.assert(canhal.tx_ok(a))
+        let from = cantxq.refill_from(q, i)
+        if from >= 0
+            txq_frames[i] = txq_frames[from]
+        q = cantxq.dequeued(q, i)
+        let _ = order.push(canframe.frame_id(c.can_receive()))
+    test.assert_eq(order.len(), 5)
+    test.assert_eq(order[0], 0x050)
+    test.assert_eq(order[1], 0x100)
+    test.assert_eq(order[2], 0x300)
+    test.assert_eq(order[3], 0x400)
+    test.assert_eq(order[4], 0x500)
+
+fn refused(e: ?CanError) -> Bool
+    match e
+        Some(_) => true
+        None    => false
+
+@test
+fn test_the_loopback_counts_what_it_sent_and_received() [io, mutate]
+    let c = canloop.reset(canloop.LOOP_INTERNAL)
+    let _ = c.can_transmit(canframe.frame(0x10, 0, 0))
+    let _ = c.can_transmit(canframe.frame(0x20, 0, 0))
+    test.assert_eq(canloop.pending_tx(), 2)
+    canloop.run()
+    test.assert_eq(canloop.pending_tx(), 0)
+    test.assert_eq(canloop.sent(), 2)
+    test.assert_eq(canloop.received(), 2)
+    test.case("a filter set and then cleared lets everything in again")
+    let _ = c.can_set_filter(0, canfilter.exact(0x700))
+    let _ = c.can_transmit(canframe.frame(0x30, 0, 0))
+    canloop.run()
+    test.assert_eq(canloop.received(), 2)
+    canloop.clear_filters()
+    let _ = c.can_transmit(canframe.frame(0x30, 0, 0))
+    canloop.run()
+    test.assert_eq(canloop.received(), 3)
+
+@test
+fn test_a_ring_reports_its_capacity_and_fullness_and_empties() [io]
+    var r = canring.ring(2)
+    test.assert_eq(canring.ring_capacity(r), 2)
+    r = canring.put(canring.put(r))
+    test.assert(canring.ring_is_full(r))
+    test.assert_eq(canring.put_at(r), 0 - 1)
+    r = canring.overran(r)
+    let e = canring.emptied(r)
+    test.assert(canring.ring_is_empty(e))
+    test.assert_eq(canring.ring_overruns(e), 1)
+
+@test
+fn test_a_frame_a_bus_cannot_carry_is_refused_before_a_mailbox() [io]
+    test.assert(canhal.frame_ok(canframe.frame(0x7FF, 8, 0)))
+    test.assert(canhal.frame_ok(canframe.frame(0x800, 0, 0)) == false)
+    test.assert(canhal.frame_ok(canframe.frame_ext(0x1FFFFFFF, 0, 0)))
+    test.assert(canhal.frame_ok(canframe.frame(0x123, 9, 0)) == false)
+    test.assert(canhal.frame_ok(canframe.none()) == false)
+
+@test
+fn test_the_loopback_controller_refuses_what_a_controller_refuses() [io, mutate]
+    let c = canloop.reset(canloop.LOOP_INTERNAL)
+    test.assert_eq(canloop.controller().id, c.id)
+    test.assert_eq(c.can_filter_slots(), canloop.LOOP_FILTER_SLOTS)
+    test.assert(c.can_recover() == None)
+    test.case("an identifier too wide for its format")
+    test.assert_eq(canhal.tx_status(c.can_transmit(canframe.frame(0x800, 0, 0))), canhal.CAN_TX_REFUSED)
+    test.case("a mailbox the controller does not have reads as done")
+    test.assert(c.can_tx_done(canloop.LOOP_MAILBOXES))
+    test.assert(c.can_tx_done(0 - 1))
+
+@test
+fn test_an_aborted_frame_never_reaches_the_bus() [io, mutate]
+    let c = canloop.reset(canloop.LOOP_INTERNAL)
+    let a = c.can_transmit(canframe.frame(0x123, 0, 0))
+    test.assert(c.can_tx_abort(canhal.accepted_mailbox(a)) == None)
+    test.assert_eq(canloop.pending_tx(), 0)
+    test.assert(c.can_tx_abort(canloop.LOOP_MAILBOXES) == None)
+    test.assert(canframe.is_none(c.can_receive()))
+
+@test
+fn test_a_bus_off_loopback_controller_refuses_to_transmit() [io, mutate]
+    let c = canloop.reset(canloop.LOOP_ALONE)
+    for _i in 0..32
+        let _ = c.can_transmit(canframe.frame(0x123, 0, 0))
+        let _ = c.can_tx_done(0)
+    test.assert(canbus.may_transmit(c.can_bus_state()) == false)
+    test.assert_eq(canhal.tx_status(c.can_transmit(canframe.frame(0x123, 0, 0))), canhal.CAN_TX_BUS_OFF)
+
+@test
+fn test_the_ring_at_its_edges() [io]
+    test.case("a negative capacity is a ring of no slots")
+    test.assert_eq(canring.ring_capacity(canring.ring(0 - 4)), 0)
+    test.case("a put into a full ring changes nothing")
+    let full = canring.put(canring.ring(1))
+    test.assert(canring.ring_is_full(full))
+    test.assert_eq(canring.ring_len(canring.put(full)), 1)
+    test.case("an empty ring has nothing to take")
+    let empty = canring.ring(4)
+    test.assert_eq(canring.take_at(empty), 0 - 1)
+    test.assert_eq(canring.ring_len(canring.taken(empty)), 0)

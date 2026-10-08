@@ -1,0 +1,292 @@
+// canloop.nv — a CAN controller in memory, for tests and for the
+// emulators.
+//
+// The emulated boards have no CAN controller, and a test on
+// the host has no bus.  `CanLoop` is a controller with no wire: a frame
+// it transmits is received by itself, through its own acceptance
+// filters, the way a bxCAN in loopback mode or an M_CAN in its test
+// mode behaves.  It satisfies `canhal.CanPeripheral[mutate]`, so a
+// program written against the trait runs unchanged on the host, under
+// QEMU and on a board.
+//
+// It has the parts of a controller a program can observe:
+//
+// - Three transmit mailboxes.  A transmit fills one and the bus empties
+//   them when `run` is called (or a receive or a completion query asks),
+//   the frame that wins arbitration first.  A transmit into three full
+//   mailboxes displaces the pending frame that loses arbitration when
+//   the new one outranks it, and answers which mailbox it took.
+// - A receive FIFO of 16 frames, with an overrun count.
+// - Fourteen acceptance filter slots.  With none set, every frame is
+//   received; with any set, a frame is received when a set slot
+//   accepts it.  Inverted filters and lists are evaluated as
+//   `canfilter.accepts` evaluates them.
+// - The error counters.  In `LOOP_INTERNAL` mode a frame acknowledges
+//   itself, so every transmission succeeds.  In `LOOP_ALONE` mode
+//   nothing acknowledges it, as for a node alone on a bus, so every
+//   transmission is an acknowledgement error: the transmit counter
+//   rises by eight per frame and the controller is bus-off after 32.
+//   It makes one attempt per frame, as bxCAN does with automatic
+//   retransmission off.  `can_recover` brings a bus-off controller
+//   back after the 128 idle sequences an idle bus provides at once.
+//
+// The state is module-level, so a program has one loopback
+// controller: `CanLoop` is a handle to it.  Nothing is allocated after
+// `reset`; the state is static storage.
+
+use canframe
+use canfilter
+use canbus
+use canhal
+use canerr
+
+// A frame acknowledges itself: every transmission succeeds and is
+// received.
+pub const LOOP_INTERNAL = 0
+// Nothing acknowledges a frame: every transmission is an
+// acknowledgement error and nothing is received.
+pub const LOOP_ALONE = 1
+
+// The receive FIFO's depth.
+pub const LOOP_RX_DEPTH = 16
+// The acceptance filter slots.
+pub const LOOP_FILTER_SLOTS = 14
+// The transmit mailboxes.
+pub const LOOP_MAILBOXES = 3
+
+// A handle to the program's loopback controller.
+pub @value
+struct CanLoop
+    id: Int
+
+var loop_mode                        = LOOP_INTERNAL
+var loop_rx: Deque[CanFrame; 16]     = Deque.new()
+var loop_tx: Vec[CanFrame; 3]        = Vec.new()
+var loop_filters: Vec[CanFilter; 14] = Vec.new()
+// Bit `i` set: filter slot `i` is in use.
+var loop_active       = 0
+var loop_state        = canbus.bus_state()
+var loop_overruns     = 0
+var loop_sent         = 0
+var loop_received     = 0
+var loop_error_frames = false
+
+// The loopback controller, reset to `mode`.  Call it once while the
+// program starts; it empties the mailboxes, the FIFO and the filters
+// and zeroes the counters.
+pub @tier(embedded)
+fn reset(mode: Int) -> CanLoop [mutate]
+    loop_mode = mode
+    loop_rx.clear()
+    loop_tx.clear()
+    for _i in 0..LOOP_MAILBOXES
+        let _ = loop_tx.push(canframe.none())
+    loop_filters.clear()
+    for _i in 0..LOOP_FILTER_SLOTS
+        let _ = loop_filters.push(canfilter.accept_all())
+    loop_active = 0
+    loop_state = canbus.bus_state()
+    loop_overruns = 0
+    loop_sent = 0
+    loop_received = 0
+    loop_error_frames = false
+    CanLoop { id: 0 }
+
+// The handle, without resetting anything.
+pub @tier(embedded)
+fn controller() -> CanLoop []
+    CanLoop { id: 0 }
+
+// Switch between `LOOP_INTERNAL` and `LOOP_ALONE`, keeping everything
+// else.
+pub @tier(embedded)
+fn set_mode(mode: Int) [mutate]
+    loop_mode = mode
+
+// Whether a failed transmission also delivers an error frame to the
+// FIFO, carrying `canbus.CAN_ERR_ACK` and the two counters in bytes 6
+// and 7, as SocketCAN's error frames do.  Off after `reset`.
+pub @tier(embedded)
+fn set_error_frames(on: Bool) [mutate]
+    loop_error_frames = on
+
+// Frames received but lost to a full FIFO.
+pub @tier(embedded)
+fn overruns() -> Int [mutate]
+    loop_overruns
+
+// Frames transmitted successfully since `reset`.
+pub @tier(embedded)
+fn sent() -> Int [mutate]
+    loop_sent
+
+// Frames received into the FIFO since `reset`.
+pub @tier(embedded)
+fn received() -> Int [mutate]
+    loop_received
+
+// Frames waiting in the receive FIFO.
+pub @tier(embedded)
+fn pending_rx() -> Int [mutate]
+    loop_rx.len()
+
+// Mailboxes holding a frame not yet on the bus.
+pub @tier(embedded)
+fn pending_tx() -> Int [mutate]
+    var n = 0
+    for m in 0..LOOP_MAILBOXES
+        if canframe.is_frame(loop_tx[m])
+            n = n + 1
+    n
+
+// Runs the bus until every mailbox is empty: the pending frame that
+// wins arbitration goes first, each is acknowledged or not by the
+// mode, and an acknowledged one is offered to the filters.
+pub @tier(embedded)
+fn run() [mutate]
+    while true
+        let m = winner()
+        if m < 0
+            return
+        let f = loop_tx[m]
+        loop_tx[m] = canframe.none()
+        if loop_mode == LOOP_ALONE
+            loop_state = canbus.on_tx_error(loop_state)
+            if loop_error_frames
+                deliver(error_frame())
+            if not canbus.may_transmit(loop_state)
+                // A controller that goes bus-off aborts what is pending.
+                for k in 0..LOOP_MAILBOXES
+                    loop_tx[k] = canframe.none()
+                return
+        else
+            loop_state = canbus.on_tx_success(loop_state)
+            loop_sent = loop_sent + 1
+            if accepted(f)
+                deliver(f)
+                loop_state = canbus.on_rx_success(loop_state)
+
+// The mailbox whose frame wins arbitration, or -1.
+@tier(embedded)
+fn winner() -> Int [mutate]
+    var best = 0 - 1
+    var key = 0
+    for m in 0..LOOP_MAILBOXES
+        let f = loop_tx[m]
+        if canframe.is_frame(f)
+            let k = canframe.arbitration_key(f)
+            if best < 0 or k < key
+                best = m
+                key = k
+    best
+
+// The mailbox whose frame loses arbitration to every other, or -1.
+@tier(embedded)
+fn loser() -> Int [mutate]
+    var worst = 0 - 1
+    var key = 0
+    for m in 0..LOOP_MAILBOXES
+        let f = loop_tx[m]
+        if canframe.is_frame(f)
+            let k = canframe.arbitration_key(f)
+            if worst < 0 or k >= key
+                worst = m
+                key = k
+    worst
+
+// Whether the filters let `f` in.
+@tier(embedded)
+fn accepted(f: CanFrame) -> Bool [mutate]
+    if loop_active == 0
+        return true
+    for i in 0..LOOP_FILTER_SLOTS
+        if (loop_active & (1 << i)) != 0 and canfilter.accepts(loop_filters[i], f)
+            return true
+    false
+
+// Puts a frame in the receive FIFO, or counts an overrun.
+@tier(embedded)
+fn deliver(f: CanFrame) [mutate]
+    match loop_rx.push_back(f)
+        Ok(_)  =>
+            loop_received = loop_received + 1
+        Err(_) =>
+            loop_overruns = loop_overruns + 1
+
+// The error frame a failed acknowledgement reports.
+@tier(embedded)
+fn error_frame() -> CanFrame [mutate]
+    let counters = canframe.with_byte(canframe.with_byte(0, 6, canbus.tx_errors(loop_state) & 0xFF),
+        7,
+        canbus.rx_errors(loop_state) & 0xFF)
+    CanFrame { id: canbus.CAN_ERR_ACK, flags: canframe.CAN_FLAG_ERROR, len: 8, data: counters }
+
+impl CanPeripheral[mutate] for CanLoop
+    @tier(embedded)
+    fn can_transmit(self, f: CanFrame) -> CanTxAccepted [mutate]
+        if not canbus.may_transmit(loop_state)
+            return canhal.tx_refused(canhal.CAN_TX_BUS_OFF)
+        if not canhal.frame_ok(f)
+            return canhal.tx_refused(canhal.CAN_TX_REFUSED)
+        for m in 0..LOOP_MAILBOXES
+            if not canframe.is_frame(loop_tx[m])
+                loop_tx[m] = f
+                return canhal.accepted(m, 0 - 1)
+        let m = loser()
+        if canframe.arbitration_key(f) < canframe.arbitration_key(loop_tx[m])
+            loop_tx[m] = f
+            return canhal.accepted(m, m)
+        canhal.tx_refused(canhal.CAN_TX_FULL)
+
+    @tier(embedded)
+    fn can_tx_done(self, mailbox: Int) -> Bool [mutate]
+        run()
+        if mailbox < 0 or mailbox >= LOOP_MAILBOXES
+            return true
+        not canframe.is_frame(loop_tx[mailbox])
+
+    @tier(embedded)
+    fn can_tx_abort(self, mailbox: Int) -> ?CanError [mutate]
+        if mailbox >= 0 and mailbox < LOOP_MAILBOXES
+            loop_tx[mailbox] = canframe.none()
+        None
+
+    @tier(embedded)
+    fn can_receive(self) -> CanFrame [mutate]
+        run()
+        match loop_rx.pop_front()
+            Some(f) => f
+            None    => canframe.none()
+
+    @tier(embedded)
+    fn can_set_filter(self, slot: Int, f: CanFilter) -> ?CanError [mutate]
+        if slot < 0 or slot >= LOOP_FILTER_SLOTS
+            return Some(CanFilterNotSupported)
+        loop_filters[slot] = f
+        loop_active = loop_active | (1 << slot)
+        None
+
+    @tier(embedded)
+    fn can_filter_slots(self) -> Int
+        LOOP_FILTER_SLOTS
+
+    @tier(embedded)
+    fn can_bus_state(self) -> CanBusState [mutate]
+        loop_state
+
+    @tier(embedded)
+    fn can_recover(self) -> ?CanError [mutate]
+        if canbus.may_transmit(loop_state)
+            return None
+        // An idle bus: the 128 sequences of eleven recessive bits pass
+        // at once.
+        for _i in 0..canbus.CAN_BUS_OFF_RECOVERY_SEQUENCES
+            loop_state = canbus.on_recovery_sequence(loop_state)
+        if canbus.may_rejoin(loop_state)
+            loop_state = canbus.rejoined(loop_state)
+        None
+
+// Clears every filter slot, so every frame is received again.
+pub @tier(embedded)
+fn clear_filters() [mutate]
+    loop_active = 0

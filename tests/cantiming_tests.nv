@@ -1,0 +1,162 @@
+// The bit-timing solver against published values, and the register
+// words the two drivers program from it.
+//
+// The classic values are the ones CAN in Automation's bit-timing
+// calculator (bittiming.can-wiki.info) and ST's application notes give
+// for bxCAN: at 42 MHz, the STM32F4's APB1 clock, 500 kbit/s is a
+// prescaler of 6 and 14 quanta of 1 + 11 + 2 (85.7 per cent, CAN_BTR
+// 0x001A0005) and 1 Mbit/s a prescaler of 3 and the same 14 quanta
+// (0x001A0002).  At 8 MHz, the NUCLEO-H723ZG's HSE, 500 kbit/s is a
+// prescaler of 1 and 16 quanta of 1 + 13 + 2 and 1 Mbit/s 8 quanta of
+// 1 + 6 + 1, both at 87.5 per cent.  A 2 Mbit/s data phase from 8 MHz
+// is four quanta of 1 + 2 + 1, 75 per cent.
+
+use std.test
+use canbus
+use canbxcan
+use canfdcan
+use canfilter
+
+@test
+fn test_bxcan_at_42_mhz_and_500_kbit() [io]
+    let t = canbus.solve_timing(42000000, 500000, 875, canbus.bxcan_limits())
+    test.assert(canbus.timing_ok(t))
+    test.assert_eq(canbus.timing_prescaler(t), 6)
+    test.assert_eq(canbus.timing_tseg1(t), 11)
+    test.assert_eq(canbus.timing_tseg2(t), 2)
+    test.assert_eq(canbus.timing_sjw(t), 1)
+    test.assert_eq(canbus.timing_quanta(t), 14)
+    test.assert_eq(canbus.timing_sample_permille(t), 857)
+    test.assert_eq(canbus.timing_bitrate(t), 500000)
+    test.assert_eq(canbxcan.btr_of(t, canbxcan.BXCAN_MODE_NORMAL), 0x001A0005)
+
+@test
+fn test_bxcan_at_42_mhz_and_1_mbit() [io]
+    let t = canbus.solve_timing(42000000, 1000000, 875, canbus.bxcan_limits())
+    test.assert_eq(canbus.timing_prescaler(t), 3)
+    test.assert_eq(canbus.timing_quanta(t), 14)
+    test.assert_eq(canbxcan.btr_of(t, canbxcan.BXCAN_MODE_NORMAL), 0x001A0002)
+    test.case("the loopback bits ride in the same word: LBKM is bit 30, SILM bit 31")
+    test.assert_eq(canbxcan.btr_of(t, canbxcan.BXCAN_MODE_SILENT_LOOPBACK), 0xC01A0002)
+
+@test
+fn test_fdcan_at_8_mhz_nominal() [io]
+    let t5 = canbus.solve_timing(8000000, 500000, 875, canbus.fdcan_nominal_limits())
+    test.assert_eq(canbus.timing_prescaler(t5), 1)
+    test.assert_eq(canbus.timing_tseg1(t5), 13)
+    test.assert_eq(canbus.timing_tseg2(t5), 2)
+    test.assert_eq(canbus.timing_sample_permille(t5), 875)
+    test.case("NSJW is as wide as phase 2, so NBTP is NSJW 1, NBRP 0, NTSEG1 12, NTSEG2 1")
+    test.assert_eq(canfdcan.nbtp_of(t5), 0x02000C01)
+
+    let t1 = canbus.solve_timing(8000000, 1000000, 875, canbus.fdcan_nominal_limits())
+    test.assert_eq(canbus.timing_prescaler(t1), 1)
+    test.assert_eq(canbus.timing_tseg1(t1), 6)
+    test.assert_eq(canbus.timing_tseg2(t1), 1)
+    test.assert_eq(canfdcan.nbtp_of(t1), 0x00000500)
+
+@test
+fn test_fdcan_data_phase_at_8_mhz() [io]
+    let d = canbus.solve_timing(8000000, 2000000, canbus.data_sample_point_permille(2000000), canbus.fdcan_data_limits())
+    test.assert_eq(canbus.timing_quanta(d), 4)
+    test.assert_eq(canbus.timing_tseg1(d), 2)
+    test.assert_eq(canbus.timing_tseg2(d), 1)
+    test.assert_eq(canbus.timing_sample_permille(d), 750)
+    test.assert_eq(canfdcan.dbtp_of(d), 0x00000100)
+
+@test
+fn test_fdcan_at_80_mhz_has_room_for_many_quanta() [io]
+    test.case("M_CAN's nominal phase holds up to 385 quanta, so the solver keeps the prescaler at 1")
+    let t = canbus.solve_timing(80000000, 500000, 875, canbus.fdcan_nominal_limits())
+    test.assert_eq(canbus.timing_prescaler(t), 1)
+    test.assert_eq(canbus.timing_quanta(t), 160)
+    test.assert_eq(canbus.timing_sample_permille(t), 875)
+    let d = canbus.solve_timing(80000000, 2000000, 750, canbus.fdcan_data_limits())
+    test.assert_eq(canbus.timing_bitrate(d), 2000000)
+    test.assert_eq(canbus.timing_sample_permille(d), 750)
+
+@test
+fn test_a_rate_the_clock_cannot_make_has_no_timing() [io]
+    test.assert(canbus.timing_ok(canbus.solve_timing(7372800, 500000, 875, canbus.bxcan_limits())) == false)
+    test.assert(canbus.timing_ok(canbus.solve_timing(0, 500000, 875, canbus.bxcan_limits())) == false)
+    test.case("and a rate too fast for the clock's quanta")
+    test.assert(canbus.timing_ok(canbus.solve_timing(8000000, 2000000, 875, canbus.bxcan_limits())) == false)
+
+@test
+fn test_every_standard_rate_from_the_two_bench_clocks() [io]
+    test.case("42 MHz makes every standard rate but 800 kbit/s, which needs 52.5 clocks a bit")
+    for i in 0..canbus.CAN_STANDARD_BITRATES
+        let r = canbus.standard_bitrate(i)
+        let t = canbus.solve_timing(42000000, r, canbus.sample_point_permille(r), canbus.bxcan_limits())
+        if r == 800000
+            test.assert(canbus.timing_ok(t) == false)
+        else
+            test.assert_eq(canbus.timing_bitrate(t), r)
+
+@test
+fn test_the_fdcan_element_words() [io]
+    test.case("a standard identifier sits in bits 28 to 18 of the first header word")
+    test.assert_eq(canfdcan.header0(0x123, false, false), 0x123 << 18)
+    test.assert_eq(canfdcan.header0(0x18DAF110, true, false), 0x40000000 | 0x18DAF110)
+    test.assert_eq(canfdcan.header0(0x123, false, true), (0x123 << 18) | 0x20000000)
+    test.assert_eq(canfdcan.header1(15, true, true), 0x003F0000)
+    test.assert_eq(canfdcan.header1(8, false, false), 0x00080000)
+
+@test
+fn test_the_fdcan_filter_elements() [io]
+    test.case("a classic mask filter is SFT 2, a list is SFT 1, both to FIFO 0")
+    test.assert_eq(canfdcan.std_element(canfilter.filter(0x100, 0x700)),
+        (2 << 30) | (1 << 27) | (0x100 << 16) | 0x700)
+    test.assert_eq(canfdcan.std_element(canfilter.list(0x123, 0x456)),
+        (1 << 30) | (1 << 27) | (0x123 << 16) | 0x456)
+    let e = canfilter.filter_ext(0x18DA0000, 0x1FFF0000)
+    test.assert_eq(canfdcan.ext_element0(e), (1 << 29) | 0x18DA0000)
+    test.assert_eq(canfdcan.ext_element1(e), (2 << 30) | 0x1FFF0000)
+
+@test
+fn test_the_classic_limits_and_no_timing() [io]
+    test.case("ISO 11898-1's classic limits: 8 to 25 quanta, a first segment to 16 and a second to 8")
+    let t = canbus.solve_timing(16000000, 500000, 875, canbus.classic_limits())
+    test.assert_eq(canbus.timing_quanta(t), 16)
+    test.assert_eq(canbus.timing_sample_permille(t), 875)
+    let none = canbus.no_timing(16000000, 500000)
+    test.assert(canbus.timing_ok(none) == false)
+    test.assert_eq(canbus.timing_quanta(none), 0)
+    test.assert_eq(canbus.timing_bitrate(none), 0)
+
+@test
+fn test_the_sample_point_is_moved_to_fit_the_segment_limits() [io]
+    test.case("a sample point at the very end leaves no phase 2, so phase 2 takes its minimum of one quantum")
+    let late = canbus.solve_timing(8000000, 500000, 1000, canbus.bxcan_limits())
+    test.assert(canbus.timing_ok(late))
+    test.assert_eq(canbus.timing_tseg2(late), 1)
+    test.case("a sample point near the start asks for more phase 2 than eight quanta, so phase 2 takes its maximum")
+    let early = canbus.solve_timing(8000000, 500000, 100, canbus.bxcan_limits())
+    test.assert(canbus.timing_ok(early))
+    test.assert_eq(canbus.timing_tseg2(early), 8)
+    test.case("25 quanta at 90 per cent wants a first segment of 22, above the limit of 16, so phase 2 grows to 8")
+    let wide = canbus.solve_timing(25000000, 1000000, 900, canbus.bxcan_limits())
+    test.assert(canbus.timing_ok(wide))
+    test.assert_eq(canbus.timing_tseg1(wide), 16)
+    test.assert_eq(canbus.timing_tseg2(wide), 8)
+
+@test
+fn test_limits_no_split_of_the_bit_satisfies_give_no_timing() [io]
+    test.case("eight quanta with both segments at most two cannot be split, so the solver answers no timing")
+    let tight = CanTimingLimits { brp_max: 1, tseg1_min: 1, tseg1_max: 2, tseg2_min: 1, tseg2_max: 2,
+                                  sjw_max: 1, tq_min: 8, tq_max: 8, sjw_full: false }
+    let t = canbus.solve_timing(4000000, 500000, 875, tight)
+    test.assert(canbus.timing_ok(t) == false)
+    test.assert_eq(canbus.timing_quanta(t), 0)
+    test.assert_eq(canbus.timing_sample_permille(t), 0)
+    test.assert_eq(canbus.timing_bitrate(t), 0)
+
+@test
+fn test_a_jump_width_as_wide_as_phase_2_is_held_to_its_maximum() [io]
+    test.case("a controller whose jump width follows phase 2 but stops at one quantum")
+    let lim = CanTimingLimits { brp_max: 1, tseg1_min: 1, tseg1_max: 16, tseg2_min: 1, tseg2_max: 8,
+                                sjw_max: 1, tq_min: 8, tq_max: 25, sjw_full: true }
+    let t = canbus.solve_timing(8000000, 500000, 750, lim)
+    test.assert(canbus.timing_ok(t))
+    test.assert_eq(canbus.timing_tseg2(t), 4)
+    test.assert_eq(canbus.timing_sjw(t), 1)

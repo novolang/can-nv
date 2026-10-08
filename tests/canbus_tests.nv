@@ -160,8 +160,11 @@ fn test_a_clock_that_cannot_produce_the_rate_is_refused() [io]
     test.assert(canbus.time_quanta(8000000, 500000) > 0)
     test.assert(refused(canbus.check_timing(8000000, 500000)) == false)
 
-    test.assert_eq(canbus.time_quanta(7000000, 500000), 0 - 1)
-    test.assert(refused(canbus.check_timing(7000000, 500000)))
+    // 7.3728 MHz, a UART crystal: 14.75 clocks a bit, so no whole number
+    // of quanta makes 500 kbit/s to within 0.1 per cent.  (7 MHz does:
+    // fourteen quanta of one clock each.)
+    test.assert_eq(canbus.time_quanta(7372800, 500000), 0 - 1)
+    test.assert(refused(canbus.check_timing(7372800, 500000)))
 
 @test
 fn test_a_state_read_from_a_controllers_registers_is_the_same_type() [io]
@@ -170,3 +173,32 @@ fn test_a_state_read_from_a_controllers_registers_is_the_same_type() [io]
     test.assert_eq(canbus.tx_errors(s), 130)
     test.assert_eq(canbus.rx_errors(s), 5)
     test.assert_eq(canbus.state_of(s), canbus.CAN_STATE_ERROR_PASSIVE)
+
+@test
+fn test_each_state_and_error_kind_reads_as_its_own_words() [io]
+    test.assert_eq(canbus.state_name(canbus.CAN_STATE_ERROR_ACTIVE), "error-active")
+    test.assert_eq(canbus.state_name(canbus.CAN_STATE_ERROR_WARNING), "error-warning")
+    test.assert_eq(canbus.state_name(canbus.CAN_STATE_ERROR_PASSIVE), "error-passive")
+    test.assert_eq(canbus.state_name(canbus.CAN_STATE_BUS_OFF), "bus-off")
+    test.assert_eq(canbus.state_name(9), "unknown")
+    test.assert_eq(canbus.error_kind_name(canbus.CAN_ERR_BIT), "bit error")
+    test.assert_eq(canbus.error_kind_name(canbus.CAN_ERR_STUFF), "stuff error")
+    test.assert_eq(canbus.error_kind_name(canbus.CAN_ERR_FORM), "form error")
+    test.assert_eq(canbus.error_kind_name(canbus.CAN_ERR_CRC), "CRC error")
+    test.assert_eq(canbus.error_kind_name(canbus.CAN_ERR_ACK), "acknowledgement error")
+    test.assert_eq(canbus.error_kind_name(0), "no error")
+
+@test
+fn test_the_counters_stop_at_their_limits() [io]
+    test.case("a bus-off transmit counter stays at 256 after another error")
+    test.assert_eq(canbus.tx_errors(canbus.on_tx_error(canbus.bus_state_of(252, 0))), 256)
+    test.case("the receive counter holds at 255")
+    test.assert_eq(canbus.rx_errors(canbus.on_rx_error(canbus.bus_state_of(0, 255))), 255)
+    test.case("a success above the error-passive limit sets the receive counter to 127")
+    test.assert_eq(canbus.rx_errors(canbus.on_rx_success(canbus.bus_state_of(0, 200))), 127)
+
+@test
+fn test_a_recovery_sequence_counts_only_while_bus_off() [io]
+    let s = canbus.on_recovery_sequence(canbus.bus_state_of(10, 0))
+    test.assert(canbus.may_rejoin(s) == false)
+    test.assert_eq(canbus.tx_errors(s), 10)

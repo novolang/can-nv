@@ -1,41 +1,29 @@
 [package]
 name        = "can-nv"
-version     = "0.0.3"
-description = "The CAN bus on a microcontroller and on Linux behind one interface: classic and CAN FD frames as values, acceptance filters and masks, the error-confinement state machine, a bounded transmit queue that sends by arbitration priority, ISO-TP segmented transport, a candump-shaped log line, the embedded-can peripheral trait, and SocketCAN over raw sockets.  Interface only — every body is a todo()."
+version     = "0.1.0"
+description = "The CAN bus on a microcontroller and on Linux behind one interface: classic and CAN FD frames as values, acceptance filters by mask and by list, the error-confinement state machine, a bit-timing solver, a transmit queue that sends by arbitration priority and a receive ring over the caller's frames, ISO-TP, candump lines, drivers for ST's bxCAN and FDCAN (Bosch M_CAN), a loopback controller for tests and emulators, and SocketCAN over raw sockets.  Nothing is allocated after start-up on a device."
 license     = "Apache-2.0"
 
-# An INTERFACE release: every `pub fn` body is a `todo()`, so the
-# signatures and the effect rows are published and nothing is
-# implemented.  `novo pkg publish` recognises the shape and requires
-# both the draft stability and the 0.0.x version; the first
-# implementation is the 0.1.0 published over it.
-stability   = "draft"
+stability   = "experimental"
 
-# `core`, with one host module named below.
-#
-# The row's own note is "the bus on a microcontroller and on Linux
-# behind one interface", and the microcontroller is the half that
-# decides the layer: a frame, a filter and an ISO-TP session are
-# arithmetic over integers a caller already holds, and an interrupt
-# handler on a part with 64 KB of RAM is where they run.  The plan
-# placed the row at `host` because SocketCAN is the visible half; the
-# narrow layer is declared here and the wide module named, which is
-# `docs/publishing.md` § A package with a core and a host half, and it
-# is what makes the device claim in `tests/embedded_probe.nv` a thing
-# the audit BUILDS.
-layer       = "core"
-
-# `cansocket` is the one module that performs: an `AF_CAN` raw socket
-# on Linux, bound to an interface whose index is read from
-# `/sys/class/net/`.  `[net]` and `[fs]`, and nothing else.
-host_modules = ["cansocket"]
+# `host`: the drivers perform `[hw]`, the loopback controller and the
+# transmit queue's slot readers `[mutate]`, and `cansocket` `[net]` and
+# `[fs]`.  The interface was `core` with `cansocket` as its host module,
+# when every body was arithmetic; with the two controller drivers in the
+# package the surface performs on a device too, and `host` is the layer
+# that says so.  Everything a device build reaches is `[hw, mutate]`
+# at most, and the frames, the filters, the timing and the state
+# machines are still `[]`.
+layer       = "host"
 
 category    = "embedded"
 
 tags        = ["can", "canbus", "can-fd", "socketcan", "iso-tp", "candump", "embedded", "automotive", "no-alloc"]
 repository  = "https://github.com/novolang/can-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.8.9"
+# The toolchain floor: embedded-hal-nv 0.3.0, which `canboard` is
+# written over, calls hal.can, which 0.19.3 first has.
+novo        = ">= 0.19.3"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
@@ -44,12 +32,8 @@ novo        = ">= 0.8.9"
 "README.md" = "A CAN frame that fits in three integers"
 
 [dependencies]
-# None.  Every module is arithmetic over values the caller holds, and
-# `cansocket` reaches the kernel through the standard library's
-# `std.net`.  The transmit queue's frames live in storage the caller
-# declares, which on a device is one of the language's fixed-capacity
-# collections (SPEC section 14.8), so the queue needs no collection
-# package.
-#
-# NOT crc-nv.  A CAN frame's CRC is computed and checked by the
-# controller's hardware and never appears in software.
+# The board's CAN controller, which `canboard` reaches through
+# `CanBus` and the handle `BoardCan`.  The transmit queue and the
+# receive ring keep their own bookkeeping over a `Vec[CanFrame; N]` the
+# caller declares, the language's own fixed-capacity storage.
+embedded-hal-nv = "^0.3.0"

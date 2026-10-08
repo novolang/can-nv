@@ -1,0 +1,176 @@
+// canboard.nv — the board's CAN controller behind `CanPeripheral`.
+//
+// A board names its controller's driver for the standard library's
+// `hal.can` (`@hal(can)` in its src/bsp.nv), and embedded-hal-nv's
+// `CanBus` reaches it through the handle `BoardCan`.  `CanBoard` holds
+// that handle and implements `canhal.CanPeripheral[hw]` over it, so a
+// program written against this package's trait runs on any board that
+// serves `hal.can`, with no driver of this package's own: the frames,
+// the filters' software half, the queue and ISO-TP sit on top of it as
+// they sit on `CanLoop`.
+//
+// What `CanBus` gives, and so what this controller has: one transmit
+// buffer, so `can_transmit` answers mailbox 0 and refuses a frame while
+// the last one waits for the bus; a frame's completion through
+// `CanBus.tx_done`; a receive of the next frame; the error counters and
+// the fault confinement state.  What it does not give, each answered as
+// the trait's refusal: aborting a pending frame, hardware acceptance
+// filters (none: `canhal.receive_filtered` filters in software), and a
+// recovery the program starts, since the controller recovers from
+// bus-off by itself after 128 sequences of 11 recessive bits (ISO
+// 11898-1, clause 12).
+//
+// The two frame types carry the same fields: an identifier, its width,
+// the remote flag, a length and the data, byte 0 in bits 0 to 7, so a
+// frame crosses with no copy of its bytes.
+
+use embedded_hal.{ BoardCan, CanBus, CanBusFrame }
+use canframe
+use canfilter
+use canbus
+use canhal
+use canerr
+
+// The board's CAN controller `bus`, as a `CanPeripheral`.
+pub @value
+struct CanBoard
+    bus: BoardCan
+
+// The board's controller `id`, 0 for the one the board names for
+// `hal.can`, started at `bitrate` bits a second; in loopback when
+// `loopback` is set, receiving every frame it sends and driving nothing
+// onto the bus.  Answers the controller and whether it started: a rate
+// its clock cannot give is refused.
+pub @tier(embedded)
+fn board_open(id: Int, bitrate: Int, loopback: Bool) -> CanBoard [hw]
+    open_on(BoardCan { id: id }, id, bitrate, loopback)
+
+// Starts the controller `bus` at `bitrate` bits a second, in loopback
+// when `loopback` is set, and answers it as the board's controller
+// `id`, or as a controller that did not start when `bus` refused the
+// rate or the mode.  `board_open` is this function over the board's
+// handle.
+pub @tier(embedded)
+fn open_on<B: CanBus>(bus: B, id: Int, bitrate: Int, loopback: Bool) -> CanBoard [hw]
+    let mode = if loopback
+        embedded_hal.CAN_MODE_LOOPBACK
+    else
+        embedded_hal.CAN_MODE_NORMAL
+    if not bus.open(bitrate, mode)
+        return CanBoard { bus: BoardCan { id: -1 } }
+    CanBoard { bus: BoardCan { id: id } }
+
+// Whether `board_open` started the controller.
+pub @tier(embedded)
+fn board_started(c: CanBoard) -> Bool []
+    c.bus.id >= 0
+
+// The rate the board's controller runs at, read back from it.
+pub @tier(embedded)
+fn board_bitrate(c: CanBoard) -> Int [hw]
+    c.bus.bitrate()
+
+// This package's frame as embedded-hal-nv's.
+pub @tier(embedded)
+fn to_bus_frame(f: CanFrame) -> CanBusFrame []
+    CanBusFrame { id: canframe.frame_id(f), extended: canframe.is_extended(f),
+                  remote: canframe.is_remote(f), len: canframe.frame_len(f),
+                  data: canframe.frame_data(f) }
+
+// embedded-hal-nv's frame as this package's.
+pub @tier(embedded)
+fn of_bus_frame(b: CanBusFrame) -> CanFrame []
+    if b.remote
+        if b.extended
+            return canframe.remote_frame_ext(b.id, b.len)
+        return canframe.remote_frame(b.id, b.len)
+    if b.extended
+        return canframe.frame_ext(b.id, b.len, b.data)
+    canframe.frame(b.id, b.len, b.data)
+
+// ── The controller over any `CanBus` ───────────────────────────────
+//
+// Each method of `CanBoard`'s `CanPeripheral` implementation is one of
+// the functions below over the board's handle, so the same logic runs
+// over any controller that implements `CanBus`.
+
+// Hands `f` to the controller `bus`: mailbox 0 takes it, or it is
+// refused as a frame the bus cannot carry, as a frame from a node that
+// is bus-off, or as a full mailbox while the last frame still waits.
+pub @tier(embedded)
+fn bus_transmit<B: CanBus>(bus: B, f: CanFrame) -> CanTxAccepted [hw]
+    if not canhal.frame_ok(f)
+        return canhal.tx_refused(canhal.CAN_TX_REFUSED)
+    if not canbus.may_transmit(bus_state(bus))
+        return canhal.tx_refused(canhal.CAN_TX_BUS_OFF)
+    if not bus.send(to_bus_frame(f))
+        return canhal.tx_refused(canhal.CAN_TX_FULL)
+    canhal.accepted(0, -1)
+
+// Whether mailbox `mailbox` of the controller `bus` has sent its frame.
+// The controller has mailbox 0 only.
+pub @tier(embedded)
+fn bus_tx_done<B: CanBus>(bus: B, mailbox: Int) -> Bool [hw]
+    mailbox == 0 and bus.tx_done()
+
+// The next frame the controller `bus` received, or `canframe.none()`.
+pub @tier(embedded)
+fn bus_receive<B: CanBus>(bus: B) -> CanFrame [hw]
+    match bus.receive()
+        Some(b) => of_bus_frame(b)
+        None    => canframe.none()
+
+// The error counters of the controller `bus`, with a controller that
+// reports bus-off read as a transmit counter of 256: a counter register
+// of eight bits cannot hold the count that put it there.
+pub @tier(embedded)
+fn bus_state<B: CanBus>(bus: B) -> CanBusState [hw]
+    let e = bus.errors()
+    if e.state == embedded_hal.CAN_BUS_OFF
+        return canbus.bus_state_of(canbus.CAN_BUS_OFF_LIMIT, e.rx)
+    canbus.bus_state_of(e.tx, e.rx)
+
+// `None` when the controller `bus` may transmit, otherwise
+// `CanBusOff`.  The controller recovers from bus-off by itself.
+pub @tier(embedded)
+fn bus_recover<B: CanBus>(bus: B) -> ?CanError [hw]
+    if canbus.may_transmit(bus_state(bus))
+        return None
+    Some(CanBusOff)
+
+impl CanPeripheral[hw] for CanBoard
+    // Mailbox 0 takes the frame, or the frame is refused: bus-off, a
+    // frame the bus cannot carry, or the last frame still waiting.
+    fn can_transmit(self, f: CanFrame) -> CanTxAccepted [hw]
+        bus_transmit(self.bus, f)
+
+    // Whether mailbox 0's frame has left the controller.  There is no
+    // other mailbox.
+    fn can_tx_done(self, mailbox: Int) -> Bool [hw]
+        bus_tx_done(self.bus, mailbox)
+
+    // `CanBus` cannot abort a frame, so the abort is refused.
+    fn can_tx_abort(self, mailbox: Int) -> ?CanError [hw]
+        Some(CanFrameRefused)
+
+    // The next frame received, or `canframe.none()`.
+    fn can_receive(self) -> CanFrame [hw]
+        bus_receive(self.bus)
+
+    // No acceptance hardware is reachable through `CanBus`: every slot
+    // is refused, and the controller receives every frame.
+    fn can_set_filter(self, slot: Int, f: CanFilter) -> ?CanError [hw]
+        Some(CanFilterNotSupported)
+
+    fn can_filter_slots(self) -> Int
+        0
+
+    // The counters, with a controller that reports bus-off read as a
+    // transmit counter of 256.
+    fn can_bus_state(self) -> CanBusState [hw]
+        bus_state(self.bus)
+
+    // The controller recovers by itself; the answer says whether it is
+    // still bus-off.
+    fn can_recover(self) -> ?CanError [hw]
+        bus_recover(self.bus)

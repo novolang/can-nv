@@ -1,0 +1,150 @@
+// candump_tests.nv: the candump line and the compact form, each refusal
+// at the character it names, and every error value's sentence.
+//
+// The lines are can-utils' own shapes: `candump can0` prints
+// `can0  123   [3]  11 22 33`, a remote request as
+// `can0  123   [2]  remote request`, and `cansend` takes `123#112233`,
+// `123#R2` and `00000123#11`.  Each malformed line below breaks one rule
+// of those shapes, so each refusal is reached by exactly one fault.
+
+use std.test
+use candump
+use canframe
+use canerr
+
+// The offset a refused line names, or -1 when the line parsed.
+fn bad_at(line: Str) -> Int
+    match candump.parse_line(line)
+        Ok(_)  => 0 - 1
+        Err(e) =>
+            match e
+                CanBadLogLine(at) => at
+                _                 => 0 - 2
+
+// The frame a line carries; the test fails on a refused line.
+fn frame_of(line: Str) -> CanFrame
+    match candump.parse_line(line)
+        Ok(l)  => candump.line_frame(l)
+        Err(_) => canframe.fault(canframe.CAN_FAULT_MALFORMED)
+
+fn fd_byte(i: Int) -> Int
+    0xA0 + i
+
+@test
+fn test_a_remote_request_renders_in_place_of_the_payload() [io]
+    test.assert_eq(candump.render_frame("can0", canframe.remote_frame(0x123, 2)),
+        "can0  123   [2]  remote request")
+    test.case("the microseconds are padded to six digits")
+    test.assert_eq(candump.render_line("vcan0", 5, 42, canframe.frame(0x7FF, 0, 0)),
+        "(5.000042) vcan0  7FF   [0]")
+
+@test
+fn test_a_malformed_timestamp_is_refused_at_its_start() [io]
+    test.case("no closing parenthesis")
+    test.assert_eq(bad_at("(5.1 can0 123 [0]"), 0)
+    test.case("no decimal point")
+    test.assert_eq(bad_at("(5) can0 123 [0]"), 1)
+    test.case("seconds that are not a number")
+    test.assert_eq(bad_at("(x.1) can0 123 [0]"), 1)
+    test.case("microseconds that are not a number")
+    test.assert_eq(bad_at("(5.y) can0 123 [0]"), 1)
+
+@test
+fn test_a_malformed_body_is_refused_where_it_breaks() [io]
+    test.case("too few words: the offset is the line's length")
+    test.assert_eq(bad_at("can0 123"), 8)
+    test.case("a length without brackets, named at the first place its text appears, inside the identifier")
+    test.assert_eq(bad_at("can0 123 3"), 7)
+    test.case("a length that is not a number")
+    test.assert_eq(bad_at("can0 123 [x]"), 9)
+    test.case("a length above eight")
+    test.assert_eq(bad_at("can0 123 [9]"), 9)
+    test.case("fewer bytes than the length says")
+    test.assert_eq(bad_at("can0 123 [2] 11"), 15)
+    test.case("a byte that is not two hex digits")
+    test.assert_eq(bad_at("can0 123 [1] 1G"), 13)
+
+@test
+fn test_every_frame_kind_parses_from_a_line() [io]
+    let ext = frame_of("can0  00000123   [2]  11 22")
+    test.assert(canframe.is_extended(ext))
+    test.assert(canframe.is_remote(ext) == false)
+    test.assert_eq(canframe.frame_byte(ext, 1), 0x22)
+    let ext_rtr = frame_of("can0  00000123   [2]  remote request")
+    test.assert(canframe.is_extended(ext_rtr) and canframe.is_remote(ext_rtr))
+    test.assert_eq(canframe.frame_len(ext_rtr), 2)
+    let rtr = frame_of("can0  123   [2]  remote request")
+    test.assert(canframe.is_remote(rtr) and not canframe.is_extended(rtr))
+    test.assert_eq(canframe.frame_id(rtr), 0x123)
+
+@test
+fn test_the_compact_form_of_a_remote_request_with_no_length() [io]
+    test.assert_eq(candump.render_compact(canframe.remote_frame(0x123, 0)), "123#R")
+    test.assert_eq(candump.render_compact(canframe.remote_frame(0x123, 3)), "123#R3")
+
+@test
+fn test_a_malformed_compact_frame_answers_a_fault() [io]
+    test.case("an identifier that is not hex, or is empty")
+    test.assert_eq(canframe.fault_code(candump.parse_compact("xyz#11")), canframe.CAN_FAULT_MALFORMED)
+    test.assert_eq(canframe.fault_code(candump.parse_compact("#11")), canframe.CAN_FAULT_MALFORMED)
+    test.case("an identifier of neither three nor eight digits")
+    test.assert_eq(canframe.fault_code(candump.parse_compact("12#00")), canframe.CAN_FAULT_MALFORMED)
+    test.case("three digits above 0x7FF")
+    test.assert_eq(canframe.fault_code(candump.parse_compact("800#")), canframe.CAN_FAULT_ID_TOO_WIDE)
+    test.case("a remote length that is not a number, or above eight")
+    test.assert_eq(canframe.fault_code(candump.parse_compact("123#Rx")), canframe.CAN_FAULT_MALFORMED)
+    test.assert_eq(canframe.fault_code(candump.parse_compact("123#R9")), canframe.CAN_FAULT_BAD_LENGTH)
+    test.case("an odd number of payload digits, more than eight bytes, a digit that is not hex")
+    test.assert_eq(canframe.fault_code(candump.parse_compact("123#1")), canframe.CAN_FAULT_MALFORMED)
+    test.assert_eq(canframe.fault_code(candump.parse_compact("123#112233445566778899")),
+        canframe.CAN_FAULT_BAD_LENGTH)
+    test.assert_eq(canframe.fault_code(candump.parse_compact("123#1G")), canframe.CAN_FAULT_MALFORMED)
+
+@test
+fn test_every_compact_frame_kind_parses() [io]
+    let r0 = candump.parse_compact("123#R")
+    test.assert(canframe.is_remote(r0))
+    test.assert_eq(canframe.frame_len(r0), 0)
+    let r3 = candump.parse_compact("123#R3")
+    test.assert_eq(canframe.frame_len(r3), 3)
+    let rx = candump.parse_compact("00000123#R2")
+    test.assert(canframe.is_remote(rx) and canframe.is_extended(rx))
+    let ex = candump.parse_compact("00000123#11")
+    test.assert(canframe.is_extended(ex) and not canframe.is_remote(ex))
+    test.assert_eq(canframe.frame_byte(ex, 0), 0x11)
+    test.case("lower-case hex digits read as upper-case ones")
+    let lc = candump.parse_compact("1ab#ff")
+    test.assert_eq(canframe.frame_id(lc), 0x1AB)
+    test.assert_eq(canframe.frame_byte(lc, 0), 0xFF)
+
+@test
+fn test_an_fd_frame_with_the_error_state_indicator_sets_flag_bit_1() [io]
+    let f = CanFdFrame { id: 0x123, flags: canframe.CAN_FD_FLAG_FD | canframe.CAN_FD_FLAG_ESI, len: 2 }
+    test.assert_eq(candump.render_fd_compact(f, fd_byte), "123##2A0A1")
+    let both = CanFdFrame { id: 0x123,
+        flags: canframe.CAN_FD_FLAG_FD | canframe.CAN_FD_FLAG_BRS | canframe.CAN_FD_FLAG_ESI,
+        len: 0 }
+    test.assert_eq(candump.render_fd_compact(both, fd_byte), "123##3")
+
+@test
+fn test_every_error_value_has_its_sentence() [io]
+    test.assert_eq(canerr.describe(CanIdTooWide(0x20000000, true)),
+                   "identifier 0x20000000 does not fit 29 bits; the largest extended identifier is 0x1FFFFFFF")
+    test.case("a negative identifier renders its digits as 0")
+    test.assert_eq(canerr.describe(CanIdTooWide(0 - 1, false)),
+                   "identifier 0x0 does not fit 11 bits; the largest standard identifier is 0x7FF")
+    test.assert_eq(canerr.describe(CanBusOff), "the node is bus-off and may not transmit until it recovers")
+    test.assert(str.starts_with(canerr.describe(CanFrameRefused), "the controller refused the frame"))
+    test.assert_eq(canerr.describe(CanShortWire(3)), "a frame on the wire is 16 bytes, and 3 are there")
+    test.assert(str.starts_with(canerr.describe(CanFilterNotSupported), "the controller cannot hold this filter"))
+    test.assert_eq(canerr.describe(CanTimingUnreachable(7372800, 500000)),
+                   "a 7372800 Hz clock cannot produce 500000 bit/s to within 0.1 per cent")
+
+@test
+fn test_which_errors_a_retry_can_clear() [io]
+    test.assert(canerr.is_transient(CanQueueFull(16)))
+    test.assert(canerr.is_transient(CanIsoTpOverflow))
+    test.assert(canerr.is_transient(CanIsoTpTimeout("N_Bs")))
+    test.assert(canerr.is_transient(CanSocketRefused("busy")))
+    test.assert(canerr.is_transient(CanBusOff))
+    test.assert(canerr.is_transient(CanFrameRefused) == false)

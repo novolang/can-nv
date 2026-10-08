@@ -1,8 +1,6 @@
 // canisotp.nv — ISO 15765-2: a message longer than eight bytes, over a
 // bus whose frames carry eight.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE PROTOCOL IS FOUR FRAME TYPES AND THREE OF THEM ARE A HANDSHAKE.
 // A single frame carries up to seven bytes and is the whole message.
 // Anything longer is a first frame, then a FLOW CONTROL frame from the
@@ -17,10 +15,9 @@
 // session's whole state is a message length, a byte offset, a
 // four-bit sequence counter, a block counter and two timers' worth of
 // deadline — seven integers.  The payload it is assembling is the
-// caller's buffer, which on a device is a fixed-capacity collection
-// sized to the largest message that product expects.  Keeping the
-// buffer out of the state is the reason this module builds for a
-// Cortex-M.
+// caller's buffer, which on a device is a fixed array in `.bss` sized
+// to the largest message that product expects, which is why this
+// module builds for a Cortex-M.
 //
 // TIME IS THE CALLER'S.  A `core` package has no clock, so every
 // function that would wait takes `now_ms` and every function that
@@ -35,6 +32,7 @@
 // package's.
 
 use canframe
+use canerr
 
 // ── The four frame types ─────────────────────────────────────────────
 
@@ -86,13 +84,22 @@ pub const CAN_ISOTP_NO_BLOCK_LIMIT = 0
 //     let f = canframe.frame(0x7E8, 8, canframe.pack2(0x10, 0x14))
 //     println("${canisotp.pci_type(f)}")   // 1, a first frame
 // ```
-pub fn pci_type(f: CanFrame) -> Int []
-    todo("can-nv.canisotp.pci_type")
+pub @tier(embedded)
+fn pci_type(f: CanFrame) -> Int []
+    if not canframe.is_frame(f) or canframe.frame_len(f) < 1
+        return 0 - 1
+    let t = canframe.frame_byte(f, 0) >>> 4
+    if t > 3
+        return 0 - 1
+    t
 
 // The payload length a single frame declares, or -1 when the frame is
 // not one.
-pub fn single_len(f: CanFrame) -> Int []
-    todo("can-nv.canisotp.single_len")
+pub @tier(embedded)
+fn single_len(f: CanFrame) -> Int []
+    if pci_type(f) != CAN_ISOTP_SINGLE
+        return 0 - 1
+    canframe.frame_byte(f, 0) & 0xF
 
 // The total message length a first frame declares — twelve bits
 // across two bytes, which is where the 4095 limit comes from.
@@ -105,20 +112,30 @@ pub fn single_len(f: CanFrame) -> Int []
 //     let f = canframe.frame(0x7E8, 8, canframe.pack2(0x10, 0x14))
 //     println("${canisotp.first_len(f)}")   // 20
 // ```
-pub fn first_len(f: CanFrame) -> Int []
-    todo("can-nv.canisotp.first_len")
+pub @tier(embedded)
+fn first_len(f: CanFrame) -> Int []
+    if pci_type(f) != CAN_ISOTP_FIRST
+        return 0 - 1
+    ((canframe.frame_byte(f, 0) & 0xF) << 8) | canframe.frame_byte(f, 1)
 
 // The four-bit sequence number a consecutive frame carries, or -1.
-pub fn consecutive_index(f: CanFrame) -> Int []
-    todo("can-nv.canisotp.consecutive_index")
+pub @tier(embedded)
+fn consecutive_index(f: CanFrame) -> Int []
+    if pci_type(f) != CAN_ISOTP_CONSECUTIVE
+        return 0 - 1
+    canframe.frame_byte(f, 0) & 0xF
 
 // The flow status a flow control frame carries, or -1.
-pub fn flow_status(f: CanFrame) -> Int []
-    todo("can-nv.canisotp.flow_status")
+pub @tier(embedded)
+fn flow_status(f: CanFrame) -> Int []
+    if pci_type(f) != CAN_ISOTP_FLOW
+        return 0 - 1
+    canframe.frame_byte(f, 0) & 0xF
 
 // The block size a flow control frame asks for.
-pub fn flow_block_size(f: CanFrame) -> Int []
-    todo("can-nv.canisotp.flow_block_size")
+pub @tier(embedded)
+fn flow_block_size(f: CanFrame) -> Int []
+    canframe.frame_byte(f, 1)
 
 // The separation time a flow control frame asks for, in
 // MICROSECONDS.
@@ -137,24 +154,46 @@ pub fn flow_block_size(f: CanFrame) -> Int []
 //     println("${canisotp.st_min_us(0xF1)}")   // 100
 //     println("${canisotp.st_min_us(10)}")     // 10000
 // ```
-pub fn st_min_us(encoded: Int) -> Int []
-    todo("can-nv.canisotp.st_min_us")
+pub @tier(embedded)
+fn st_min_us(encoded: Int) -> Int []
+    if encoded >= 0 and encoded <= 0x7F
+        return encoded * 1000
+    if encoded >= 0xF1 and encoded <= 0xF9
+        return (encoded - 0xF0) * 100
+    127000
 
 // The one-byte encoding of a separation time given in microseconds,
 // rounded up to something the field can express.
-pub fn st_min_encode(us: Int) -> Int []
-    todo("can-nv.canisotp.st_min_encode")
+pub @tier(embedded)
+fn st_min_encode(us: Int) -> Int []
+    if us <= 0
+        return 0
+    if us <= 900
+        return 0xF0 + (us + 99) / 100
+    let ms = (us + 999) / 1000
+    if ms > 0x7F
+        return 0x7F
+    ms
 
 // ── Building the frames ──────────────────────────────────────────────
 
 // A single frame carrying `len` bytes of the caller's payload.
-pub fn single_frame(id: Int, data: Int, len: Int) -> CanFrame []
-    todo("can-nv.canisotp.single_frame")
+pub @tier(embedded)
+fn single_frame(id: Int, data: Int, len: Int) -> CanFrame []
+    var n = len
+    if n < 0
+        n = 0
+    if n > CAN_ISOTP_SINGLE_MAX
+        n = CAN_ISOTP_SINGLE_MAX
+    canframe.frame(id, n + 1, (n & 0xF) | (low_bytes(data, n) << 8))
 
 // A first frame declaring a total message length and carrying its
 // first six bytes.
-pub fn first_frame(id: Int, total_len: Int, data: Int) -> CanFrame []
-    todo("can-nv.canisotp.first_frame")
+pub @tier(embedded)
+fn first_frame(id: Int, total_len: Int, data: Int) -> CanFrame []
+    let b0 = 0x10 | ((total_len >>> 8) & 0xF)
+    let b1 = total_len & 0xFF
+    canframe.frame(id, 8, b0 | (b1 << 8) | (low_bytes(data, CAN_ISOTP_FIRST_MAX) << 16))
 
 // A consecutive frame with sequence number `index` and up to seven
 // bytes.
@@ -163,8 +202,14 @@ pub fn first_frame(id: Int, total_len: Int, data: Int) -> CanFrame []
 // frame is implicitly 0, so a sender that numbered its first
 // consecutive frame 0 has its whole message rejected by a conforming
 // receiver.
-pub fn consecutive_frame(id: Int, index: Int, data: Int, len: Int) -> CanFrame []
-    todo("can-nv.canisotp.consecutive_frame")
+pub @tier(embedded)
+fn consecutive_frame(id: Int, index: Int, data: Int, len: Int) -> CanFrame []
+    var n = len
+    if n < 0
+        n = 0
+    if n > CAN_ISOTP_CONSECUTIVE_MAX
+        n = CAN_ISOTP_CONSECUTIVE_MAX
+    canframe.frame(id, n + 1, 0x20 | (index & 0xF) | (low_bytes(data, n) << 8))
 
 // A flow control frame.
 //
@@ -176,12 +221,14 @@ pub fn consecutive_frame(id: Int, index: Int, data: Int, len: Int) -> CanFrame [
 //     let f = canisotp.flow_frame(0x7E0, canisotp.CAN_ISOTP_CONTINUE, 8, 0xF1)
 //     println("${canframe.frame_byte(f, 1)}")   // 8, the block size
 // ```
-pub fn flow_frame(id: Int, status: Int, block_size: Int, st_min: Int) -> CanFrame []
-    todo("can-nv.canisotp.flow_frame")
+pub @tier(embedded)
+fn flow_frame(id: Int, status: Int, block_size: Int, st_min: Int) -> CanFrame []
+    canframe.frame(id, 3, canframe.pack4(0x30 | (status & 0xF), block_size, st_min, 0))
 
 // The next sequence number after `index`, wrapping 15 to 0.
-pub fn next_index(index: Int) -> Int []
-    todo("can-nv.canisotp.next_index")
+pub @tier(embedded)
+fn next_index(index: Int) -> Int []
+    (index + 1) & 0xF
 
 // How many consecutive frames a message of `len` bytes needs after its
 // first frame.
@@ -192,8 +239,11 @@ pub fn next_index(index: Int) -> Int []
 // fn main() [io]
 //     println("${canisotp.consecutive_count(20)}")   // 2
 // ```
-pub fn consecutive_count(len: Int) -> Int []
-    todo("can-nv.canisotp.consecutive_count")
+pub @tier(embedded)
+fn consecutive_count(len: Int) -> Int []
+    if len <= CAN_ISOTP_SINGLE_MAX
+        return 0
+    (len - CAN_ISOTP_FIRST_MAX + CAN_ISOTP_CONSECUTIVE_MAX - 1) / CAN_ISOTP_CONSECUTIVE_MAX
 
 // ── The session ──────────────────────────────────────────────────────
 
@@ -246,21 +296,95 @@ pub const CAN_ISOTP_STATE_FAILED = 5
 // fn main() [io]
 //     println("${canisotp.session_state(canisotp.session())}")   // 0
 // ```
-pub fn session() -> CanIsoTpSession []
-    todo("can-nv.canisotp.session")
+pub @tier(embedded)
+fn session() -> CanIsoTpSession []
+    CanIsoTpSession { state: CAN_ISOTP_STATE_IDLE,
+        total: 0,
+        done: 0,
+        index: 0,
+        block_left: 0,
+        st_min_us: 0,
+        waits: 0 }
 
 // Begin sending a message of `total` bytes.
-pub fn begin_send(s: CanIsoTpSession, total: Int) -> CanIsoTpSession []
-    todo("can-nv.canisotp.begin_send")
+pub @tier(embedded)
+fn begin_send(s: CanIsoTpSession, total: Int) -> CanIsoTpSession []
+    if total < 0 or total > CAN_ISOTP_MAX_MESSAGE
+        return failed(s, FAIL_TOO_LONG, total)
+    if total <= CAN_ISOTP_SINGLE_MAX
+        return CanIsoTpSession { state: CAN_ISOTP_STATE_DONE,
+            total: total,
+            done: total,
+            index: 0,
+            block_left: 0,
+            st_min_us: 0,
+            waits: 0 }
+    CanIsoTpSession { state: CAN_ISOTP_STATE_WAIT_FLOW,
+        total: total,
+        done: CAN_ISOTP_FIRST_MAX,
+        index: 1,
+        block_left: 0,
+        st_min_us: 0,
+        waits: 0 }
 
 // Take a flow control frame while sending: adopt its block size and
 // separation time, or fail on an overflow, or count a wait.
-pub fn take_flow(s: CanIsoTpSession, f: CanFrame) -> CanIsoTpSession []
-    todo("can-nv.canisotp.take_flow")
+pub @tier(embedded)
+fn take_flow(s: CanIsoTpSession, f: CanFrame) -> CanIsoTpSession []
+    if s.state != CAN_ISOTP_STATE_WAIT_FLOW
+        return s
+    let st = flow_status(f)
+    if st == CAN_ISOTP_CONTINUE
+        var left = flow_block_size(f)
+        if left == CAN_ISOTP_NO_BLOCK_LIMIT
+            left = UNLIMITED
+        return CanIsoTpSession { state: CAN_ISOTP_STATE_SENDING,
+            total: s.total,
+            done: s.done,
+            index: s.index,
+            block_left: left,
+            st_min_us: st_min_us(canframe.frame_byte(f, 2)),
+            waits: 0 }
+    if st == CAN_ISOTP_WAIT
+        if s.waits + 1 > CAN_ISOTP_MAX_WAITS
+            return failed(s, FAIL_WAITS, s.waits + 1)
+        return CanIsoTpSession { state: s.state,
+            total: s.total,
+            done: s.done,
+            index: s.index,
+            block_left: s.block_left,
+            st_min_us: s.st_min_us,
+            waits: s.waits + 1 }
+    failed(s, FAIL_OVERFLOW, 0)
 
 // Account for a consecutive frame just sent.
-pub fn sent_consecutive(s: CanIsoTpSession, len: Int) -> CanIsoTpSession []
-    todo("can-nv.canisotp.sent_consecutive")
+pub @tier(embedded)
+fn sent_consecutive(s: CanIsoTpSession, len: Int) -> CanIsoTpSession []
+    if s.state != CAN_ISOTP_STATE_SENDING
+        return s
+    let done = s.done + len
+    if done >= s.total
+        return CanIsoTpSession { state: CAN_ISOTP_STATE_DONE,
+            total: s.total,
+            done: s.total,
+            index: next_index(s.index),
+            block_left: 0,
+            st_min_us: s.st_min_us,
+            waits: 0 }
+    var left = s.block_left
+    var state = s.state
+    if left != UNLIMITED
+        left = left - 1
+        if left <= 0
+            left = 0
+            state = CAN_ISOTP_STATE_WAIT_FLOW
+    CanIsoTpSession { state: state,
+        total: s.total,
+        done: done,
+        index: next_index(s.index),
+        block_left: left,
+        st_min_us: s.st_min_us,
+        waits: 0 }
 
 // Begin receiving, from a first frame, into a buffer of `capacity`
 // bytes.
@@ -268,8 +392,30 @@ pub fn sent_consecutive(s: CanIsoTpSession, len: Int) -> CanIsoTpSession []
 // A capacity smaller than the declared length is what
 // `CAN_ISOTP_OVERFLOW` exists for, and `should_send_overflow` is the
 // question a receiver asks before it answers.
-pub fn begin_receive(s: CanIsoTpSession, f: CanFrame, capacity: Int) -> CanIsoTpSession []
-    todo("can-nv.canisotp.begin_receive")
+pub @tier(embedded)
+fn begin_receive(s: CanIsoTpSession, f: CanFrame, capacity: Int) -> CanIsoTpSession []
+    if pci_type(f) != CAN_ISOTP_FIRST
+        return failed(s, FAIL_SEQUENCE, 0)
+    let total = first_len(f)
+    if should_send_overflow(total, capacity)
+        return failed(CanIsoTpSession { state: s.state,
+            total: total,
+            done: 0,
+            index: 0,
+            block_left: 0,
+            st_min_us: 0,
+            waits: 0 },
+        FAIL_TOO_LONG, capacity)
+    var done = CAN_ISOTP_FIRST_MAX
+    if done > total
+        done = total
+    CanIsoTpSession { state: CAN_ISOTP_STATE_RECEIVING,
+        total: total,
+        done: done,
+        index: 1,
+        block_left: 0,
+        st_min_us: 0,
+        waits: 0 }
 
 // Take a consecutive frame while receiving.
 //
@@ -278,56 +424,103 @@ pub fn begin_receive(s: CanIsoTpSession, f: CanFrame, capacity: Int) -> CanIsoTp
 // retransmission: a gap means a frame was lost and the message cannot
 // be reassembled, and a receiver that carried on would hand its caller
 // a message with a hole in it.
-pub fn take_consecutive(s: CanIsoTpSession, f: CanFrame) -> CanIsoTpSession []
-    todo("can-nv.canisotp.take_consecutive")
+pub @tier(embedded)
+fn take_consecutive(s: CanIsoTpSession, f: CanFrame) -> CanIsoTpSession []
+    if s.state != CAN_ISOTP_STATE_RECEIVING
+        return s
+    let got = consecutive_index(f)
+    if got != s.index
+        return failed(s, FAIL_SEQUENCE, got)
+    var n = s.total - s.done
+    if n > CAN_ISOTP_CONSECUTIVE_MAX
+        n = CAN_ISOTP_CONSECUTIVE_MAX
+    let done = s.done + n
+    var state = s.state
+    if done >= s.total
+        state = CAN_ISOTP_STATE_DONE
+    CanIsoTpSession { state: state,
+        total: s.total,
+        done: done,
+        index: next_index(s.index),
+        block_left: 0,
+        st_min_us: 0,
+        waits: 0 }
 
 // Whether a flow control frame is due now.
-pub fn flow_due(s: CanIsoTpSession) -> Bool []
-    todo("can-nv.canisotp.flow_due")
+pub @tier(embedded)
+fn flow_due(s: CanIsoTpSession) -> Bool []
+    s.state == CAN_ISOTP_STATE_WAIT_FLOW
 
 // Whether a receiver should answer OVERFLOW rather than CONTINUE for a
 // message of `total` bytes into a buffer of `capacity`.
-pub fn should_send_overflow(total: Int, capacity: Int) -> Bool []
-    todo("can-nv.canisotp.should_send_overflow")
+pub @tier(embedded)
+fn should_send_overflow(total: Int, capacity: Int) -> Bool []
+    total > capacity
 
 // The session's state code.
-pub fn session_state(s: CanIsoTpSession) -> Int []
-    todo("can-nv.canisotp.session_state")
+pub @tier(embedded)
+fn session_state(s: CanIsoTpSession) -> Int []
+    s.state
 
 // The declared total length.
-pub fn session_total(s: CanIsoTpSession) -> Int []
-    todo("can-nv.canisotp.session_total")
+pub @tier(embedded)
+fn session_total(s: CanIsoTpSession) -> Int []
+    s.total
 
 // How many bytes have crossed.
-pub fn session_done(s: CanIsoTpSession) -> Int []
-    todo("can-nv.canisotp.session_done")
+pub @tier(embedded)
+fn session_done(s: CanIsoTpSession) -> Int []
+    s.done
 
 // The next sequence number.
-pub fn session_index(s: CanIsoTpSession) -> Int []
-    todo("can-nv.canisotp.session_index")
+pub @tier(embedded)
+fn session_index(s: CanIsoTpSession) -> Int []
+    s.index
 
 // The separation time in force, in microseconds.
-pub fn session_st_min_us(s: CanIsoTpSession) -> Int []
-    todo("can-nv.canisotp.session_st_min_us")
+pub @tier(embedded)
+fn session_st_min_us(s: CanIsoTpSession) -> Int []
+    s.st_min_us
 
 // How many frames remain in this block.
-pub fn session_block_left(s: CanIsoTpSession) -> Int []
-    todo("can-nv.canisotp.session_block_left")
+pub @tier(embedded)
+fn session_block_left(s: CanIsoTpSession) -> Int []
+    if s.block_left == UNLIMITED or s.state == CAN_ISOTP_STATE_FAILED
+        return 0
+    s.block_left
 
 // How many consecutive WAIT frames have arrived.
-pub fn session_waits(s: CanIsoTpSession) -> Int []
-    todo("can-nv.canisotp.session_waits")
+pub @tier(embedded)
+fn session_waits(s: CanIsoTpSession) -> Int []
+    s.waits
 
 // Whether the transfer is over, either way.
-pub fn session_is_finished(s: CanIsoTpSession) -> Bool []
-    todo("can-nv.canisotp.session_is_finished")
+pub @tier(embedded)
+fn session_is_finished(s: CanIsoTpSession) -> Bool []
+    s.state == CAN_ISOTP_STATE_DONE or s.state == CAN_ISOTP_STATE_FAILED
 
 // Why a failed session failed, or nothing.
 //
 // A `@value` struct cannot be a `Result` payload (SPEC § 14.5), so the
 // session carries a state code and this answers the reason beside it.
-pub fn session_fault(s: CanIsoTpSession) -> ?CanError []
-    todo("can-nv.canisotp.session_fault")
+pub @tier(rt)
+fn session_fault(s: CanIsoTpSession) -> ?CanError []
+    if s.state != CAN_ISOTP_STATE_FAILED
+        return None
+    let why = s.block_left
+    if why == FAIL_SEQUENCE
+        return Some(CanIsoTpBadSequence(s.index, s.st_min_us))
+    if why == FAIL_TOO_LONG
+        return Some(CanIsoTpTooLong(s.total, s.st_min_us))
+    if why == FAIL_OVERFLOW
+        return Some(CanIsoTpOverflow)
+    if why == FAIL_N_AS
+        return Some(CanIsoTpTimeout("N_As"))
+    if why == FAIL_N_BS
+        return Some(CanIsoTpTimeout("N_Bs"))
+    if why == FAIL_N_CR
+        return Some(CanIsoTpTimeout("N_Cr"))
+    Some(CanIsoTpTimeout("N_Bs"))
 
 // ── The four timers, as deadlines the caller arms ────────────────────
 
@@ -359,16 +552,32 @@ pub const CAN_ISOTP_MAX_WAITS = 10
 // fn main() [io]
 //     println("${canisotp.deadline_ms(canisotp.session(), 0)}")
 // ```
-pub fn deadline_ms(s: CanIsoTpSession, now_ms: Int) -> Int []
-    todo("can-nv.canisotp.deadline_ms")
+pub @tier(embedded)
+fn deadline_ms(s: CanIsoTpSession, now_ms: Int) -> Int []
+    if s.state == CAN_ISOTP_STATE_WAIT_FLOW
+        return now_ms + CAN_ISOTP_N_BS_MS
+    if s.state == CAN_ISOTP_STATE_RECEIVING
+        return now_ms + CAN_ISOTP_N_CR_MS
+    if s.state == CAN_ISOTP_STATE_SENDING
+        return now_ms + CAN_ISOTP_N_AS_MS
+    0 - 1
 
 // Whether the session's deadline has passed.
-pub fn timed_out(s: CanIsoTpSession, armed_at_ms: Int, now_ms: Int) -> Bool []
-    todo("can-nv.canisotp.timed_out")
+pub @tier(embedded)
+fn timed_out(s: CanIsoTpSession, armed_at_ms: Int, now_ms: Int) -> Bool []
+    let dl = deadline_ms(s, armed_at_ms)
+    dl >= 0 and now_ms > dl
 
 // The session moved to failed, with the timer that expired named.
-pub fn on_timeout(s: CanIsoTpSession) -> CanIsoTpSession []
-    todo("can-nv.canisotp.on_timeout")
+pub @tier(embedded)
+fn on_timeout(s: CanIsoTpSession) -> CanIsoTpSession []
+    if s.state == CAN_ISOTP_STATE_WAIT_FLOW
+        return failed(s, FAIL_N_BS, 0)
+    if s.state == CAN_ISOTP_STATE_RECEIVING
+        return failed(s, FAIL_N_CR, 0)
+    if s.state == CAN_ISOTP_STATE_SENDING
+        return failed(s, FAIL_N_AS, 0)
+    s
 
 // ── Extended addressing ──────────────────────────────────────────────
 
@@ -386,14 +595,56 @@ pub fn on_timeout(s: CanIsoTpSession) -> CanIsoTpSession []
 // fn main() [io]
 //     println("${canisotp.addressing_overhead(true)}")   // 1
 // ```
-pub fn addressing_overhead(extended_addressing: Bool) -> Int []
-    todo("can-nv.canisotp.addressing_overhead")
+pub @tier(embedded)
+fn addressing_overhead(extended_addressing: Bool) -> Int []
+    if extended_addressing
+        return 1
+    0
 
 // The most bytes a single frame carries under this addressing mode.
-pub fn single_max(extended_addressing: Bool) -> Int []
-    todo("can-nv.canisotp.single_max")
+pub @tier(embedded)
+fn single_max(extended_addressing: Bool) -> Int []
+    CAN_ISOTP_SINGLE_MAX - addressing_overhead(extended_addressing)
 
 // The most bytes a consecutive frame carries under this addressing
 // mode.
-pub fn consecutive_max(extended_addressing: Bool) -> Int []
-    todo("can-nv.canisotp.consecutive_max")
+pub @tier(embedded)
+fn consecutive_max(extended_addressing: Bool) -> Int []
+    CAN_ISOTP_CONSECUTIVE_MAX - addressing_overhead(extended_addressing)
+
+// ── Inside the session ───────────────────────────────────────────────
+
+// `block_left` while a sender may send without waiting for another flow
+// control frame: the receiver asked for a block size of 0.
+const UNLIMITED = 0 - 1
+
+// Why a session failed.  A failed session keeps the reason in
+// `block_left` and the number that decided it in `st_min_us`, so the
+// session stays seven integers and `session_fault` can name both.
+const FAIL_SEQUENCE = 1
+const FAIL_TOO_LONG = 2
+const FAIL_OVERFLOW = 3
+const FAIL_N_AS = 4
+const FAIL_N_BS = 5
+const FAIL_N_CR = 6
+const FAIL_WAITS = 7
+
+// The session moved to failed for `why`, with `detail`.
+@tier(embedded)
+fn failed(s: CanIsoTpSession, why: Int, detail: Int) -> CanIsoTpSession
+    CanIsoTpSession { state: CAN_ISOTP_STATE_FAILED,
+        total: s.total,
+        done: s.done,
+        index: s.index,
+        block_left: why,
+        st_min_us: detail,
+        waits: s.waits }
+
+// The low `n` bytes of a packed payload word, the rest cleared.  `n`
+// is at most 7, the bytes a frame carries after its protocol byte,
+// which is what every caller passes.
+@tier(embedded)
+fn low_bytes(data: Int, n: Int) -> Int
+    if n <= 0
+        return 0
+    data & ((1 << (8 * n)) - 1)

@@ -148,3 +148,95 @@ fn test_overlap_is_not_coverage() [io]
 
     test.assert(canfilter.overlaps(canfilter.exact(0x100),
                                    canfilter.exact(0x200)) == false)
+
+@test
+fn test_a_list_filter_matches_exactly_its_two_identifiers() [io]
+    test.case("a bxCAN bank in list mode and an M_CAN dual-ID element hold two identifiers in one slot")
+    let f = canfilter.list(0x2A0, 0x2A5)
+    test.assert(canfilter.filter_is_list(f))
+    test.assert(canfilter.accepts_id(f, 0x2A0, false))
+    test.assert(canfilter.accepts_id(f, 0x2A5, false))
+    test.assert(canfilter.accepts_id(f, 0x2A1, false) == false)
+    test.assert_eq(canfilter.width(f), 2)
+    let x = canfilter.list_ext(0x18DAF110, 0x18DAF120)
+    test.assert(canfilter.accepts_id(x, 0x18DAF120, true))
+    test.assert(canfilter.accepts_id(x, 0x18DAF120, false) == false)
+    test.case("a mask filter covers a list inside it, and a merge widens the list into one mask")
+    test.assert(canfilter.covers(canfilter.filter(0x2A0, 0x7F0), f))
+    test.assert(canfilter.covers(f, canfilter.exact(0x2A5)))
+    let m = canfilter.merge(f, canfilter.exact(0x2A0))
+    test.assert(canfilter.accepts_id(m, 0x2A5, false))
+    test.assert(canfilter.filter_is_list(m) == false)
+
+@test
+fn test_a_value_that_is_not_a_frame_is_never_accepted() [io]
+    test.assert(canfilter.accepts(canfilter.accept_all(), canframe.none()) == false)
+    test.assert(canfilter.accepts(canfilter.accept_all(), canframe.fault(canframe.CAN_FAULT_MALFORMED)) == false)
+
+@test
+fn test_an_inverted_filter_accepts_the_rest_of_its_format() [io]
+    test.assert_eq(canfilter.width(canfilter.inverted(canfilter.filter(0x100, 0x700))), 2048 - 256)
+    test.case("a list of one identifier written twice matches one identifier")
+    test.assert_eq(canfilter.width(canfilter.list(5, 5)), 1)
+
+@test
+fn test_a_list_filter_with_bits_outside_its_format_is_refused() [io]
+    test.assert(refused(canfilter.check_filter(canfilter.list(0x100, 0x101))) == false)
+    test.assert(refused(canfilter.check_filter(canfilter.list(0x800, 0x1))))
+    test.assert(refused(canfilter.check_filter(canfilter.list(0x1, 0x800))))
+
+@test
+fn test_filters_of_different_formats_merge_to_accepting_everything_of_the_first() [io]
+    test.case("a list and a filter of the other format")
+    let a = canfilter.merge(canfilter.list(0x100, 0x101), canfilter.exact_ext(1))
+    test.assert(not canfilter.filter_is_extended(a))
+    test.assert_eq(canfilter.width(a), 2048)
+    let b = canfilter.merge(canfilter.list_ext(1, 2), canfilter.exact(1))
+    test.assert(canfilter.filter_is_extended(b))
+    test.assert_eq(canfilter.filter_mask(b), 0)
+    test.case("an inverted list is not merged either")
+    test.assert_eq(canfilter.width(canfilter.merge(canfilter.inverted(canfilter.list(1, 2)), canfilter.inverted(canfilter.list(1, 3)))),
+        2048)
+    test.case("two mask filters of different formats")
+    test.assert_eq(canfilter.width(canfilter.merge(canfilter.exact(1), canfilter.exact_ext(1))), 2048)
+    test.assert(canfilter.filter_is_extended(canfilter.merge(canfilter.exact_ext(1), canfilter.exact(1))))
+
+@test
+fn test_two_inverted_filters_merge_to_the_inverse_of_what_both_match() [io]
+    test.case("disjoint match sets: every identifier is accepted by one of them")
+    let d = canfilter.merge(canfilter.inverted(canfilter.exact(0x100)), canfilter.inverted(canfilter.exact(0x200)))
+    test.assert(not canfilter.filter_is_inverted(d))
+    test.assert_eq(canfilter.width(d), 2048)
+    test.case("overlapping match sets: only the identifiers both match are rejected")
+    let o = canfilter.merge(canfilter.inverted(canfilter.filter(0x100, 0x700)),
+        canfilter.inverted(canfilter.filter(0x110, 0x7F0)))
+    test.assert(canfilter.filter_is_inverted(o))
+    test.assert_eq(canfilter.width(o), 2048 - 16)
+    test.assert(canfilter.accepts_id(o, 0x110, false) == false)
+    test.assert(canfilter.accepts_id(o, 0x120, false))
+
+@test
+fn test_a_merge_across_formats_gives_away_nothing_it_can_count() [io]
+    test.case("the merge accepts the standard format only, so it adds no identifier either input did not")
+    test.assert_eq(canfilter.false_accept_width(canfilter.accept_all(), canfilter.exact_ext(1)), 0)
+
+@test
+fn test_covers_across_formats_remote_frames_and_inversion() [io]
+    test.assert(canfilter.covers(canfilter.exact(1), canfilter.exact_ext(1)) == false)
+    test.assert(canfilter.covers(canfilter.exact(1), canfilter.allowing_remote(canfilter.exact(1))) == false)
+    test.case("both inverted: the narrower match set rejects less, so it covers the wider")
+    test.assert(canfilter.covers(canfilter.inverted(canfilter.exact(0x100)), canfilter.inverted(canfilter.filter(0x100, 0x700))))
+    test.assert(canfilter.covers(canfilter.inverted(canfilter.filter(0x100, 0x700)), canfilter.inverted(canfilter.exact(0x100))) == false)
+    test.case("an inverted filter covers a filter whose match set it does not reject")
+    test.assert(canfilter.covers(canfilter.inverted(canfilter.exact(0x200)), canfilter.exact(0x100)))
+    test.assert(canfilter.covers(canfilter.inverted(canfilter.list(1, 2)), canfilter.exact(1)) == false)
+    test.case("only a filter matching everything covers an inverted one")
+    test.assert(canfilter.covers(canfilter.accept_all(), canfilter.inverted(canfilter.exact(1))))
+    test.assert(canfilter.covers(canfilter.exact(2), canfilter.inverted(canfilter.exact(1))) == false)
+
+@test
+fn test_overlaps_across_formats_and_inversion() [io]
+    test.assert(canfilter.overlaps(canfilter.exact(1), canfilter.exact_ext(1)) == false)
+    test.assert(canfilter.overlaps(canfilter.inverted(canfilter.exact(1)), canfilter.inverted(canfilter.exact(2))))
+    test.assert(canfilter.overlaps(canfilter.inverted(canfilter.exact(1)), canfilter.exact(2)))
+    test.assert(canfilter.overlaps(canfilter.exact(1), canfilter.inverted(canfilter.exact(1))) == false)

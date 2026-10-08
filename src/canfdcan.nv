@@ -1,0 +1,570 @@
+// canfdcan.nv — Bosch's M_CAN as ST ships it in the STM32H7, FDCAN:
+// classic CAN and CAN FD.
+//
+// `FdCan` is a handle that holds an instance's register base and the
+// address of its part of the message RAM; every fact about the
+// controller's state is read from its registers, so the handle is a
+// `@value` of two integers and both `CanPeripheral[hw]` and
+// `CanFdPeripheral[hw]` are implemented over it.  The register map is
+// RM0468 (STM32H723/733/725/735/730), chapter 56.
+//
+// The H7's FDCAN instances share one 10 KB message RAM at 0x4000AC00.
+// This driver gives each instance 2 KB of it, laid out as:
+//
+// | Section | Elements | Bytes |
+// |---|---:|---:|
+// | standard filters | 28 of 1 word | 112 |
+// | extended filters | 8 of 2 words | 64 |
+// | receive FIFO 0 | 16 of 72 bytes | 1,152 |
+// | transmit queue | 8 of 72 bytes | 576 |
+//
+// Every element holds 64 data bytes, so a classic and an FD frame take
+// the same element.  The transmit buffers run as a queue (TXBC.TFQM
+// set): the controller sends the pending frame with the highest
+// priority first, which is the order arbitration gives.  A transmit
+// into a full queue cancels the pending frame that loses arbitration
+// when the new one outranks it, and answers that buffer as displaced.
+//
+// Filters: a standard filter goes to one of the 28 standard elements
+// and an extended filter to one of the 8 extended ones, in the slot the
+// caller names; a mask filter is a classic filter element and a list
+// is a dual-ID element, both storing to FIFO 0.  Until a filter is
+// set, every frame is received, remote frames included (GFC accepts
+// non-matching frames); the first filter set makes non-matching frames
+// rejected, and remote frames with them until a filter that allows
+// them is set (GFC.RRFS and RRFE are global switches).  An inverted
+// filter is refused.
+//
+// Bus-off: the controller sets CCCR.INIT itself and stays off;
+// `can_recover` cancels every pending transmission, clears INIT, and
+// the controller rejoins after 129 sequences of eleven recessive bits.
+//
+// The loopback modes need no transceiver.  In internal loopback
+// (`FDCAN_MODE_INTERNAL_LOOPBACK`: CCCR.TEST and CCCR.MON set, TEST.LBCK
+// set) the transmitter feeds the receiver inside the chip and the TX
+// pin stays recessive, so a frame sent is received through the
+// filters; the controller acknowledges its own frames.
+
+use canframe
+use canfilter
+use canbus
+use canhal
+use canerr
+
+// The STM32H7's instances and their message RAM (RM0468 § 2.3).
+pub const FDCAN1_BASE = 0x4000A000
+// FDCAN2.
+pub const FDCAN2_BASE = 0x4000A400
+// The start of the 10 KB message RAM the instances share.
+pub const FDCAN_MESSAGE_RAM = 0x4000AC00
+// The part of the message RAM each instance gets.
+pub const FDCAN_RAM_PER_INSTANCE = 2048
+
+// The operating modes.
+pub const FDCAN_MODE_NORMAL = 0
+// The transmitter feeds the receiver inside the chip; TX stays
+// recessive (CCCR.TEST, CCCR.MON, TEST.LBCK).
+pub const FDCAN_MODE_INTERNAL_LOOPBACK = 1
+// As internal, with TX driven, for a probe on the pin (CCCR.TEST,
+// TEST.LBCK).
+pub const FDCAN_MODE_EXTERNAL_LOOPBACK = 2
+// Listen only, never drive the bus (CCCR.MON).
+pub const FDCAN_MODE_MONITOR = 3
+
+// The kernel clock sources RCC_D2CCIP1R.FDCANSEL selects.  HSE is the
+// reset value; on the NUCLEO-H723ZG it is the ST-LINK's 8 MHz.
+pub const FDCAN_CLOCK_HSE = 0
+// PLL1's Q output.
+pub const FDCAN_CLOCK_PLL1Q = 1
+// PLL2's Q output.
+pub const FDCAN_CLOCK_PLL2Q = 2
+
+// The standard filter elements this driver gives each instance.
+pub const FDCAN_STD_FILTERS = 28
+// The extended filter elements this driver gives each instance.
+pub const FDCAN_EXT_FILTERS = 8
+// The receive FIFO's depth.
+pub const FDCAN_RX_DEPTH = 16
+// The transmit queue's depth.
+pub const FDCAN_TX_DEPTH = 8
+
+// The registers (RM0468 § 56.5).
+const DBTP = 0x0C
+const TEST = 0x10
+const CCCR = 0x18
+const NBTP = 0x1C
+const ECR = 0x40
+const PSR = 0x44
+const IR = 0x50
+const GFC = 0x80
+const SIDFC = 0x84
+const XIDFC = 0x88
+const XIDAM = 0x90
+const RXF0C = 0xA0
+const RXF0S = 0xA4
+const RXF0A = 0xA8
+const RXESC = 0xBC
+const TXBC = 0xC0
+const TXFQS = 0xC4
+const TXESC = 0xC8
+const TXBRP = 0xCC
+const TXBAR = 0xD0
+const TXBCR = 0xD4
+
+// The message RAM layout inside an instance's part, in bytes.
+const STD_AT = 0
+const EXT_AT = 112
+const RX_AT = 176
+const TX_AT = 1328
+// One receive or transmit element: two header words and 64 data bytes.
+const ELEMENT = 72
+
+const SPIN = 2000000
+
+// An FDCAN instance: its registers and its part of the message RAM.
+pub @value
+struct FdCan
+    base: Int
+    ram: Int
+
+// FDCAN1 on an STM32H7.
+pub @tier(embedded)
+fn fdcan1() -> FdCan []
+    FdCan { base: FDCAN1_BASE, ram: FDCAN_MESSAGE_RAM }
+
+// FDCAN2 on an STM32H7.
+pub @tier(embedded)
+fn fdcan2() -> FdCan []
+    FdCan { base: FDCAN2_BASE, ram: FDCAN_MESSAGE_RAM + FDCAN_RAM_PER_INSTANCE }
+
+// The FDCAN_NBTP value for a nominal timing: NSJW - 1, NBRP - 1,
+// NTSEG1 - 1 and NTSEG2 - 1.
+pub @tier(embedded)
+fn nbtp_of(t: CanBitTiming) -> Int []
+    ((canbus.timing_sjw(t) - 1) << 25) | ((canbus.timing_prescaler(t) - 1) << 16) | ((canbus.timing_tseg1(t) - 1) << 8) | (canbus.timing_tseg2(t) - 1)
+
+// The FDCAN_DBTP value for a data-phase timing: DBRP - 1, DTSEG1 - 1,
+// DTSEG2 - 1 and DSJW - 1, with transmitter delay compensation off.
+pub @tier(embedded)
+fn dbtp_of(t: CanBitTiming) -> Int []
+    ((canbus.timing_prescaler(t) - 1) << 16) | ((canbus.timing_tseg1(t) - 1) << 8) | ((canbus.timing_tseg2(t) - 1) << 4) | (canbus.timing_sjw(t) - 1)
+
+// Selects the FDCAN kernel clock and turns the instances' clock on, on
+// an STM32H7 (RCC_D2CCIP1R.FDCANSEL, bits 29 and 28; RCC_APB1HENR.FDCANEN,
+// bit 8).
+pub @tier(embedded)
+// cov: skip — reads and writes the STM32H7's RCC and GPIO registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
+fn h7_clock_on(source: Int) [hw]
+    let d2ccip1r = 0x58024450
+    hw.mem_write32(d2ccip1r, (hw.mem_read32(d2ccip1r) & ~(3 << 28)) | ((source & 3) << 28))
+    let apb1henr = 0x580244EC
+    hw.mem_write32(apb1henr, hw.mem_read32(apb1henr) | (1 << 8))
+
+// Routes FDCAN1 to PD0 (RX) and PD1 (TX), alternate function 9, on an
+// STM32H7: the pins the NUCLEO-H723ZG brings out on its Zio connector.
+// A transceiver goes between them and the bus; none is needed for the
+// loopback modes.
+pub @tier(embedded)
+// cov: skip — reads and writes the STM32H7's RCC and GPIO registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
+fn h7_route_pd0_pd1() [hw]
+    let ahb4enr = 0x580244E0
+    hw.mem_write32(ahb4enr, hw.mem_read32(ahb4enr) | (1 << 3))
+    let gpiod = 0x58020C00
+    hw.mem_write32(gpiod, (hw.mem_read32(gpiod) & ~0xF) | 0xA)
+    hw.mem_write32(gpiod + 0x20, (hw.mem_read32(gpiod + 0x20) & ~0xFF) | 0x99)
+
+@tier(embedded)
+// cov: skip — reads the FDCAN controller's registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
+fn rd(d: FdCan, off: Int) -> Int [hw]
+    hw.mem_read32(d.base + off) & 0xFFFFFFFF
+
+@tier(embedded)
+// cov: skip — writes the FDCAN controller's registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
+fn wr(d: FdCan, off: Int, v: Int) [hw]
+    hw.mem_write32(d.base + off, v & 0xFFFFFFFF)
+
+@tier(embedded)
+// cov: skip — reads the FDCAN message RAM at its fixed address, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
+fn ram_rd(d: FdCan, off: Int) -> Int [hw]
+    hw.mem_read32(d.ram + off) & 0xFFFFFFFF
+
+@tier(embedded)
+// cov: skip — writes the FDCAN message RAM at its fixed address, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
+fn ram_wr(d: FdCan, off: Int, v: Int) [hw]
+    hw.mem_write32(d.ram + off, v & 0xFFFFFFFF)
+
+// Sets CCCR.INIT and CCCR.CCE, so the protected registers take writes.
+@tier(embedded)
+// cov: skip — reads and writes the FDCAN controller's registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
+fn enter_config(d: FdCan) -> Bool [hw]
+    wr(d, CCCR, rd(d, CCCR) | 1)
+    for _i in 0..SPIN
+        if (rd(d, CCCR) & 1) != 0
+            wr(d, CCCR, rd(d, CCCR) | 2)
+            return true
+    false
+
+// Clears CCCR.INIT and waits for the controller to join the bus.
+@tier(embedded)
+// cov: skip — reads and writes the FDCAN controller's registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
+fn leave_config(d: FdCan) -> Bool [hw]
+    wr(d, CCCR, rd(d, CCCR) & ~3)
+    for _i in 0..SPIN
+        if (rd(d, CCCR) & 1) == 0
+            return true
+    false
+
+// Starts the controller: enters initialisation, programs the mode, the
+// nominal timing and, with `fd`, the data-phase timing and CAN FD with
+// bit rate switching; lays out and clears this instance's part of the
+// message RAM; and leaves initialisation.  Answers false when the
+// controller did not answer, which on a part whose kernel clock is off
+// is the first call.
+pub @tier(embedded)
+// cov: skip — reads and writes the FDCAN controller's registers and its message RAM at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
+fn start(d: FdCan, nominal: CanBitTiming, data: CanBitTiming, fd: Bool, mode: Int) -> Bool [hw]
+    if not canbus.timing_ok(nominal) or fd and not canbus.timing_ok(data)
+        return false
+    if not enter_config(d)
+        return false
+    // CCCR: INIT and CCE, FDOE (8) and BRSE (9) for FD, TEST (7) and
+    // MON (5) for the modes.
+    var cccr = 3
+    if fd
+        cccr = cccr | (1 << 8) | (1 << 9)
+    if mode == FDCAN_MODE_INTERNAL_LOOPBACK
+        cccr = cccr | (1 << 7) | (1 << 5)
+    elif mode == FDCAN_MODE_EXTERNAL_LOOPBACK
+        cccr = cccr | (1 << 7)
+    elif mode == FDCAN_MODE_MONITOR
+        cccr = cccr | (1 << 5)
+    wr(d, CCCR, cccr)
+    if mode == FDCAN_MODE_INTERNAL_LOOPBACK or mode == FDCAN_MODE_EXTERNAL_LOOPBACK
+        // TEST.LBCK, bit 4; TEST is writable once CCCR.TEST is set.
+        wr(d, TEST, 1 << 4)
+    wr(d, NBTP, nbtp_of(nominal))
+    if fd
+        wr(d, DBTP, dbtp_of(data))
+    // The message RAM, cleared: a zero filter element is disabled.
+    for w in 0..FDCAN_RAM_PER_INSTANCE / 4
+        ram_wr(d, 4 * w, 0)
+    let at = d.ram - FDCAN_MESSAGE_RAM
+    wr(d, SIDFC, (FDCAN_STD_FILTERS << 16) | ((at + STD_AT) & 0xFFFC))
+    wr(d, XIDFC, (FDCAN_EXT_FILTERS << 16) | ((at + EXT_AT) & 0xFFFC))
+    wr(d, XIDAM, 0x1FFFFFFF)
+    // Non-matching frames, remote frames included, to FIFO 0.
+    wr(d, GFC, 0)
+    wr(d, RXF0C, (FDCAN_RX_DEPTH << 16) | ((at + RX_AT) & 0xFFFC))
+    // 64-byte data fields for the FIFOs, the buffers and the queue.
+    wr(d, RXESC, 0x777)
+    wr(d, TXESC, 7)
+    // A transmit queue (TFQM, bit 30) of 8, no dedicated buffers.
+    wr(d, TXBC, (1 << 30) | (FDCAN_TX_DEPTH << 24) | ((at + TX_AT) & 0xFFFC))
+    // Every interrupt flag cleared; this driver polls.
+    wr(d, IR, 0xFFFFFFFF)
+    leave_config(d)
+
+// Whether FIFO 0 lost a frame since the last call (IR.RF0L, bit 3),
+// which also clears the flag.
+pub @tier(embedded)
+// cov: skip — reads and writes the FDCAN controller's registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
+fn overran(d: FdCan) -> Bool [hw]
+    if (rd(d, IR) & (1 << 3)) == 0
+        return false
+    wr(d, IR, 1 << 3)
+    true
+
+// The first header word of an element: XTD (30), RTR (29) and the
+// identifier, a standard one in bits 28 to 18.
+pub @tier(embedded)
+fn header0(id: Int, extended: Bool, remote: Bool) -> Int []
+    var w = 0
+    if extended
+        w = (1 << 30) | (id & 0x1FFFFFFF)
+    else
+        w = (id & 0x7FF) << 18
+    if remote
+        w = w | (1 << 29)
+    w
+
+// The second header word of a transmit element: FDF (21), BRS (20) and
+// the data length code (19 to 16).
+pub @tier(embedded)
+fn header1(dlc: Int, fd: Bool, brs: Bool) -> Int []
+    var w = (dlc & 0xF) << 16
+    if fd
+        w = w | (1 << 21)
+    if brs
+        w = w | (1 << 20)
+    w
+
+// The standard filter element for `f`: a classic filter (SFT 2) or a
+// dual-ID list (SFT 1), storing to FIFO 0 (SFEC 1).
+pub @tier(embedded)
+fn std_element(f: CanFilter) -> Int []
+    var sft = 2
+    if canfilter.filter_is_list(f)
+        sft = 1
+    (sft << 30) | (1 << 27) | ((canfilter.filter_id(f) & 0x7FF) << 16) | (canfilter.filter_mask(f) & 0x7FF)
+
+// The extended filter element's first word (EFEC 1, FIFO 0, and EFID1).
+pub @tier(embedded)
+fn ext_element0(f: CanFilter) -> Int []
+    (1 << 29) | (canfilter.filter_id(f) & 0x1FFFFFFF)
+
+// The extended filter element's second word: a classic filter (EFT 2)
+// or a dual-ID list (EFT 1), and EFID2.
+pub @tier(embedded)
+fn ext_element1(f: CanFilter) -> Int []
+    var eft = 2
+    if canfilter.filter_is_list(f)
+        eft = 1
+    (eft << 30) | (canfilter.filter_mask(f) & 0x1FFFFFFF)
+
+// The arbitration key of the frame pending in transmit buffer `i`.
+@tier(embedded)
+// cov: skip — reads the FDCAN message RAM at its fixed address, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
+fn pending_key(d: FdCan, i: Int) -> Int [hw]
+    let t0 = ram_rd(d, TX_AT + ELEMENT * i)
+    let ext = (t0 & (1 << 30)) != 0
+    let rtr = (t0 & (1 << 29)) != 0
+    var f = canframe.frame((t0 >>> 18) & 0x7FF, 0, 0)
+    if ext
+        f = canframe.frame_ext(t0 & 0x1FFFFFFF, 0, 0)
+    if rtr
+        if ext
+            f = canframe.remote_frame_ext(t0 & 0x1FFFFFFF, 0)
+        else
+            f = canframe.remote_frame((t0 >>> 18) & 0x7FF, 0)
+    canframe.arbitration_key(f)
+
+// A free transmit buffer, making room by cancelling the pending frame
+// that loses arbitration when `key` outranks it.  Answers the buffer,
+// and the displaced one or -1, packed as `buffer | displaced << 8`; -1
+// when the queue is full of frames that outrank this one.
+@tier(embedded)
+// cov: skip — reads and writes the FDCAN controller's registers and its message RAM at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
+fn free_buffer(d: FdCan, key: Int) -> Int [hw]
+    let q = rd(d, TXFQS)
+    if (q & (1 << 21)) == 0
+        return ((q >>> 16) & 0x1F) | (0xFF << 8)
+    let pending = rd(d, TXBRP)
+    var worst = 0 - 1
+    var worst_key = 0
+    for i in 0..FDCAN_TX_DEPTH
+        if (pending & (1 << i)) != 0
+            let k = pending_key(d, i)
+            if worst < 0 or k >= worst_key
+                worst = i
+                worst_key = k
+    if worst < 0 or key >= worst_key
+        return 0 - 1
+    wr(d, TXBCR, 1 << worst)
+    for _i in 0..SPIN
+        let s = rd(d, TXFQS)
+        if (s & (1 << 21)) == 0
+            return ((s >>> 16) & 0x1F) | (worst << 8)
+    0 - 1
+
+// Answers a transmit attempt from what `free_buffer` found.
+@tier(embedded)
+// cov: skip — the transmit methods are its only callers, and they read and write the FDCAN controller's registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds them for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs them
+fn accepted_from(slot: Int) -> CanTxAccepted
+    let disp = (slot >>> 8) & 0xFF
+    if disp == 0xFF
+        return canhal.accepted(slot & 0xFF, 0 - 1)
+    canhal.accepted(slot & 0xFF, disp)
+
+// Whether the controller is bus-off (PSR.BO, bit 7).
+@tier(embedded)
+// cov: skip — reads the FDCAN controller's registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
+fn bus_off(d: FdCan) -> Bool [hw]
+    (rd(d, PSR) & (1 << 7)) != 0
+
+// cov: skip — reads and writes the FDCAN controller's registers and its message RAM at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
+impl CanPeripheral[hw] for FdCan
+    @tier(embedded)
+    fn can_transmit(self, f: CanFrame) -> CanTxAccepted [hw]
+        if bus_off(self)
+            return canhal.tx_refused(canhal.CAN_TX_BUS_OFF)
+        if not canhal.frame_ok(f)
+            return canhal.tx_refused(canhal.CAN_TX_REFUSED)
+        let slot = free_buffer(self, canframe.arbitration_key(f))
+        if slot < 0
+            return canhal.tx_refused(canhal.CAN_TX_FULL)
+        let i = slot & 0xFF
+        let at = TX_AT + ELEMENT * i
+        ram_wr(self, at, header0(canframe.frame_id(f), canframe.is_extended(f), canframe.is_remote(f)))
+        ram_wr(self, at + 4, header1(canframe.frame_len(f), false, false))
+        let data = canframe.frame_data(f)
+        ram_wr(self, at + 8, data & 0xFFFFFFFF)
+        ram_wr(self, at + 12, (data >>> 32) & 0xFFFFFFFF)
+        wr(self, TXBAR, 1 << i)
+        accepted_from(slot)
+
+    @tier(embedded)
+    fn can_tx_done(self, mailbox: Int) -> Bool [hw]
+        if mailbox < 0 or mailbox >= FDCAN_TX_DEPTH
+            return true
+        (rd(self, TXBRP) & (1 << mailbox)) == 0
+
+    @tier(embedded)
+    fn can_tx_abort(self, mailbox: Int) -> ?CanError [hw]
+        if mailbox >= 0 and mailbox < FDCAN_TX_DEPTH
+            wr(self, TXBCR, 1 << mailbox)
+        None
+
+    // A frame in the FD format with more than eight bytes does not fit
+    // a `CanFrame`: it is taken off the FIFO and answered as a fault
+    // with `CAN_FAULT_BAD_LENGTH`; `can_receive_fd` is the call for it.
+    @tier(embedded)
+    fn can_receive(self) -> CanFrame [hw]
+        let s = rd(self, RXF0S)
+        if (s & 0x7F) == 0
+            return canframe.none()
+        let gi = (s >>> 8) & 0x3F
+        let at = RX_AT + ELEMENT * gi
+        let r0 = ram_rd(self, at)
+        let r1 = ram_rd(self, at + 4)
+        let lo = ram_rd(self, at + 8)
+        let hi = ram_rd(self, at + 12)
+        wr(self, RXF0A, gi)
+        let dlc = (r1 >>> 16) & 0xF
+        let fd = (r1 & (1 << 21)) != 0
+        if fd and dlc > 8
+            return canframe.fault(canframe.CAN_FAULT_BAD_LENGTH)
+        let len = canframe.classic_len_for_dlc(dlc)
+        let ext = (r0 & (1 << 30)) != 0
+        let rtr = (r0 & (1 << 29)) != 0
+        if ext
+            if rtr
+                return canframe.remote_frame_ext(r0 & 0x1FFFFFFF, len)
+            return canframe.frame_ext(r0 & 0x1FFFFFFF, len, lo | (hi << 32))
+        if rtr
+            return canframe.remote_frame((r0 >>> 18) & 0x7FF, len)
+        canframe.frame((r0 >>> 18) & 0x7FF, len, lo | (hi << 32))
+
+    @tier(embedded)
+    fn can_set_filter(self, slot: Int, f: CanFilter) -> ?CanError [hw]
+        if canfilter.filter_is_inverted(f) or slot < 0
+            return Some(CanFilterNotSupported)
+        let ext = canfilter.filter_is_extended(f)
+        if ext and slot >= FDCAN_EXT_FILTERS or not ext and slot >= FDCAN_STD_FILTERS
+            return Some(CanFilterNotSupported)
+        if not enter_config(self)
+            return Some(CanFilterNotSupported)
+        if ext
+            ram_wr(self, EXT_AT + 8 * slot, ext_element0(f))
+            ram_wr(self, EXT_AT + 8 * slot + 4, ext_element1(f))
+        else
+            ram_wr(self, STD_AT + 4 * slot, std_element(f))
+        // Non-matching frames rejected (ANFS and ANFE 2).  Remote frames
+        // are rejected (RRFS and RRFE) from the first filter on, and
+        // filtered like data frames again once a filter lets them in.
+        var gfc = (2 << 4) | (2 << 2) | 3
+        let cur = rd(self, GFC)
+        if (cur & (2 << 4)) != 0
+            gfc = (gfc & ~3) | (cur & 3)
+        if (canfilter.filter_flags(f) & canfilter.CAN_FILTER_ALLOW_RTR) != 0
+            gfc = gfc & ~3
+        wr(self, GFC, gfc)
+        let _ = leave_config(self)
+        None
+
+    @tier(embedded)
+    fn can_filter_slots(self) -> Int
+        FDCAN_STD_FILTERS
+
+    @tier(embedded)
+    fn can_bus_state(self) -> CanBusState [hw]
+        let ecr = rd(self, ECR)
+        let rec = (ecr >>> 8) & 0x7F
+        if bus_off(self)
+            return canbus.bus_state_of(canbus.CAN_BUS_OFF_LIMIT, rec)
+        canbus.bus_state_of(ecr & 0xFF, rec)
+
+    @tier(embedded)
+    fn can_recover(self) -> ?CanError [hw]
+        if not bus_off(self)
+            return None
+        // What is pending is cancelled first: the frame that took the
+        // node off would otherwise be sent again the moment it rejoins,
+        // and a stale command delivered late is worse than none.  The
+        // controller set INIT when it went bus-off; clearing it starts
+        // the 129 idle sequences the protocol asks for.
+        wr(self, TXBCR, (1 << FDCAN_TX_DEPTH) - 1)
+        wr(self, CCCR, rd(self, CCCR) & ~3)
+        for _i in 0..SPIN
+            if not bus_off(self)
+                return None
+        Some(CanBusOff)
+
+// cov: skip — reads and writes the FDCAN controller's registers and its message RAM at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
+impl CanFdPeripheral[hw] for FdCan
+    @tier(embedded)
+    fn can_transmit_fd(self, f: CanFdFrame, data: Vec[u8; 64]) -> CanTxAccepted [hw]
+        if bus_off(self)
+            return canhal.tx_refused(canhal.CAN_TX_BUS_OFF)
+        if not canframe.fd_is_frame(f) or not canframe.fd_len_is_valid(canframe.fd_len(f))
+            return canhal.tx_refused(canhal.CAN_TX_REFUSED)
+        let key = canframe.arbitration_key(canframe.frame(canframe.fd_id(f), 0, 0))
+        let slot = free_buffer(self, key)
+        if slot < 0
+            return canhal.tx_refused(canhal.CAN_TX_FULL)
+        let i = slot & 0xFF
+        let at = TX_AT + ELEMENT * i
+        let fd = canframe.fd_is_fd(f)
+        ram_wr(self, at, header0(canframe.fd_id(f), canframe.fd_is_extended(f), false))
+        var dlc = canframe.fd_dlc(f)
+        if not fd
+            dlc = canframe.fd_len(f)
+        ram_wr(self, at + 4, header1(dlc, fd, fd and canframe.fd_has_brs(f)))
+        let n = canframe.fd_padded_len(canframe.fd_len(f))
+        let have = data.len()
+        for w in 0..(n + 3) / 4
+            var word = 0
+            for b in 0..4
+                let k = 4 * w + b
+                if k < have and k < canframe.fd_len(f)
+                    word = word | (data[k] as Int << (8 * b))
+            ram_wr(self, at + 8 + 4 * w, word)
+        wr(self, TXBAR, 1 << i)
+        accepted_from(slot)
+
+    @tier(embedded)
+    fn can_receive_fd(self, var data: Vec[u8; 64]) -> CanFdFrame [hw]
+        data.clear()
+        let s = rd(self, RXF0S)
+        if (s & 0x7F) == 0
+            return canframe.fd_none()
+        let gi = (s >>> 8) & 0x3F
+        let at = RX_AT + ELEMENT * gi
+        let r0 = ram_rd(self, at)
+        let r1 = ram_rd(self, at + 4)
+        let dlc = (r1 >>> 16) & 0xF
+        let fd = (r1 & (1 << 21)) != 0
+        var len = canframe.classic_len_for_dlc(dlc)
+        if fd
+            len = canframe.fd_len_for_dlc(dlc)
+        for w in 0..(len + 3) / 4
+            let word = ram_rd(self, at + 8 + 4 * w)
+            for b in 0..4
+                if 4 * w + b < len
+                    let _ = data.push(((word >>> (8 * b)) & 0xFF) as u8)
+        wr(self, RXF0A, gi)
+        let ext = (r0 & (1 << 30)) != 0
+        var flags = 0
+        if ext
+            flags = canframe.CAN_FLAG_EXTENDED
+        if (r0 & (1 << 29)) != 0
+            flags = flags | canframe.CAN_FLAG_RTR
+        if (r0 & (1 << 31)) != 0
+            flags = flags | canframe.CAN_FD_FLAG_ESI
+        if fd
+            flags = flags | canframe.CAN_FD_FLAG_FD
+        if (r1 & (1 << 20)) != 0
+            flags = flags | canframe.CAN_FD_FLAG_BRS
+        var id = (r0 >>> 18) & 0x7FF
+        if ext
+            id = r0 & 0x1FFFFFFF
+        CanFdFrame { id: id, flags: flags, len: len }

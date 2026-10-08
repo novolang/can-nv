@@ -1,0 +1,194 @@
+// canboard_tests — the board's controller behind CanPeripheral, on the
+// host.
+//
+// The frame conversions are checked both ways for each kind of frame.
+// The controller logic runs over a double of `CanBus`, whose state sits
+// in a map that a method changes through its receiver.  The host has no
+// CAN controller: `hal.can` refuses the open and the send, receives
+// nothing, and reads the counters as 0, so `CanBoard` over the board's
+// handle answers each method's refusal or its empty answer.  On a board
+// the same calls reach the controller; tests/can.sh of the FRDM-MCXN947
+// runs them there.
+
+use std.test
+use embedded_hal.{ BoardCan, CanBus, CanBusFrame, CanBusErrors }
+use canframe
+use canfilter
+use canbus
+use canhal
+use canboard
+use canboard.{ CanBoard }
+
+// ── The double ───────────────────────────────────────────────────────
+//
+// `st` holds the controller's state by key: 0 is 1 when `open` accepts,
+// 1 the last mode opened, 2 the rate it runs at, 3 is 1 when `send`
+// refuses, 4 is 1 when the last frame has left, 5 is 1 when a frame
+// waits to be received, 6 the transmit error counter, 7 the receive
+// error counter, 8 the confinement state, 9 the number of frames sent,
+// 10 the identifier of the last frame sent.
+
+struct FakeCan
+    st: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+impl CanBus for FakeCan
+    fn open(self, bitrate: Int, mode: Int) -> Bool [hw]
+        if at(self.st, 0) == 0
+            return false
+        self.st.insert(1, mode)
+        self.st.insert(2, bitrate)
+        true
+
+    fn send(self, f: CanBusFrame) -> Bool [hw]
+        if at(self.st, 3) == 1
+            return false
+        self.st.insert(9, at(self.st, 9) + 1)
+        self.st.insert(10, f.id)
+        true
+
+    fn receive(self) -> ?CanBusFrame [hw]
+        if at(self.st, 5) == 0
+            return None
+        self.st.insert(5, 0)
+        Some(CanBusFrame { id: 0x321, extended: false, remote: false, len: 2, data: 0xBEEF })
+
+    fn tx_done(self) -> Bool [hw]
+        at(self.st, 4) == 1
+
+    fn bitrate(self) -> Int [hw]
+        at(self.st, 2)
+
+    fn errors(self) -> CanBusErrors [hw]
+        CanBusErrors { tx: at(self.st, 6), rx: at(self.st, 7), state: at(self.st, 8) }
+
+// A controller that accepts the open when `opens` is set.
+fn fake(opens: Bool) -> FakeCan
+    let st: HashMap<Int, Int> = HashMap.new()
+    if opens
+        st.insert(0, 1)
+    FakeCan { st: st }
+
+@test
+fn test_a_standard_data_frame_crosses_both_ways() [io]
+    let f = canframe.frame(0x123, 3, 0x332211)
+    let b = canboard.to_bus_frame(f)
+    test.assert(b.id == 0x123 and not b.extended and not b.remote and b.len == 3)
+    test.assert(b.data == 0x332211)
+    let back = canboard.of_bus_frame(b)
+    test.assert(canframe.frame_id(back) == 0x123)
+    test.assert(canframe.frame_byte(back, 2) == 0x33)
+    test.assert(not canframe.is_extended(back))
+
+@test
+fn test_an_extended_data_frame_crosses_both_ways() [io]
+    let b = canboard.to_bus_frame(canframe.frame_ext(0x18DAF110, 8, -1))
+    test.assert(b.extended and b.len == 8 and b.data == -1)
+    let back = canboard.of_bus_frame(b)
+    test.assert(canframe.is_extended(back))
+    test.assert(canframe.frame_id(back) == 0x18DAF110)
+
+@test
+fn test_remote_frames_cross_both_ways() [io]
+    let b = canboard.to_bus_frame(canframe.remote_frame(0x7FF, 4))
+    test.assert(b.remote and not b.extended and b.len == 4)
+    test.assert(canframe.is_remote(canboard.of_bus_frame(b)))
+    let e = canboard.of_bus_frame(CanBusFrame { id: 0x1FFFFFFF, extended: true, remote: true, len: 0, data: 0 })
+    test.assert(canframe.is_remote(e) and canframe.is_extended(e))
+    test.assert(canframe.frame_id(e) == 0x1FFFFFFF)
+
+@test
+fn test_the_host_has_no_controller_to_open() [io, hw]
+    let c = canboard.board_open(0, 500000, true)
+    test.assert(not canboard.board_started(c))
+    test.assert(canboard.board_bitrate(c) == 0)
+
+@test
+fn test_the_board_controller_answers_as_absent_hardware() [io, hw]
+    let c = CanBoard { bus: BoardCan { id: 0 } }
+    // The send is refused by the hook, which reads as a full mailbox.
+    test.assert(canhal.tx_status(c.can_transmit(canframe.frame(0x100, 1, 7))) == canhal.CAN_TX_FULL)
+    test.assert(canhal.tx_status(c.can_transmit(canframe.frame(0x800, 1, 7))) == canhal.CAN_TX_REFUSED)
+    test.assert(not c.can_tx_done(0))
+    test.assert(not c.can_tx_done(1))
+    test.assert(c.can_tx_abort(0) != None)
+    test.assert(canframe.is_none(c.can_receive()))
+    test.assert(c.can_set_filter(0, canfilter.accept_all()) != None)
+    test.assert(c.can_filter_slots() == 0)
+    test.assert(canbus.tx_errors(c.can_bus_state()) == 0)
+    test.assert(c.can_recover() == None)
+    // The trait's free functions run over it too.
+    test.assert(canframe.is_none(canhal.receive_filtered(c, canfilter.accept_all(), 3)))
+    test.assert(canhal.recover_if_bus_off(c) == None)
+
+@test
+fn test_the_open_starts_the_controller_in_the_mode_asked() [io, hw]
+    let bus = fake(true)
+    let c = canboard.open_on(bus, 0, 500000, true)
+    test.assert(canboard.board_started(c))
+    test.assert_eq(at(bus.st, 1), embedded_hal.CAN_MODE_LOOPBACK)
+    test.assert_eq(bus.bitrate(), 500000)
+    let n = canboard.open_on(bus, 2, 250000, false)
+    test.assert(canboard.board_started(n))
+    test.assert_eq(n.bus.id, 2)
+    test.assert_eq(at(bus.st, 1), embedded_hal.CAN_MODE_NORMAL)
+
+@test
+fn test_an_open_the_controller_refuses_answers_a_stopped_board() [io, hw]
+    let c = canboard.open_on(fake(false), 0, 500000, false)
+    test.assert(not canboard.board_started(c))
+
+@test
+fn test_a_transmit_takes_mailbox_0_or_names_the_refusal() [io, hw]
+    let bus = fake(true)
+    let a = canboard.bus_transmit(bus, canframe.frame(0x123, 2, 0x2211))
+    test.assert_eq(canhal.tx_status(a), canhal.CAN_TX_ACCEPTED)
+    test.assert_eq(canhal.accepted_mailbox(a), 0)
+    test.assert_eq(at(bus.st, 9), 1)
+    test.assert_eq(at(bus.st, 10), 0x123)
+    test.assert_eq(canhal.tx_status(canboard.bus_transmit(bus, canframe.frame(0x800, 1, 7))),
+        canhal.CAN_TX_REFUSED)
+    bus.st.insert(3, 1)
+    test.assert_eq(canhal.tx_status(canboard.bus_transmit(bus, canframe.frame(0x124, 1, 7))), canhal.CAN_TX_FULL)
+    bus.st.insert(8, embedded_hal.CAN_BUS_OFF)
+    test.assert_eq(canhal.tx_status(canboard.bus_transmit(bus, canframe.frame(0x125, 1, 7))),
+        canhal.CAN_TX_BUS_OFF)
+    test.assert_eq(at(bus.st, 9), 1)
+
+@test
+fn test_mailbox_0_reports_its_frame_sent() [io, hw]
+    let bus = fake(true)
+    test.assert(not canboard.bus_tx_done(bus, 0))
+    bus.st.insert(4, 1)
+    test.assert(canboard.bus_tx_done(bus, 0))
+    test.assert(not canboard.bus_tx_done(bus, 1))
+
+@test
+fn test_a_receive_answers_the_waiting_frame_then_none() [io, hw]
+    let bus = fake(true)
+    test.assert(canframe.is_none(canboard.bus_receive(bus)))
+    bus.st.insert(5, 1)
+    let f = canboard.bus_receive(bus)
+    test.assert_eq(canframe.frame_id(f), 0x321)
+    test.assert_eq(canframe.frame_len(f), 2)
+    test.assert_eq(canframe.frame_byte(f, 1), 0xBE)
+    test.assert(canframe.is_none(canboard.bus_receive(bus)))
+
+@test
+fn test_the_counters_and_bus_off_read_through_the_double() [io, hw]
+    let bus = fake(true)
+    bus.st.insert(6, 130)
+    bus.st.insert(7, 5)
+    bus.st.insert(8, embedded_hal.CAN_ERROR_PASSIVE)
+    let s = canboard.bus_state(bus)
+    test.assert_eq(canbus.tx_errors(s), 130)
+    test.assert_eq(canbus.rx_errors(s), 5)
+    test.assert(canboard.bus_recover(bus) == None)
+    bus.st.insert(6, 0)
+    bus.st.insert(8, embedded_hal.CAN_BUS_OFF)
+    let off = canboard.bus_state(bus)
+    test.assert_eq(canbus.tx_errors(off), canbus.CAN_BUS_OFF_LIMIT)
+    test.assert_eq(canbus.rx_errors(off), 5)
+    test.assert(canboard.bus_recover(bus) != None)

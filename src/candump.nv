@@ -1,7 +1,5 @@
 // candump.nv — the log line every CAN tool prints, read and written.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE FORMAT IS A DE FACTO STANDARD AND THAT IS WHY IT IS HERE.
 // `candump` ships with can-utils on every Linux machine that speaks
 // CAN, its output is what every question on every forum is pasted in,
@@ -24,6 +22,7 @@
 // with none is rendered without one.
 
 use canframe
+use canerr
 
 // ── The line ─────────────────────────────────────────────────────────
 
@@ -71,8 +70,14 @@ pub struct CanLogLine
 // fn main() [io]
 //     println(candump.render_frame("can0", canframe.frame(0x123, 3, 0x332211)))
 // ```
-pub fn render_frame(interface: Str, f: CanFrame) -> Str []
-    todo("can-nv.candump.render_frame")
+pub @tier(rt)
+fn render_frame(interface: Str, f: CanFrame) -> Str []
+    var out = interface + "  " + render_id(canframe.frame_id(f), canframe.is_extended(f)) + "   [" + str.from_int(canframe.frame_len(f)) + "]"
+    if canframe.is_remote(f)
+        return out + "  remote request"
+    if canframe.frame_len(f) > 0
+        out = out + "  " + render_payload(f)
+    out
 
 // The same with candump's absolute timestamp in front:
 // `(1234567890.123456) can0  123   [3]  11 22 33`.
@@ -81,8 +86,9 @@ pub fn render_frame(interface: Str, f: CanFrame) -> Str []
 // package has no clock — which also makes a rendered log
 // reproducible, and a reproducible log is a log a test can compare
 // byte for byte.
-pub fn render_line(interface: Str, seconds: Int, micros: Int, f: CanFrame) -> Str []
-    todo("can-nv.candump.render_line")
+pub @tier(rt)
+fn render_line(interface: Str, seconds: Int, micros: Int, f: CanFrame) -> Str []
+    "(" + str.from_int(seconds) + "." + digits(micros, 6) + ") " + render_frame(interface, f)
 
 // Parse one candump line, with or without a timestamp.
 //
@@ -94,28 +100,104 @@ pub fn render_line(interface: Str, seconds: Int, micros: Int, f: CanFrame) -> St
 //         Ok(l)  => println("${candump.line_interface(l)}")
 //         Err(e) => println(e.message())
 // ```
-pub fn parse_line(line: Str) -> Result<CanLogLine, CanError> []
-    todo("can-nv.candump.parse_line")
+pub @tier(rt)
+fn parse_line(line: Str) -> Result<CanLogLine, CanError> []
+    let words = str.words(line)
+    var w = 0
+    var seconds = 0 - 1
+    var micros = 0
+    if words.len() > 0 and str.starts_with(words[0], "(")
+        let stamp = words[0]
+        if not str.ends_with(stamp, ")")
+            return Err(CanBadLogLine(0))
+        let inner = str.slice(stamp, 1, str.len(stamp) - 1)
+        let parts = str.split(inner, ".")
+        if parts.len() != 2
+            return Err(CanBadLogLine(1))
+        match str.to_int(parts[0])
+            Some(v) =>
+                seconds = v
+            None    =>
+                return Err(CanBadLogLine(1))
+        match str.to_int(parts[1])
+            Some(v) =>
+                micros = v
+            None    =>
+                return Err(CanBadLogLine(1))
+        w = 1
+    if words.len() < w + 3
+        return Err(CanBadLogLine(str.len(line)))
+    let iface = words[w]
+    let id_text = words[w + 1]
+    let id = hex_value(id_text)
+    if id < 0 or str.len(id_text) != 3 and str.len(id_text) != 8
+        return Err(CanBadLogLine(offset_of(line, id_text)))
+    let ext = str.len(id_text) == 8
+    let len_text = words[w + 2]
+    if not str.starts_with(len_text, "[") or not str.ends_with(len_text, "]")
+        return Err(CanBadLogLine(offset_of(line, len_text)))
+    var len = 0
+    match str.to_int(str.slice(len_text, 1, str.len(len_text) - 1))
+        Some(v) =>
+            len = v
+        None    =>
+            return Err(CanBadLogLine(offset_of(line, len_text)))
+    if len < 0 or len > canframe.CAN_MAX_DLEN
+        return Err(CanBadLogLine(offset_of(line, len_text)))
+    var flags = 0
+    if ext
+        flags = canframe.CAN_FLAG_EXTENDED
+    var data = 0
+    let rest = words.len() - (w + 3)
+    if rest == 2 and words[w + 3] == "remote" and words[w + 4] == "request"
+        flags = flags | canframe.CAN_FLAG_RTR
+    else
+        if rest != len
+            return Err(CanBadLogLine(str.len(line)))
+        for i in 0..len
+            let b = words[w + 3 + i]
+            let v = hex_value(b)
+            if v < 0 or str.len(b) != 2
+                return Err(CanBadLogLine(offset_of(line, b)))
+            data = canframe.with_byte(data, i, v)
+    Ok(CanLogLine { interface: iface,
+        seconds: seconds,
+        micros: micros,
+        id: id,
+        flags: flags,
+        len: len,
+        data: data })
 
 // The interface a parsed line named.
-pub fn line_interface(l: CanLogLine) -> Str []
-    todo("can-nv.candump.line_interface")
+pub @tier(rt)
+fn line_interface(l: CanLogLine) -> Str []
+    l.interface
 
 // The seconds a parsed line carried, or -1.
-pub fn line_seconds(l: CanLogLine) -> Int []
-    todo("can-nv.candump.line_seconds")
+pub @tier(rt)
+fn line_seconds(l: CanLogLine) -> Int []
+    l.seconds
 
 // The microseconds a parsed line carried.
-pub fn line_micros(l: CanLogLine) -> Int []
-    todo("can-nv.candump.line_micros")
+pub @tier(rt)
+fn line_micros(l: CanLogLine) -> Int []
+    l.micros
 
 // The frame a parsed line carried.
-pub fn line_frame(l: CanLogLine) -> CanFrame []
-    todo("can-nv.candump.line_frame")
+pub @tier(rt)
+fn line_frame(l: CanLogLine) -> CanFrame []
+    if (l.flags & canframe.CAN_FLAG_EXTENDED) != 0
+        if (l.flags & canframe.CAN_FLAG_RTR) != 0
+            return canframe.remote_frame_ext(l.id, l.len)
+        return canframe.frame_ext(l.id, l.len, l.data)
+    if (l.flags & canframe.CAN_FLAG_RTR) != 0
+        return canframe.remote_frame(l.id, l.len)
+    canframe.frame(l.id, l.len, l.data)
 
 // Whether a parsed line carried a timestamp at all.
-pub fn line_has_time(l: CanLogLine) -> Bool []
-    todo("can-nv.candump.line_has_time")
+pub @tier(rt)
+fn line_has_time(l: CanLogLine) -> Bool []
+    l.seconds >= 0
 
 // ── The compact form ─────────────────────────────────────────────────
 
@@ -136,8 +218,17 @@ pub fn line_has_time(l: CanLogLine) -> Bool []
 // fn main() [io]
 //     println(candump.render_compact(canframe.frame(0x123, 3, 0x332211)))
 // ```
-pub fn render_compact(f: CanFrame) -> Str []
-    todo("can-nv.candump.render_compact")
+pub @tier(rt)
+fn render_compact(f: CanFrame) -> Str []
+    let head = render_id(canframe.frame_id(f), canframe.is_extended(f)) + "#"
+    if canframe.is_remote(f)
+        if canframe.frame_len(f) > 0
+            return head + "R" + str.from_int(canframe.frame_len(f))
+        return head + "R"
+    var out = head
+    for i in 0..canframe.frame_len(f)
+        out = out + hex2(canframe.frame_byte(f, i))
+    out
 
 // Parse the compact form.
 //
@@ -145,8 +236,48 @@ pub fn render_compact(f: CanFrame) -> Str []
 // `@value` struct cannot be a `Result` payload (E2015).
 // `canframe.is_fault` is the question and `canframe.fault_of` is the
 // reason — the same shape every fallible answer in this package has.
-pub fn parse_compact(s: Str) -> CanFrame []
-    todo("can-nv.candump.parse_compact")
+pub @tier(rt)
+fn parse_compact(s: Str) -> CanFrame []
+    let parts = str.split(s, "#")
+    if parts.len() != 2
+        return canframe.fault(canframe.CAN_FAULT_MALFORMED)
+    let id_text = parts[0]
+    let id = hex_value(id_text)
+    if id < 0
+        return canframe.fault(canframe.CAN_FAULT_MALFORMED)
+    let ext = str.len(id_text) == 8
+    if not ext and str.len(id_text) != 3
+        return canframe.fault(canframe.CAN_FAULT_MALFORMED)
+    if ext and id > canframe.CAN_EFF_MAX_ID or not ext and id > canframe.CAN_SFF_MAX_ID
+        return canframe.fault(canframe.CAN_FAULT_ID_TOO_WIDE)
+    let body = parts[1]
+    if str.starts_with(body, "R")
+        var len = 0
+        if str.len(body) > 1
+            match str.to_int(str.slice(body, 1, str.len(body)))
+                Some(v) =>
+                    len = v
+                None    =>
+                    return canframe.fault(canframe.CAN_FAULT_MALFORMED)
+        if len < 0 or len > canframe.CAN_MAX_DLEN
+            return canframe.fault(canframe.CAN_FAULT_BAD_LENGTH)
+        if ext
+            return canframe.remote_frame_ext(id, len)
+        return canframe.remote_frame(id, len)
+    let n = str.len(body)
+    if n % 2 != 0
+        return canframe.fault(canframe.CAN_FAULT_MALFORMED)
+    if n / 2 > canframe.CAN_MAX_DLEN
+        return canframe.fault(canframe.CAN_FAULT_BAD_LENGTH)
+    var data = 0
+    for i in 0..n / 2
+        let v = hex_value(str.slice(body, 2 * i, 2 * i + 2))
+        if v < 0
+            return canframe.fault(canframe.CAN_FAULT_MALFORMED)
+        data = canframe.with_byte(data, i, v)
+    if ext
+        return canframe.frame_ext(id, n / 2, data)
+    canframe.frame(id, n / 2, data)
 
 // Render a CAN FD frame's header in the compact form, with the payload
 // bytes the caller supplies through `byte_at`.
@@ -155,8 +286,17 @@ pub fn parse_compact(s: Str) -> CanFrame []
 // a value at `@tier(embedded)` is refused — and because the caller's
 // payload is in the caller's buffer, which is where an FD payload
 // lives.
-pub fn render_fd_compact(f: CanFdFrame, byte_at: fn(Int) -> Int) -> Str []
-    todo("can-nv.candump.render_fd_compact")
+pub @tier(rt)
+fn render_fd_compact(f: CanFdFrame, byte_at: fn(Int) -> Int [mutate]) -> Str [mutate]
+    var flags = 0
+    if canframe.fd_has_brs(f)
+        flags = flags | 1
+    if canframe.fd_has_esi(f)
+        flags = flags | 2
+    var out = render_id(canframe.fd_id(f), canframe.fd_is_extended(f)) + "##" + hex_digit(flags)
+    for i in 0..canframe.fd_len(f)
+        out = out + hex2(byte_at(i))
+    out
 
 // ── The bytes on their own ───────────────────────────────────────────
 
@@ -166,8 +306,14 @@ pub fn render_fd_compact(f: CanFdFrame, byte_at: fn(Int) -> Int) -> Str []
 // The half of a line a firmware with a debug UART wants without the
 // rest, and the reason this module is `core` rather than a host
 // utility.
-pub fn render_payload(f: CanFrame) -> Str []
-    todo("can-nv.candump.render_payload")
+pub @tier(rt)
+fn render_payload(f: CanFrame) -> Str []
+    var out = ""
+    for i in 0..canframe.frame_len(f)
+        if i > 0
+            out = out + " "
+        out = out + hex2(canframe.frame_byte(f, i))
+    out
 
 // An identifier rendered as candump renders it: three upper-case hex
 // digits for a standard identifier and eight for an extended one.
@@ -184,5 +330,60 @@ pub fn render_payload(f: CanFrame) -> Str []
 //     println(candump.render_id(0x123, false))   // 123
 //     println(candump.render_id(0x123, true))    // 00000123
 // ```
-pub fn render_id(id: Int, extended: Bool) -> Str []
-    todo("can-nv.candump.render_id")
+pub @tier(rt)
+fn render_id(id: Int, extended: Bool) -> Str []
+    var width = 3
+    if extended
+        width = 8
+    var out = ""
+    for k in 0..width
+        out = hex_digit((id >>> (4 * k)) & 15) + out
+    out
+
+// ── Digits ───────────────────────────────────────────────────────────
+
+// One upper-case hexadecimal digit.
+@tier(rt)
+fn hex_digit(d: Int) -> Str
+    str.slice("0123456789ABCDEF", d & 15, (d & 15) + 1)
+
+// A byte as two upper-case hexadecimal digits.
+@tier(rt)
+fn hex2(b: Int) -> Str
+    hex_digit(b >>> 4) + hex_digit(b)
+
+// `n` in decimal, zero-padded to `width` digits.
+@tier(rt)
+fn digits(n: Int, width: Int) -> Str
+    var out = str.from_int(n)
+    for _i in 0..width
+        if str.len(out) < width
+            out = "0" + out
+    out
+
+// The value of a run of hexadecimal digits, either case, or -1 when the
+// text is empty or holds anything else.
+@tier(rt)
+fn hex_value(t: Str) -> Int
+    let n = str.len(t)
+    if n == 0 or n > 15
+        return 0 - 1
+    var v = 0
+    for i in 0..n
+        let c = str.byte_at_or(t, i, 0)
+        var d = 0 - 1
+        if c >= 48 and c <= 57
+            d = c - 48
+        elif c >= 65 and c <= 70
+            d = c - 55
+        elif c >= 97 and c <= 102
+            d = c - 87
+        if d < 0
+            return 0 - 1
+        v = (v << 4) | d
+    v
+
+// Where `word` first appears in `line`, for a refusal's offset.
+@tier(rt)
+fn offset_of(line: Str, word: Str) -> Int
+    str.index(line, word) ?? 0

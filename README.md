@@ -4,14 +4,10 @@ The Controller Area Network (CAN) is a two-wire serial bus on which every
 node may start a message at any time, and a message carries an identifier
 rather than an address. It is specified in ISO 11898-1, and it is what a car,
 a machine tool and an industrial drive use to talk to their own parts. This
-package brings the protocol to novo-lang: the frames, the acceptance filters,
-the error-confinement rules, the segmented transport of ISO 15765-2, the
-`candump` text format, and Linux's SocketCAN interface.
-
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared with
-its full signature, but every body is a `todo()` that panics when called. The
-package is published so its design can be reviewed and depended on before it
-is implemented. Version 0.1.0 will be the first working release.
+package brings the protocol to novo-lang: the frames, the bit timing, the
+acceptance filters, the error-confinement rules, drivers for the two STM32
+CAN controllers, the segmented transport of ISO 15765-2, the `candump` text
+format, and Linux's SocketCAN interface.
 
 ## What CAN is
 
@@ -22,59 +18,54 @@ alone, whether the frame is one it cares about.
 
 The identifier comes in two widths. The **standard** identifier is 11 bits.
 The **extended** identifier is 29 bits, and a frame using it sets a bit that
-says so.
+says so. A **remote frame** asks another node to send the frame with its
+identifier, and carries no data.
 
-**Arbitration** is how two nodes that start at the same moment settle it. The
-bus is wired so that a zero bit sent by any node overrides a one bit sent by
-another. Both nodes transmit their identifiers and watch the wire. The first
-node to send a one and read back a zero has lost, stops, and retries later.
-The numerically smaller identifier therefore always wins, and it wins without
-a collision and without losing a bit time. A smaller identifier is a
+**Arbitration** is how two nodes that start at the same moment settle it. A
+zero bit sent by any node overrides a one bit sent by another, so the
+numerically smaller identifier wins, without a collision and without losing
+a bit time (ISO 11898-1 section 10.4.2.2). A smaller identifier is a
 higher-priority message.
 
-An **acceptance filter** is a pair of numbers a controller is programmed
-with: a value and a **mask**. The mask says which bits of an incoming
-identifier are compared. A filter of value 0x100 and mask 0x700 accepts
-every identifier from 0x100 to 0x1FF. Hardware filters exist because a busy
-bus carries thousands of frames a second and a node wants perhaps five of
-them.
+**Bit timing** is how a controller divides one bit into **time quanta**, each
+a fixed number of its clock cycles. A bit is one synchronisation quantum,
+then a first segment, then a second; the bus is sampled between the two
+segments, at the **sample point**. Every node on a bus must use the same bit
+rate and nearly the same sample point.
+
+An **acceptance filter** is what a controller is programmed with to decide
+which identifiers to receive. A **mask filter** is a value and a **mask**:
+the mask says which bits of an incoming identifier are compared, so a value
+of 0x100 and a mask of 0x700 accepts 0x100 to 0x1FF. A **list filter** names
+identifiers exactly, two to a filter slot.
 
 **Error confinement** is how a broken node takes itself off the bus. Each
-node keeps two counters. A transmit error adds eight to the transmit counter
-and a receive error adds one to the receive counter, and a success subtracts
-one from whichever applies. Crossing 128 makes a node **error-passive**,
-which means it may no longer signal an error to the others. A transmit
-counter reaching 256 makes it **bus-off**, which means it stops transmitting
-altogether until it is reset and has seen 128 occurrences of eleven
-consecutive idle bits.
+node keeps a transmit and a receive error counter. A transmit error adds
+eight and a receive error one, and a success subtracts one. At 128 a node is
+**error-passive**; a transmit counter of 256 makes it **bus-off**, and it
+sends nothing until it is reset and has seen 128 sequences of eleven idle
+bits (ISO 11898-1 section 12.1.4).
 
 **CAN FD** is the later flexible-data-rate form of the same bus. An FD frame
-carries up to 64 bytes and may switch to a faster bit rate for the data
-part.
+carries up to 64 bytes and may switch to a faster bit rate for the data part,
+the **bit rate switch** (BRS).
 
 **ISO-TP**, specified in ISO 15765-2, carries a message longer than one
-frame. It has four frame types. A **single frame** holds the whole message. A
-longer message starts with a **first frame**, then waits for a **flow
-control** frame from the receiver saying how many frames it will take and how
-fast, then sends **consecutive frames** numbered 0 to 15 and wrapping. The
-flow control frame is what lets a microcontroller stop a diagnostic tool from
-sending four kilobytes at bus speed.
+frame: a **first frame**, a **flow control** frame from the receiver saying
+how many frames it will take and how fast, then **consecutive frames**
+numbered 0 to 15 and wrapping.
 
 | Quantity | Value |
 | --- | --- |
 | Data bytes in a classic frame | 0 to 8 |
-| Data bytes in an FD frame | 0 to 64 |
+| Data bytes in an FD frame | 0 to 8, 12, 16, 20, 24, 32, 48, 64 |
 | Standard identifier | 11 bits, 0 to 0x7FF |
 | Extended identifier | 29 bits, 0 to 0x1FFFFFFF |
 | Transmit error weight, receive error weight | 8, 1 |
-| Error-passive limit, bus-off limit | 128, 256 |
-| Idle sequences before a bus-off node may rejoin | 128 |
+| Error-warning, error-passive, bus-off limits | 96, 128, 256 |
 | Frames to bus-off for a node alone on the bus | 32 |
-| ISO-TP single frame payload | 7 bytes |
-| ISO-TP first frame payload | 6 bytes |
-| ISO-TP consecutive frame payload | 7 bytes |
+| Idle sequences before a bus-off node may rejoin | 128 |
 | Longest ISO-TP message | 4095 bytes |
-| Standard bit rates this package knows | 9 |
 
 ## Install
 
@@ -84,239 +75,269 @@ novo pkg add can-nv
 
 ## Example
 
-This example compiles; every call in it panics until 0.1.0.
+This program runs FDCAN1 of an STM32H723 in its internal loopback mode, in
+which a frame sent is received by the same controller, so no transceiver
+and no second node are needed. It sends one classic frame and reads it back.
 
-```novo
+```novo norun:needs-pkg
 use canframe
-use canfilter
+use canbus
+use canhal
+use canfdcan
 
-fn main() [io]
-    // Accept identifiers 0x100 to 0x1FF and nothing else. The mask says
-    // which bits of an incoming identifier are compared against 0x100.
-    let engine = canfilter.filter(0x100, 0x700)
-
-    // A frame is three integers: the identifier, the flags and length,
-    // and the whole eight-byte payload packed into the third.
-    let f = canframe.frame(0x123, 3, canframe.pack4(0x11, 0x22, 0x33, 0))
-
-    if canfilter.accepts(engine, f)
-        // Sixteen bits starting at bit 0 of the payload, most significant byte
-        // first. Nothing allocates, so this line runs in an interrupt handler.
-        let rpm = canframe.signal_be(canframe.frame_data(f), 0, 16)
-        println("${rpm}")
+fn main() [hw, mutate]
+    bsp.board.init()
+    // FDCAN's kernel clock is the board's 8 MHz HSE.
+    canfdcan.h7_clock_on(canfdcan.FDCAN_CLOCK_HSE)
+    // 500 kbit/s with the sample point at 87.5 per cent, and a 2 Mbit/s
+    // data phase at 75 per cent.
+    let nominal = canbus.solve_timing(8000000, 500000, 875, canbus.fdcan_nominal_limits())
+    let data = canbus.solve_timing(8000000, 2000000, 750, canbus.fdcan_data_limits())
+    let can = canfdcan.fdcan1()
+    if not canfdcan.start(can, nominal, data, true, canfdcan.FDCAN_MODE_INTERNAL_LOOPBACK)
+        hal.uart.write("FDCAN1 did not start\n")
+        return
+    // A frame on identifier 0x123 with three bytes.
+    let sent = canhal.transmit_checked(can, canframe.frame(0x123, 3, canframe.pack4(0x11, 0x22, 0x33, 0)))
+    for _i in 0..100000
+        // The loopback delivers the frame to the receive FIFO.
+        let f = can.can_receive()
+        if canframe.is_frame(f)
+            if canframe.frame_byte(f, 2) == 0x33
+                hal.uart.write("received 0x123\n")
+            return
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test` fails
-on purpose: every test reaches a `not implemented: can-nv.<module>.<fn>`
-panic. The tests are the specification the implementation will have to
-satisfy.
+`examples/embedded/can_demo` in the novo-lang repository holds three longer
+programs: the same session over the loopback controller on every board and
+under QEMU, over FDCAN on the NUCLEO-H723ZG, and over bxCAN on the
+STM32F407G-DISC1.
 
 ## What the package contains
 
 | Module | Contents |
 | --- | --- |
-| `canframe` | Classic and FD frames as values, both identifier widths, remote and error frames, the data length codes, the arbitration key, and the arithmetic that reads a numeric signal out of a payload. |
-| `canfilter` | Acceptance filters and masks, the test of a frame against one, and the merge that fits more filters than a controller has slots. |
-| `canisotp` | ISO 15765-2: the four frame types, the flow-control handshake, a session value, and three timers as deadlines the caller arms. |
-| `canbus` | Error confinement: the two counters, the four states, recovery, the error kinds, the standard bit rates and the sample point. |
-| `cantxq` | A bounded transmit queue that hands over the frame that would win arbitration, not the frame that arrived first. |
+| `canframe` | Classic frames with their payload, FD frame headers, both identifier widths, remote and error frames, the data length codes, the arbitration key, and reading a numeric signal out of a payload. |
+| `canfilter` | Mask and list filters, the test of a frame against one, inversion, and the merge that fits more filters than a controller has slots. |
+| `canbus` | Error confinement: the counters, the four states and recovery.  The standard bit rates, the sample point, and the bit-timing solver with each controller's limits. |
+| `canhal` | `CanPeripheral[e]`, the trait every controller satisfies, and `CanFdPeripheral[e]`, its CAN FD half; what a transmit answers; which parts have a controller. |
+| `canbxcan` | The driver for ST's bxCAN (STM32F1, F2, F3, F4, F7, L4): mailboxes, the filter banks, the modes, bus-off recovery. |
+| `canfdcan` | The driver for ST's FDCAN, Bosch's M_CAN (STM32H7): the message RAM, classic and FD frames, the filter elements, the modes, bus-off recovery. |
+| `canboard` | `CanBoard`, the board's CAN controller behind `CanPeripheral[hw]`, over embedded-hal-nv's `CanBus` and `BoardCan`: one mailbox, the counters, the trait's refusals for what `CanBus` cannot do. |
+| `canloop` | A controller in memory that receives what it sends, with mailboxes, a receive FIFO, filters and the error counters, for tests and emulators. |
+| `cantxq` | A transmit queue over the caller's frames that hands over the frame that would win arbitration. |
+| `canring` | A receive ring over the caller's frames. |
+| `canisotp` | ISO 15765-2: the four frame types, the flow-control handshake, a session value, and the timers as deadlines the caller arms. |
 | `candump` | The can-utils log line and the `cansend` compact form, rendered and parsed. |
-| `canhal` | `CanPeripheral[e]`, the trait a controller driver satisfies, what a transmit attempt answers, and which parts have a controller on the die. |
 | `canerr` | One error type, with the question a retry loop asks of it. |
-| `cansocket` | SocketCAN on Linux: the kernel's frame layout, the socket, and the interface facts a bind needs. |
+| `cansocket` | SocketCAN on Linux: the kernel's frame layout, the socket, the kernel's filters, and what sysfs says about an interface. |
 
 ## How to choose an entry point
 
-**A device links everything except `cansocket`.** Those eight modules declare
-no effects. They are arithmetic over values the caller holds.
+**A program on a board** whose board serves `hal.can` opens its
+controller with `canboard.board_open(0, bitrate, loopback)` and talks to it
+through `CanPeripheral`, with no driver of this package's own; the
+FRDM-MCXN947's CAN0 is one.  On an STM32 board without `hal.can`, it
+starts the controller with `canbxcan.start` or `canfdcan.start`.  The same
+code runs over each of them and over `canloop`.
 
-**A Linux program links `cansocket` as well.** It is the one module that
-performs anything: `[net]` for the socket and `[fs]` for an interface's
-kernel index, which a bind needs and a socket cannot answer.
+**A test or an emulated board** uses `canloop`, which needs no hardware and
+behaves like a controller in loopback mode.
 
-**`canhal.CanPeripheral[e]` is the seam between the two.** A board's driver
-satisfies it on a device and `cansocket` satisfies it on Linux, and the rest
-of the package is written against neither.
+**A program on Linux** uses `cansocket`. A virtual interface, `vcan0`, needs no
+hardware.
 
-**Use `canframe` and `canfilter` alone for the common receive path.** Build a
+**`canframe` and `canfilter` alone** are the common receive path: build a
 frame, test it against a filter, read a signal out of it. Reach for
-`canisotp` only when a message is longer than eight bytes, and for `cantxq`
-only when more frames are queued than the controller has mailboxes.
+`cantxq` when more frames wait than the controller has mailboxes, for
+`canring` when frames arrive faster than the program services the
+controller, and for `canisotp` when a message is longer than one frame.
 
 ## The rules a user needs
 
 1. **A classic frame carries its own payload; an FD frame does not.** Eight
-   bytes is sixty-four bits, so `CanFrame` is three integers and costs
-   nothing to copy. An FD frame's 64 bytes would be eight integers copied on
-   every assignment, so `CanFdFrame` is the header and the bytes stay in the
-   caller's buffer, which for a driver with a DMA region is where they
-   already are.
-2. **A smaller identifier wins the bus.** `canframe.arbitration_key` packs the
-   identifier, the extension bit and the remote bit into one integer so that
-   `<` is the comparison the bus performs, and `canframe.wins_arbitration`
-   asks it directly.
-3. **A transmit queue that sends in arrival order throws away CAN's
-   real-time guarantee.** `cantxq.dequeue_index` picks by arbitration
-   priority. `cantxq.dequeue_fifo_index` is the arrival order, under its own
-   name, for a caller who wants it.
-4. **A receive answers a frame that carries its own status, not an optional
-   or a `Result`.** A `@value` struct may not be an optional or a `Result`
-   payload (E2015). `canframe.none()` means nothing arrived and
-   `canframe.fault(code)` means something was refused. Ask
-   `canframe.is_frame` before reading an identifier, because `is_none` alone
-   would treat a refusal as a frame on identifier 3.
-5. **A selection callback takes an integer, not a frame.** A `@value` struct
-   may not appear in a function value's signature, so `cantxq`'s callbacks
-   are `fn(Int) -> Int` over an arbitration key. A driver already holds its
-   pending identifiers as integers, because that is what it programmed into
-   the mailbox registers.
-6. **A bus error is not a program error.** A node alone on a bus produces an
-   acknowledgement error on every frame it sends, for ever, and that is the
-   protocol working. Those belong to `canbus`'s counters and states, not to
-   `canerr`.
-7. **A node alone on a bus goes bus-off after thirty-two frames.** Eight up
-   per error and one down per success reaches 256 in thirty-two attempts.
-   `canbus.would_go_bus_off_alone` says so, and it is the first thing to
-   check when a board on a bench with a terminator and no second node stops
+   bytes fit one `Int`, so `CanFrame` is four integers and costs nothing to
+   copy. `CanFdFrame` is the header; the up to 64 bytes are a `Vec[u8; 64]`
+   the caller holds, which `can_transmit_fd` reads and `can_receive_fd` fills.
+2. **A smaller identifier wins the bus.** `canframe.arbitration_key` is one
+   integer whose order is the bus's order, extended frames and remote frames
+   included. The first eleven bits of a 29-bit identifier are its top
+   eleven, so `0x123 << 18` is the extended identifier that shares 0x123's.
+3. **A transmit answers a mailbox, not completion.** `can_tx_done` says when
+   the frame has left. When every mailbox is full, a frame that outranks a
+   pending one displaces it, and `accepted_displaced` names the mailbox, so
+   the caller can queue that frame again.
+4. **A receive answers a frame that carries its own status.**
+   `canframe.none()` means nothing arrived and `canframe.fault(code)` means
+   something was refused. Ask `canframe.is_frame` before reading an
+   identifier.
+5. **A node alone on a bus goes bus-off after 32 frames.** With no other
+   node to acknowledge, every transmission is an error. `canbus.would_go_bus_off_alone`
+   says so, and it is the first thing to check when a board on a bench stops
    transmitting.
-8. **Two nodes with different sample points work until the cable gets
-   longer.** CiA 301 asks for 87.5 per cent at 500 kbit/s and above and 75
-   per cent below it. `canbus.sample_point_permille` answers the figure in
-   tenths of a per cent, and `canbus.check_timing` answers whether a given
-   clock can produce it.
-9. **An ISO-TP receiver decides the pace, and the sender must obey it.** The
-   flow control frame carries a block size and a minimum separation time, and
-   `canisotp.session` tracks both. ISO 15765-2 caps a message at 4095 bytes
-   in the form this package implements.
-10. **Consecutive frame numbers wrap at 16.** `canisotp.next_index` applies
-    the rule. A receiver that does not check the number cannot tell a lost
-    frame from a late one.
-11. **Extended addressing costs one payload byte per frame.**
-    `canisotp.addressing_overhead`, `single_max` and `consecutive_max`
-    answer the reduced figures, so a caller never subtracts by hand.
-12. **A filter with the inverted flag rejects what it matches.** SocketCAN
-    spells the same thing `CAN_INV_FILTER`. `canfilter.merge` combines two
-    filters into one that a controller slot can hold, and
-    `canfilter.false_accept_width` says how many identifiers the merged
-    filter lets through that neither original did.
+6. **Recovery cancels what is pending.** `can_recover` on either driver
+   aborts the frames waiting in the mailboxes before the controller rejoins,
+   so a stale command is not sent late. `cantxq.cleared` does the same for
+   the software queue.
+7. **Two nodes need the same bit rate and nearly the same sample point.**
+   CiA 301 asks for 87.5 per cent at 500 kbit/s and above and 75 per cent
+   below it; `canbus.sample_point_permille` answers it. `canbus.solve_timing`
+   refuses a clock that cannot produce the rate to within 0.1 per cent.
+8. **An FD length is not every number.** 9 to 11, 13 to 15 and the other gaps
+   above 8 do not exist; a payload is padded to the next length the format
+   has, and `canframe.fd_len_is_valid` and `fd_padded_len` say which.
+9. **A filter with bits outside its mask is refused.** Those bits are never
+   compared, so the filter accepts more than it says. `canfilter.check_filter`
+   answers the refusal.
+10. **A controller's hardware cannot hold every filter.** Neither driver
+    holds an inverted filter; FDCAN's remote-frame setting is one switch for
+    all filters. `canfilter.merge` widens two filters into one slot and
+    `false_accept_width` says how many identifiers the widening lets in.
+11. **An ISO-TP receiver decides the pace.** The flow control frame carries a
+    block size and a minimum separation time, and consecutive frame numbers
+    wrap at 16 (ISO 15765-2 section 9.6).
+
+## Bit timing
+
+`canbus.solve_timing(clock_hz, bitrate, sample_permille, limits)` tries
+every prescaler the controller allows, places the sample point as near the
+target as the segment limits allow, and keeps the timing whose bit rate is
+nearest, then whose sample point is nearest, then with the most quanta. The
+limits are values: `bxcan_limits`, `fdcan_nominal_limits` and
+`fdcan_data_limits`. `canbxcan.btr_of`, `canfdcan.nbtp_of` and `dbtp_of`
+give the register words.
+
+| Controller and clock | Rate | Prescaler | Quanta | Segments | Sample point | Register |
+| --- | ---: | ---: | ---: | --- | ---: | --- |
+| bxCAN, 42 MHz (STM32F4 APB1) | 500 kbit/s | 6 | 14 | 1 + 11 + 2 | 85.7 % | CAN_BTR 0x001A0005 |
+| bxCAN, 42 MHz | 1 Mbit/s | 3 | 14 | 1 + 11 + 2 | 85.7 % | CAN_BTR 0x001A0002 |
+| FDCAN, 8 MHz (NUCLEO-H723ZG HSE) | 500 kbit/s | 1 | 16 | 1 + 13 + 2 | 87.5 % | FDCAN_NBTP 0x02000C01 |
+| FDCAN, 8 MHz | 1 Mbit/s | 1 | 8 | 1 + 6 + 1 | 87.5 % | FDCAN_NBTP 0x00000500 |
+| FDCAN data phase, 8 MHz | 2 Mbit/s | 1 | 4 | 1 + 2 + 1 | 75 % | FDCAN_DBTP 0x00000100 |
+| FDCAN, 80 MHz | 500 kbit/s | 1 | 160 | 1 + 139 + 20 | 87.5 % | — |
+
+The bxCAN rows are the values CAN in Automation's bit-timing calculator and
+ST's application notes give; the synchronisation jump width is one quantum
+for classic timing and the whole second segment for FDCAN, as CiA 601-3
+recommends.
 
 ## Running on a microcontroller
 
-The package states that its modules run on a device with no heap allocator,
-and the compiler checks that claim on every build. Eight of the nine modules
-carry no effects and are inside the claim: `canframe`, `canfilter`,
-`canisotp`, `canbus`, `cantxq`, `candump`, `canhal` and `canerr`.
+Everything a device build reaches performs at most `[hw, mutate]`, and the
+frames, filters, timing and state machines perform nothing. After start-up
+nothing is allocated: a frame, a filter, a session and a driver handle are
+`@value` structs in the caller's frame, the queue and the ring are
+bookkeeping over the caller's `Vec[CanFrame; N]`, and the loopback
+controller's state is static storage. Building a refusal with a payload,
+`Some(CanIdTooWide(…))`, is a heap cell, so the functions that answer one
+are `@tier(rt)`; the receive and transmit paths answer status codes instead.
 
-`cansocket` is outside the claim. It names `std.net`, and one host-only
-function anywhere in a compilation unit is an undefined symbol at link time
-on a device, whether or not the firmware calls it. The manifest names it in
-`host_modules`, so a device build leaves it out.
+| Value | Bytes, inline |
+| --- | ---: |
+| `CanFrame` | 32 |
+| `CanFdFrame`, `CanFilter`, `CanBusState`, `CanTxAccepted` | 24 |
+| `CanTxQueue`, `CanRxRing` | 32 |
+| `CanIsoTpSession` | 56 |
+| `CanBitTiming` | 48 |
+| `BxCan`, `FdCan`, `CanLoop` | 24, 16, 8 |
+| `canloop`'s state in `.bss` | 1,000 |
+| `Vec[u8; 64]`, an FD payload | 72 |
 
-The registry measures the tiers per module, and its page for this package
-shows the split: the embedded, rt and wasm tiers list the eight modules above,
-and `cansocket` is absent from them. The system and app tiers cover all nine.
+The drivers take a handle that holds the controller's base address, so the
+handle is the same on every board of a family:
 
-`tests/embedded_probe.nv` is the claim as a program that either builds or
-does not. It covers `canframe`, `canfilter` and `canisotp`, which is the
-receive path an interrupt handler runs.
+| Board | Controller | Instances | Pins brought out | Transceiver |
+| --- | --- | --- | --- | --- |
+| STM32F407G-DISC1 | bxCAN | CAN1 at 0x40006400, CAN2 at 0x40006800 | CAN1 on PD0 (RX) and PD1 (TX), or PB8 and PB9 | none |
+| NUCLEO-H723ZG | FDCAN | FDCAN1 at 0x4000A000, FDCAN2 at 0x4000A400, message RAM at 0x4000AC00 | FDCAN1 on PD0 (RX) and PD1 (TX) | none |
 
-```bash
-novo build --target=nrf52-qemu tests/embedded_probe.nv
-```
+`canbxcan.f4_route_pd0_pd1` and `canfdcan.h7_route_pd0_pd1` put the
+controllers on those pins. A real bus needs a transceiver between the pins
+and the wires; the loopback modes need neither.
 
-The command produces a Cortex-M4 executable, `embedded_probe.elf`. The probe
-builds and is not run, because every function it calls is a `todo()` that
-would panic on the first line.
+`canhal.controller_of` answers `CAN_CONTROLLER_NONE` for the nRF52, nRF53,
+RP2040 and RP2350 boards. Those parts need an external controller over SPI,
+the MCP2515 or the MCP2518FD, which this package does not drive.
 
-**A CAN controller is on the die of some parts and not others.** The
-nRF52840, the nRF52832 and the RP2040 have none. Those parts need an
-external MCP2515, or an MCP2518FD for CAN FD, driven over SPI, which is a
-board's driver rather than anything this package supplies.
-`canhal.controller_of` answers `CAN_CONTROLLER_NONE` for `nrf52840-dk`,
-`nrf52832-dk` and `rp2040`, so a firmware build fails with a name in the
-message rather than on a bench. The parts with a controller on the die are
-STM32 (bxCAN on the F1, F4 and L4; FDCAN on the G0, G4, H7 and U5), NXP's
-FlexCAN in the i.MX RT, S32K and LPC families, the ESP32's TWAI, Atmel SAM C
-and E, and Infineon AURIX.
+`cansocket` builds only for a host, at `@tier(app)`, and `candump` renders
+text at `@tier(rt)`.
 
 ## What is not included
 
-- **A peripheral driver.** No function here writes a register or drives a
-  chip select. That belongs with the board.
-- **CAN database files.** The `.dbc` format names the signals a bus carries
-  and gives each one a scale and an offset. `canframe.signal_be` and
-  `signal_le` are the arithmetic underneath it. A DBC parser is a package
-  of its own.
-- **UDS and J1939.** Both sit on ISO-TP rather than in it. J1939 redefines
-  the 29-bit identifier as a structured field, which makes it a package of
-  its own.
-- **A buffer for an FD payload.** The header is a value and the bytes are the
-  caller's. See rule 1.
-- **A test against a real bus.** `cansocket`'s behaviour needs a virtual CAN
-  interface created with `ip link add dev vcan0 type vcan`, and the test
-  suite has no way to ask for one. The socket half is covered by assertions
-  about shape only, and its test file says so.
+- **Drivers for other controllers.** FlexCAN, TWAI, the MCP2515 and the
+  MCP2518FD have no driver here; `CanPeripheral` is the trait one would
+  satisfy.
+- **Interrupts.** The drivers poll; a program services the controller from
+  its loop. A receive interrupt handler can call `can_receive` itself.
+- **A real bus on the bench.** The drivers' normal mode is exercised only
+  without a transceiver, where every frame is an error; the loopback modes
+  exercise the rest.
+- **CAN database files.** The `.dbc` format names a bus's signals.
+  `canframe.signal_be` and `signal_le` are the arithmetic underneath it.
+- **UDS and J1939.** Both sit on ISO-TP rather than in it.
+- **The controller counters and bit rate on Linux.** The kernel reports a
+  controller's error counters and bit rate over netlink, which `cansocket`
+  does not read; `interface_tx_errors` and `interface_rx_errors` answer the
+  interface's error statistics from sysfs, and `interface_bitrate` answers
+  -1.
 
 ## Related packages
 
-- The language's fixed-capacity collections, `Vec[T; N]` and its family
-  (SPEC section 14.8), are the storage a transmit queue's frames live in on a
-  device. `cantxq` keeps the bookkeeping and answers indices into that
-  storage.
-- [bitfield-nv](https://novo-lang.org/packages/bitfield-nv) describes a
-  hardware register's bits. A driver for an external CAN controller
-  configures it through registers, and that is where the descriptions go.
 - [modbus-nv](https://novo-lang.org/packages/modbus-nv) is the other
   industrial fieldbus on the registry. Modbus is a request and a reply
   between a client and a server. CAN is a broadcast with no addresses in it.
-- `std.net` in the standard library is the sockets `cansocket` opens.
+- [shell-nv](https://novo-lang.org/packages/shell-nv) is a device console;
+  a program can register commands that send and dump frames.
+- `std.net` in the standard library holds the SocketCAN calls `cansocket`
+  is written over: `net.can_open`, `net.can_set_option` and
+  `net.can_recv_from`.
 
 ## Tests
 
 ```bash
-novo test                             # 134 tests
-novo test tests/canframe_tests.nv     # 19: the frame, the identifiers, the signals
-novo test tests/canfilter_tests.nv    # 13: acceptance, inversion, merging
-novo test tests/canisotp_tests.nv     # 21: the four frame types and the handshake
-novo test tests/canbus_tests.nv       # 15: the counters, the states, the timing
-novo test tests/cantxq_tests.nv       # 13: priority order against arrival order
-novo test tests/canreaders_tests.nv   # 14: the candump line, both directions
-novo test tests/canhost_tests.nv      # 28: the peripheral trait and the wire layout
-novo test tests/cansocket_tests.nv    # 11: the socket surface, by shape
+novo test tests/canframe_tests.nv     # 27: the frame, the identifiers, arbitration, the signals
+novo test tests/canfilter_tests.nv    # 22: acceptance, lists, inversion, merging
+novo test tests/canbus_tests.nv       # 18: the counters, the states, the timing check
+novo test tests/cantiming_tests.nv    # 13: the solver against published values, the register words
+novo test tests/cantxq_tests.nv       # 16: priority order against arrival order
+novo test tests/canisotp_tests.nv     # 32: the four frame types and the handshake
+novo test tests/canhost_tests.nv      # 28: candump, the wire layout, the peripheral trait
+novo test tests/candump_tests.nv      # 10: candump lines and their refusals
+novo test tests/canhal_tests.nv       #  5: the peripheral trait's helpers over the loopback controller
+novo test tests/canreaders_tests.nv   # 14: the readers, both directions
+novo test tests/cansocket_tests.nv    # 16: the socket surface on a machine with no CAN interface
+novo test tests/canloop_tests.nv      # 16: a controller in memory, the ring and the queue behind it
+novo test tests/candriver_tests.nv    #  5: the drivers' handles, words and message RAM layout
+novo test tests/canboard_tests.nv     # 11: the device half over a CanBus double, and over a host's absent controller
 ```
 
+The suites run every line of `src/` on a host but for the regions a
+`cov: skip` marker names with its reason: the bxCAN and FDCAN drivers'
+register access, which only a board maps, and the paths of `cansocket`
+that need a CAN interface.  `tests/socketcan.sh` runs those `cansocket`
+paths on two virtual interfaces, vcan0 and vcan1, in a user network
+namespace (`unshare -rnm`), which needs no privilege on a kernel that
+allows unprivileged user namespaces and has the vcan module.
+
+`tests/board_probe.nv` runs `CanBoard` on a board that serves `hal.can`:
+`novo build --target=frdm-mcxn947 tests/board_probe.nv` builds it, and
+it reports each check over RTT in loopback, normal mode and bus-off.
+The FRDM-MCXN947's suite in the novo-lang repository,
+`orbit/bsp/nxp/mcxn9/frdm-mcxn947/tests/can.sh`, runs the same checks
+against the registry's copy of this package and measures the line
+coverage of `src/canboard.nv` on the board.
+
 The references are ISO 11898-1 for the protocol, ISO 15765-2 for the
-segmented transport, [embedded-can](https://docs.rs/embedded-can) for the
-peripheral trait, and
-[SocketCAN](https://docs.kernel.org/networking/can.html) for the kernel's
-frame and filter layouts. The text formats are `candump`'s and `cansend`'s,
-from [can-utils](https://github.com/linux-can/can-utils).
+segmented transport, RM0090 (STM32F4, chapter 32) for bxCAN, RM0468
+(STM32H723, chapter 56) for FDCAN, [embedded-can](https://docs.rs/embedded-can)
+for the peripheral trait, and [SocketCAN](https://docs.kernel.org/networking/can.html)
+for the kernel's frame and filter layouts. `tests/embedded_probe.nv` is a
+firmware image that checks the frames, filters and ISO-TP at the embedded
+tier and prints one line. `tests/driver_probe.nv` brings both drivers up
+and is built for the STM32F407G-DISC1 and the NUCLEO-H723ZG; the drivers'
+clock and pin routines write a board's registers, and the programs under
+`examples/embedded/can_demo` run them on the boards.
 
-No test opens a socket or reads a clock. Every frame is a literal, every
-deadline is an argument, and a whole ISO-TP exchange is a list of values the
-test writes out.
-
-The tests compile today and fail at run, each on the
-`not implemented: can-nv.<module>.<fn>` panic that is its body. That is the
-expected state of an interface release. They turn green one at a time as
-bodies land.
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| Every `CAN_*` constant in `canframe`, `canfilter`, `canisotp`, `canbus`, `canhal`, `cansocket` | yes (they are constants) |
-| `canframe.CanFrame`, `.CanFdFrame`, `canfilter.CanFilter`, `canisotp.CanIsoTpSession`, `canbus.CanBusState`, `cantxq.CanTxQueue`, `canhal.CanTxAccepted`, `candump.CanLogLine`, `canerr.CanError`, `cansocket.CanSocket` | declared |
-| `canhal.CanPeripheral[e]` | declared |
-| `canframe`: the constructors, the accessors, the packing, the arbitration key and the signal arithmetic | no |
-| `canfilter`: the constructors, `accepts`, `merge`, `covers`, `false_accept_width` | no |
-| `canisotp`: the frame builders, the readers, the session and the timers | no |
-| `canbus`: the counters, the states, recovery, the bit rates and the timing check | no |
-| `cantxq`: the queue, both dequeue orders and the displacement rules | no |
-| `candump`: rendering and parsing both formats | no |
-| `canhal`: the transmit result, the three helpers and the controller table | no |
-| `canerr.describe`, `.is_transient` | no |
-| `cansocket`: the wire layout, the socket and the interface facts | no |
 
 ## Licence
 

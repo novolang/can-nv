@@ -1,0 +1,184 @@
+// vcan_probe.nv: cansocket's paths that need a SocketCAN interface,
+// run on virtual interfaces.
+//
+// It is not a test suite: `novo test tests` does not run it, and the
+// publish's coverage measurement does not either, since a machine has
+// a CAN interface only when one is configured.  tests/socketcan.sh
+// builds it and runs it in a user network namespace with sysfs mounted
+// for that namespace, where vcan0 is up with the classic MTU of 16 bytes
+// and vcan1 with the CAN FD MTU of 72 bytes, so an FD frame crosses
+// vcan1.  Each check prints one
+// PASS or FAIL line; the last line counts them, and the exit status is
+// 1 when a check failed.
+
+use std.process
+use canframe
+use canframe.{ CanFrame }
+use canerr
+use cansocket
+use cansocket.{ CanSocket }
+
+// Prints the check's line and answers 1 for a failure.
+fn check(name: Str, ok: Bool) -> Int [io]
+    if ok
+        println("PASS ${name}")
+        return 0
+    println("FAIL ${name}")
+    1
+
+// Payload byte `i` of an FD frame: 0xA0 + i.
+fn fd_payload(i: Int) -> Int
+    0xA0 + i
+
+// The next frame on `s`, skipping the nothing value for up to 50 reads.
+fn next_frame(s: CanSocket) -> CanFrame [net]
+    for _i in 0..50
+        let f = cansocket.receive(s)
+        if not canframe.is_none(f)
+            return f
+    canframe.none()
+
+fn same(a: CanFrame, b: CanFrame) -> Bool
+    canframe.frame_id(a) == canframe.frame_id(b) and canframe.frame_len(a) == canframe.frame_len(b) and canframe.frame_data(a) == canframe.frame_data(b) and canframe.is_extended(a) == canframe.is_extended(b) and canframe.is_remote(a) == canframe.is_remote(b)
+
+// The bytes of `v` as a list.
+fn list_of(v: Vec[u8; 72]) -> [u8]
+    var out: [u8] = []
+    for i in 0..v.len()
+        list.push(out, v[i])
+    out
+
+fn socket(r: Result<CanSocket, CanError>) -> ?CanSocket
+    match r
+        Ok(s)  => Some(s)
+        Err(_) => None
+
+fn main() [io, net, fs, mutate]
+    var fails = 0
+    var n = 0
+
+    // ── The interfaces ───────────────────────────────────────────────
+    match cansocket.interfaces()
+        Ok(names) =>
+            fails = fails + check("interfaces lists vcan0 and vcan1, in name order",
+                list.len(names) == 2 and names[0] == "vcan0" and names[1] == "vcan1")
+        Err(_)    =>
+            fails = fails + check("interfaces lists vcan0 and vcan1, in name order", false)
+    n = n + 1
+    fails = fails + check("interface_exists(vcan0)", cansocket.interface_exists("vcan0"))
+    n = n + 1
+    var index = 0 - 1
+    match cansocket.interface_index("vcan0")
+        Ok(i)  =>
+            index = i
+        Err(_) =>
+            index = 0 - 1
+    fails = fails + check("interface_index(vcan0) is the kernel's index, above 0", index > 0)
+    n = n + 1
+    fails = fails + check("interface_name turns the index back into vcan0",
+        cansocket.interface_name(index) == Ok("vcan0"))
+    n = n + 1
+    fails = fails + check("interface_bitrate(vcan0) is -1: a virtual interface has no bit rate",
+        cansocket.interface_bitrate("vcan0") == Ok(0 - 1))
+    n = n + 1
+    fails = fails + check("is_virtual(vcan0) asks sysfs, and vcan0 is virtual", cansocket.is_virtual("vcan0"))
+    n = n + 1
+    fails = fails + check("interface_tx_errors(vcan0) is 0", cansocket.interface_tx_errors("vcan0") == Ok(0))
+    n = n + 1
+    fails = fails + check("interface_rx_errors(vcan0) is 0", cansocket.interface_rx_errors("vcan0") == Ok(0))
+    n = n + 1
+
+    // ── Classic frames on vcan0 ──────────────────────────────────────
+    let a_ = socket(cansocket.open("vcan0"))
+    let b_ = socket(cansocket.open("vcan0"))
+    fails = fails + check("open(vcan0) binds two sockets", a_ != None and b_ != None)
+    n = n + 1
+    match a_
+        Some(a) =>
+            match b_
+                Some(b) =>
+                    fails = fails + check("the socket names vcan0 and carries no FD",
+                        cansocket.interface_of(a) == "vcan0" and not cansocket.carries_fd(a))
+                    n = n + 1
+                    fails = fails + check("set_receive_timeout(100 ms)", cansocket.set_receive_timeout(b, 100) == None)
+                    n = n + 1
+                    let std = canframe.frame(0x123, 3, 0x332211)
+                    fails = fails + check("send a standard frame", cansocket.send(a, std) == None)
+                    n = n + 1
+                    fails = fails + check("receive it back on the second socket", same(next_frame(b), std))
+                    n = n + 1
+                    let ext = canframe.frame_ext(0x18DAF110, 8, -1)
+                    fails = fails + check("send an extended frame of 8 bytes", cansocket.send(a, ext) == None)
+                    n = n + 1
+                    fails = fails + check("receive_from answers it", same(cansocket.receive_from(b), ext))
+                    n = n + 1
+                    fails = fails + check("last_interface_index is vcan0's index",
+                        cansocket.last_interface_index(b) == index)
+                    n = n + 1
+                    let rtr = canframe.remote_frame(0x2AA, 4)
+                    let _ = cansocket.send(a, rtr)
+                    var buf: Vec[u8; 72] = Vec.new()
+                    fails = fails + check("receive_into answers the 16 bytes of a remote frame",
+                        cansocket.receive_into(b, buf) == Ok(16) and same(cansocket.frame_from_wire(list_of(buf), 0), rtr))
+                    n = n + 1
+                    fails = fails + check("with nothing left, receive answers the nothing value",
+                        canframe.is_none(cansocket.receive(b)))
+                    n = n + 1
+                    let _ = cansocket.close(a)
+                    let _ = cansocket.close(b)
+                None    =>
+                    fails = fails + check("the socket opens", false)
+                    n = n + 1
+        None    =>
+            fails = fails + check("the socket opens", false)
+            n = n + 1
+
+    // ── FD frames ────────────────────────────────────────────────────
+    match socket(cansocket.open_fd("vcan0"))
+        Some(s) =>
+            let _ = cansocket.close(s)
+            fails = fails + check("an FD frame on a closed FD socket is refused",
+                cansocket.send_fd(s, canframe.fd_frame(0x123, 12, true), fd_payload) != None)
+        None    =>
+            fails = fails + check("an FD frame on a closed FD socket is refused", false)
+    n = n + 1
+    let c_ = socket(cansocket.open_fd("vcan1"))
+    let d_ = socket(cansocket.open_fd("vcan1"))
+    fails = fails + check("open_fd(vcan1) binds two FD sockets", c_ != None and d_ != None)
+    n = n + 1
+    match c_
+        Some(c) =>
+            match d_
+                Some(d) =>
+                    fails = fails + check("the socket carries FD", cansocket.carries_fd(c))
+                    n = n + 1
+                    let _ = cansocket.set_receive_timeout(d, 100)
+                    fails = fails + check("send an FD frame of 12 bytes with a bit rate switch",
+                        cansocket.send_fd(c, canframe.fd_frame(0x123, 12, true), fd_payload) == None)
+                    n = n + 1
+                    let big = next_frame(d)
+                    fails = fails + check("receive answers it as a bad-length fault: 12 bytes do not fit a classic frame",
+                        canframe.fault_code(big) == canframe.CAN_FAULT_BAD_LENGTH)
+                    n = n + 1
+                    fails = fails + check("send an FD frame of 8 bytes",
+                        cansocket.send_fd(c, canframe.fd_frame(0x321, 8, false), fd_payload) == None)
+                    n = n + 1
+                    let small = next_frame(d)
+                    fails = fails + check("receive reads its 72 bytes as a classic frame",
+                        canframe.frame_id(small) == 0x321 and canframe.frame_len(small) == 8 and canframe.frame_byte(small, 7) == 0xA7)
+                    n = n + 1
+                    fails = fails + check("a classic frame crosses an FD socket in 16 bytes",
+                        cansocket.send(c, canframe.frame(0x7FF, 1, 0x5A)) == None and canframe.frame_byte(next_frame(d), 0) == 0x5A)
+                    n = n + 1
+                    let _ = cansocket.close(c)
+                    let _ = cansocket.close(d)
+                None    =>
+                    fails = fails + check("the socket opens", false)
+                    n = n + 1
+        None    =>
+            fails = fails + check("the socket opens", false)
+            n = n + 1
+
+    println("${n - fails} of ${n} passed")
+    if fails > 0
+        process.exit(1)

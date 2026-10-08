@@ -1,0 +1,67 @@
+// The drivers' handles and the words they program, on the host.
+//
+// The bring-up functions, `canbxcan.start` and `canfdcan.start` and the
+// clock and pin routines beside them, write a controller's registers
+// and run only on a board: `tests/driver_probe.nv` builds them for the
+// STM32F407G-DISC1 and the NUCLEO-H723ZG, and the programs under
+// `examples/embedded/can_demo` run them on the bench.  The last test
+// takes each clock and pin routine as a value, which type-checks its
+// signature on the host without calling it.
+
+use std.test
+use canfilter
+use canbxcan
+use canfdcan
+
+@test
+fn test_the_bxcan_handles_name_the_f4s_instances() [io]
+    test.case("CAN2's filter banks live in CAN1's block, from bank 14 on")
+    let a = canbxcan.can1()
+    let b = canbxcan.can2()
+    test.assert_eq(a.base, canbxcan.BXCAN1_BASE)
+    test.assert_eq(a.filters, canbxcan.BXCAN1_BASE)
+    test.assert_eq(a.first_bank, 0)
+    test.assert_eq(b.base, canbxcan.BXCAN2_BASE)
+    test.assert_eq(b.filters, canbxcan.BXCAN1_BASE)
+    test.assert_eq(b.first_bank, 14)
+    test.assert_eq(canbxcan.BXCAN1_BASE, 0x40006400)
+    test.assert_eq(canbxcan.BXCAN2_BASE, 0x40006800)
+
+@test
+fn test_the_fdcan_handles_split_the_message_ram() [io]
+    test.case("each instance gets 2 KB of the 10 KB message RAM at 0x4000AC00")
+    let a = canfdcan.fdcan1()
+    let b = canfdcan.fdcan2()
+    test.assert_eq(a.base, 0x4000A000)
+    test.assert_eq(b.base, 0x4000A400)
+    test.assert_eq(a.ram, canfdcan.FDCAN_MESSAGE_RAM)
+    test.assert_eq(b.ram, canfdcan.FDCAN_MESSAGE_RAM + canfdcan.FDCAN_RAM_PER_INSTANCE)
+    test.case("and the layout fits: 28 + 2 × 8 filter words, 16 + 8 elements of 72 bytes")
+    test.assert(28 * 4 + 8 * 8 + (canfdcan.FDCAN_RX_DEPTH + canfdcan.FDCAN_TX_DEPTH) * 72 <= canfdcan.FDCAN_RAM_PER_INSTANCE)
+
+@test
+fn test_the_bxcan_identifier_layout() [io]
+    test.case("a standard identifier sits in bits 31 to 21")
+    test.assert_eq(canbxcan.id_bits(0x123, false), 0x123 << 21)
+    test.assert_eq(canbxcan.id_bits(0x7FF, false), 0xFFE00000)
+    test.case("bits above the format's width are dropped")
+    test.assert_eq(canbxcan.id_bits(0xFFFF, false), 0x7FF << 21)
+    test.case("an extended identifier sits in bits 31 to 3, with IDE in bit 2")
+    test.assert_eq(canbxcan.id_bits(0x18DAF110, true), (0x18DAF110 << 3) | 4)
+    test.assert_eq(canbxcan.id_bits(0x1FFFFFFF, true), 0xFFFFFFFC)
+
+@test
+fn test_an_extended_list_is_a_dual_id_element() [io]
+    test.case("EFT 1, the second identifier in EFID2")
+    let e = canfilter.list_ext(0x18DAF110, 0x18DA10F1)
+    test.assert_eq(canfdcan.ext_element0(e), (1 << 29) | 0x18DAF110)
+    test.assert_eq(canfdcan.ext_element1(e), (1 << 30) | 0x18DA10F1)
+
+@test
+fn test_the_clock_and_pin_routines_take_the_boards_types() [io]
+    test.case("each routine is a value of its declared type; none is called")
+    let f4_clock: fn() -> Unit [hw] = canbxcan.f4_clock_on
+    let f4_pins: fn() -> Unit [hw] = canbxcan.f4_route_pd0_pd1
+    let h7_clock: fn(Int) -> Unit [hw] = canfdcan.h7_clock_on
+    let h7_pins: fn() -> Unit [hw] = canfdcan.h7_route_pd0_pd1
+    test.assert_eq(canfdcan.FDCAN_CLOCK_HSE, 0)

@@ -57,7 +57,7 @@ fn test_a_fresh_queue_is_empty_and_has_dropped_nothing() [io]
 
 @test
 fn test_enqueueing_is_two_steps_because_the_storage_is_the_callers() [io]
-    test.case("this answers a slot, the caller writes the frame, and nothing here ever holds one")
+    test.case("heapless-nv's own shape: this answers a slot, the caller writes the frame, and nothing here ever holds one")
     var q = cantxq.queue(4)
     test.assert_eq(cantxq.enqueue_at(q), 0)
     q = cantxq.enqueued(q)
@@ -174,3 +174,37 @@ fn test_a_full_queue_refuses_the_enqueue_with_its_capacity_named() [io]
     var q = cantxq.queue(1)
     q = cantxq.enqueued(q)
     test.assert(refused(cantxq.check_enqueue(q, canframe.frame(0x123, 0, 0))))
+
+@test
+fn test_the_queue_at_its_edges() [io]
+    test.case("a negative capacity is a queue of no slots")
+    test.assert_eq(cantxq.capacity(cantxq.queue(0 - 2)), 0)
+    test.case("an enqueue into a full queue changes nothing")
+    let full = cantxq.enqueued(cantxq.queue(1))
+    test.assert_eq(cantxq.len(cantxq.enqueued(full)), 1)
+    test.case("a dequeue from an empty queue, or of a slot outside the queue, changes nothing")
+    test.assert_eq(cantxq.len(cantxq.dequeued(cantxq.queue(4), 0)), 0)
+    test.assert_eq(cantxq.len(cantxq.dequeued(full, 5)), 1)
+    test.assert_eq(cantxq.len(cantxq.dequeued(full, 0 - 1)), 1)
+
+@test
+fn test_a_queue_whose_frames_wrap_past_the_end_of_the_array() [io]
+    var q = cantxq.queue(4)
+    for _i in 0..4
+        q = cantxq.enqueued(q)
+    q = cantxq.dequeued(q, cantxq.dequeue_fifo_index(q))
+    q = cantxq.dequeued(q, cantxq.dequeue_fifo_index(q))
+    q = cantxq.enqueued(q)
+    test.case("slots 2, 3 and 0 hold frames, oldest first")
+    test.assert_eq(cantxq.dequeue_fifo_index(q), 2)
+    test.assert_eq(cantxq.refill_from(q, 3), 2)
+    test.case("slot 0 is the newest, so taking it leaves the other two in place")
+    let after = cantxq.dequeued(q, 0)
+    test.assert_eq(cantxq.len(after), 2)
+    test.assert_eq(cantxq.dequeue_fifo_index(after), 2)
+
+@test
+fn test_a_queue_record_with_no_slots_reads_slot_zero() [io]
+    test.case("a record built by hand, holding a frame in no storage, reads the first slot rather than dividing by zero")
+    let q = CanTxQueue { head: 0, count: 1, capacity: 0, dropped: 0 }
+    test.assert_eq(cantxq.index_of_id(q, 0x600, id_at), 0)

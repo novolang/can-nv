@@ -1,0 +1,63 @@
+// driver_probe.nv — the two drivers' bring-up, as a firmware image that
+// builds for a board of each family.
+//
+// `tests/orbit/test_can_nv.sh` builds it for the STM32F407G-DISC1 and
+// the NUCLEO-H723ZG and does not run it: it names both drivers, and each
+// board has only one of the two controllers.  The programs that run the
+// drivers are `examples/embedded/can_demo/src/bxcan_bench.nv` and
+// `fdcan_bench.nv`, on the bench.
+
+use canframe
+use canfilter
+use canbus
+use canhal
+use canbxcan
+use canfdcan
+
+// Brings bxCAN's CAN1 up in silent loopback, sends one frame, and
+// answers whether it came back.
+@tier(embedded)
+fn bxcan_once() -> Bool [hw]
+    canbxcan.f4_clock_on()
+    let t = canbus.solve_timing(42000000, 500000, 875, canbus.bxcan_limits())
+    let can = canbxcan.can1()
+    if not canbxcan.start(can, t, canbxcan.BXCAN_MODE_SILENT_LOOPBACK)
+        return false
+    canbxcan.clear_filters(can)
+    let _ = can.can_set_filter(0, canfilter.accept_all())
+    let _ = canhal.transmit_checked(can, canframe.frame(0x123, 1, 0x2A))
+    for _i in 0..100000
+        let f = can.can_receive()
+        if canframe.is_frame(f)
+            return canframe.frame_byte(f, 0) == 0x2A
+    // CAN2 shares CAN1's filter banks; its handle names its own half.
+    let _ = canbxcan.can2()
+    canbxcan.f4_route_pd0_pd1()
+    false
+
+// Brings FDCAN1 up in internal loopback, sends one frame, and answers
+// whether it came back.
+@tier(embedded)
+fn fdcan_once() -> Bool [hw]
+    canfdcan.h7_clock_on(canfdcan.FDCAN_CLOCK_HSE)
+    let n = canbus.solve_timing(8000000, 500000, 875, canbus.fdcan_nominal_limits())
+    let d = canbus.solve_timing(8000000, 2000000, 750, canbus.fdcan_data_limits())
+    let can = canfdcan.fdcan1()
+    if not canfdcan.start(can, n, d, true, canfdcan.FDCAN_MODE_INTERNAL_LOOPBACK)
+        return false
+    let _ = canhal.transmit_checked(can, canframe.frame(0x123, 1, 0x2A))
+    for _i in 0..100000
+        let f = can.can_receive()
+        if canframe.is_frame(f)
+            return canframe.frame_byte(f, 0) == 0x2A
+    let _ = canfdcan.fdcan2()
+    canfdcan.h7_route_pd0_pd1()
+    false
+
+@tier(rt)
+fn main() [hw]
+    bsp.board.init()
+    if bxcan_once() or fdcan_once()
+        hal.uart.write("can-nv: a frame came back\n")
+    else
+        hal.uart.write("can-nv: no frame came back\n")

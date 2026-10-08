@@ -1,0 +1,85 @@
+// canhal_tests.nv: the transmit answer's refusals, the free functions
+// over `CanPeripheral`, and the table of controllers by board.
+//
+// The free functions run over the loopback controller, which is a
+// `CanPeripheral[mutate]` with its bus in memory, so a bus-off node and
+// a filtered receive are both set up with no hardware.
+
+use std.test
+use canframe
+use canfilter
+use canhal
+use canloop
+
+@test
+fn test_each_refused_transmit_answers_its_error() [io]
+    test.assert(canhal.tx_fault(canhal.accepted(0, 0 - 1)) == None)
+    match canhal.tx_fault(canhal.tx_refused(canhal.CAN_TX_FULL))
+        Some(CanQueueFull(_)) => test.assert(true)
+        _                     => test.assert(false)
+    match canhal.tx_fault(canhal.tx_refused(canhal.CAN_TX_BUS_OFF))
+        Some(CanBusOff) => test.assert(true)
+        _               => test.assert(false)
+    match canhal.tx_fault(canhal.tx_refused(canhal.CAN_TX_REFUSED))
+        Some(CanFrameRefused) => test.assert(true)
+        _                     => test.assert(false)
+
+@test
+fn test_a_checked_transmit_refuses_a_frame_the_bus_cannot_carry() [io, mutate]
+    let c = canloop.reset(canloop.LOOP_INTERNAL)
+    test.assert_eq(canhal.tx_status(canhal.transmit_checked(c, canframe.frame(0x800, 0, 0))),
+        canhal.CAN_TX_REFUSED)
+    test.assert_eq(canhal.tx_status(canhal.transmit_checked(c, canframe.frame(0x100, 9, 0))),
+        canhal.CAN_TX_REFUSED)
+    test.assert(canhal.tx_ok(canhal.transmit_checked(c, canframe.frame(0x100, 1, 7))))
+
+@test
+fn test_a_filtered_receive_skips_frames_and_stops_at_its_limit() [io, mutate]
+    let c = canloop.reset(canloop.LOOP_INTERNAL)
+    let _ = c.can_transmit(canframe.frame(0x100, 0, 0))
+    let _ = c.can_transmit(canframe.frame(0x200, 0, 0))
+    let _ = c.can_transmit(canframe.frame(0x300, 0, 0))
+    test.case("the filter skips 0x100 and answers 0x200")
+    let f = canhal.receive_filtered(c, canfilter.exact(0x200), 3)
+    test.assert_eq(canframe.frame_id(f), 0x200)
+    test.case("a limit of one reads 0x300, which the filter refuses, and answers nothing")
+    test.assert(canframe.is_none(canhal.receive_filtered(c, canfilter.exact(0x200), 1)))
+
+@test
+fn test_every_board_names_its_controller() [io]
+    test.assert_eq(canhal.controller_of("nrf52840-dk"), canhal.CAN_CONTROLLER_NONE)
+    test.assert_eq(canhal.controller_of("linux"), canhal.CAN_CONTROLLER_SOCKETCAN)
+    test.assert_eq(canhal.controller_of("socketcan"), canhal.CAN_CONTROLLER_SOCKETCAN)
+    test.assert_eq(canhal.controller_of("stm32f407g-disc1"), canhal.CAN_CONTROLLER_BXCAN)
+    test.assert_eq(canhal.controller_of("nucleo-h723zg"), canhal.CAN_CONTROLLER_FDCAN)
+    test.assert_eq(canhal.controller_of("frdm-mcxn947"), canhal.CAN_CONTROLLER_FLEXCAN)
+    test.assert_eq(canhal.controller_of("esp32-c6-devkitc-1"), canhal.CAN_CONTROLLER_TWAI)
+    test.case("a family prefix names the family's controller")
+    test.assert_eq(canhal.controller_of("stm32l476rg"), canhal.CAN_CONTROLLER_BXCAN)
+    test.assert_eq(canhal.controller_of("stm32g474re"), canhal.CAN_CONTROLLER_FDCAN)
+    test.assert_eq(canhal.controller_of("imxrt1062"), canhal.CAN_CONTROLLER_FLEXCAN)
+    test.assert_eq(canhal.controller_of("esp32-s3"), canhal.CAN_CONTROLLER_TWAI)
+    test.case("a name shorter than every prefix, and an unknown board")
+    test.assert_eq(canhal.controller_of("lp"), canhal.CAN_CONTROLLER_NONE)
+    test.assert_eq(canhal.controller_of("arduino-uno"), canhal.CAN_CONTROLLER_NONE)
+
+@test
+fn test_every_controller_has_its_slot_count_and_name() [io]
+    test.assert_eq(canhal.filter_slots_of(canhal.CAN_CONTROLLER_BXCAN), 14)
+    test.assert_eq(canhal.filter_slots_of(canhal.CAN_CONTROLLER_FDCAN), 28)
+    test.assert_eq(canhal.filter_slots_of(canhal.CAN_CONTROLLER_FLEXCAN), 16)
+    test.assert_eq(canhal.filter_slots_of(canhal.CAN_CONTROLLER_TWAI), 1)
+    test.assert_eq(canhal.filter_slots_of(canhal.CAN_CONTROLLER_MCP2515), 6)
+    test.assert_eq(canhal.filter_slots_of(canhal.CAN_CONTROLLER_MCP2518FD), 32)
+    test.assert_eq(canhal.filter_slots_of(canhal.CAN_CONTROLLER_SOCKETCAN), 512)
+    test.assert_eq(canhal.filter_slots_of(canhal.CAN_CONTROLLER_NONE), 0)
+    test.assert_eq(canhal.controller_name(canhal.CAN_CONTROLLER_BXCAN), "ST bxCAN")
+    test.assert_eq(canhal.controller_name(canhal.CAN_CONTROLLER_FDCAN), "ST FDCAN (Bosch M_CAN)")
+    test.assert_eq(canhal.controller_name(canhal.CAN_CONTROLLER_FLEXCAN), "NXP FlexCAN")
+    test.assert_eq(canhal.controller_name(canhal.CAN_CONTROLLER_TWAI), "Espressif TWAI")
+    test.assert_eq(canhal.controller_name(canhal.CAN_CONTROLLER_MCP2515), "Microchip MCP2515 over SPI")
+    test.assert_eq(canhal.controller_name(canhal.CAN_CONTROLLER_MCP2518FD), "Microchip MCP2518FD over SPI")
+    test.assert_eq(canhal.controller_name(canhal.CAN_CONTROLLER_SOCKETCAN), "Linux SocketCAN")
+    test.assert_eq(canhal.controller_name(canhal.CAN_CONTROLLER_NONE), "no CAN controller")
+    test.assert(canhal.supports_fd(canhal.CAN_CONTROLLER_MCP2518FD))
+    test.assert(canhal.supports_fd(canhal.CAN_CONTROLLER_BXCAN) == false)

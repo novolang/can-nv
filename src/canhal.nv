@@ -1,24 +1,22 @@
 // canhal.nv — the peripheral trait, and the boards that have one.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// `CanPeripheral[e]` is the trait every controller in this package
+// satisfies, in the shape of Rust's `embedded-can`: transmit, receive,
+// the two questions a driver asks about state, and recovery.
+// `CanFdPeripheral[e]` is its CAN FD half.  Three implementations ship
+// with the package: `canloop.CanLoop` (`[mutate]`, a controller in
+// memory), `canbxcan.BxCan` and `canfdcan.FdCan` (`[hw]`, the STM32
+// controllers).  A program written against the trait runs on any of
+// them, and a function written over it is charged what its argument
+// costs.
 //
-// `CanPeripheral[e]` IS THE TRAIT THAT CROSSES THE LAYER, and this
-// package implements it nowhere.  It is `embedded-can`'s shape in
-// novo-lang: transmit, receive, the two questions a driver asks about
-// state, and nothing else.  `cansocket` satisfies it on Linux and a
-// board's driver satisfies it on a device, and the whole rest of this
-// package is written against neither.
-//
-// NEITHER BOARD THIS PROJECT SUPPORTS HAS A CAN CONTROLLER, and saying
-// so is more useful than implying otherwise.  The nRF52840 has none.
-// The RP2040 has none.  What exists on those parts is an external
-// controller over SPI — the MCP2515 for classic CAN, the MCP2518FD for
-// FD — and that is a driver over `orbit/hal`'s SPI trait rather than
-// anything this package can supply.  The parts with a CAN peripheral
-// on the die are STM32 (bxCAN on the F1/F4, FDCAN on the G4/H7), NXP's
-// FlexCAN (i.MX RT, S32K, LPC), the ESP32's TWAI, Atmel SAM C/E, and
-// Infineon AURIX.  `CAN_CONTROLLER_*` below names them so a reader
-// choosing a part has the list in the package rather than in a search.
+// Which boards have a controller on the die: the STM32F407G-DISC1
+// (bxCAN, CAN1 and CAN2) and the NUCLEO-H723ZG (FDCAN1 to FDCAN3).  The
+// nRF52 and nRF53 parts and the RP2040 and RP2350 have none; a board
+// built on one of those needs an external controller over SPI, the
+// MCP2515 for classic CAN or the MCP2518FD for FD, which this package
+// does not drive.  `controller_of` answers for a board or a part
+// family, and `CAN_CONTROLLER_*` names the controllers.
 //
 // TRANSMISSION IS NOT COMPLETION.  `can_transmit` answers a MAILBOX
 // index, not "sent": a CAN controller accepts a frame into a mailbox
@@ -37,6 +35,8 @@
 
 use canframe
 use canfilter
+use canbus
+use canerr
 
 // ── What a transmit attempt answers ──────────────────────────────────
 
@@ -70,36 +70,50 @@ pub const CAN_TX_BUS_OFF = 2
 pub const CAN_TX_REFUSED = 3
 
 // Build an acceptance.
-pub fn accepted(mailbox: Int, displaced: Int) -> CanTxAccepted []
-    todo("can-nv.canhal.accepted")
+pub @tier(embedded)
+fn accepted(mailbox: Int, displaced: Int) -> CanTxAccepted []
+    CanTxAccepted { status: CAN_TX_ACCEPTED, mailbox: mailbox, displaced: displaced }
 
 // A refusal with the given `CAN_TX_*` status.
-pub fn tx_refused(status: Int) -> CanTxAccepted []
-    todo("can-nv.canhal.tx_refused")
+pub @tier(embedded)
+fn tx_refused(status: Int) -> CanTxAccepted []
+    CanTxAccepted { status: status, mailbox: 0 - 1, displaced: 0 - 1 }
 
 // Whether a mailbox took the frame.
-pub fn tx_ok(a: CanTxAccepted) -> Bool []
-    todo("can-nv.canhal.tx_ok")
+pub @tier(embedded)
+fn tx_ok(a: CanTxAccepted) -> Bool []
+    a.status == CAN_TX_ACCEPTED
 
 // The `CAN_TX_*` status.
-pub fn tx_status(a: CanTxAccepted) -> Int []
-    todo("can-nv.canhal.tx_status")
+pub @tier(embedded)
+fn tx_status(a: CanTxAccepted) -> Int []
+    a.status
 
 // Why the frame was refused, or nothing.
-pub fn tx_fault(a: CanTxAccepted) -> ?CanError []
-    todo("can-nv.canhal.tx_fault")
+pub @tier(rt)
+fn tx_fault(a: CanTxAccepted) -> ?CanError []
+    if a.status == CAN_TX_ACCEPTED
+        return None
+    if a.status == CAN_TX_FULL
+        return Some(CanQueueFull(0))
+    if a.status == CAN_TX_BUS_OFF
+        return Some(CanBusOff)
+    Some(CanFrameRefused)
 
 // Which mailbox took the frame.
-pub fn accepted_mailbox(a: CanTxAccepted) -> Int []
-    todo("can-nv.canhal.accepted_mailbox")
+pub @tier(embedded)
+fn accepted_mailbox(a: CanTxAccepted) -> Int []
+    a.mailbox
 
 // Which pending frame was displaced, or -1.
-pub fn accepted_displaced(a: CanTxAccepted) -> Int []
-    todo("can-nv.canhal.accepted_displaced")
+pub @tier(embedded)
+fn accepted_displaced(a: CanTxAccepted) -> Int []
+    a.displaced
 
 // Whether anything was displaced.
-pub fn accepted_displaced_any(a: CanTxAccepted) -> Bool []
-    todo("can-nv.canhal.accepted_displaced_any")
+pub @tier(embedded)
+fn accepted_displaced_any(a: CanTxAccepted) -> Bool []
+    a.displaced >= 0
 
 // ── The trait ────────────────────────────────────────────────────────
 
@@ -156,6 +170,22 @@ pub trait CanPeripheral[e]
     // something asks it to come back.
     fn can_recover(self) -> ?CanError [e]
 
+// The CAN FD half of a controller: a frame of up to 64 bytes each way.
+//
+// A separate trait, because most controllers have no FD and a program
+// written for classic CAN should not have to name methods it cannot
+// call.  The payload is a `Vec[u8; 64]`, inline wherever the caller
+// holds it; a transmit sends `canframe.fd_len(f)` bytes of it, padded
+// with zeros to the length the data length code names, and a receive
+// fills it and answers the header.  A classic frame received through
+// `can_receive_fd` answers with `canframe.fd_is_fd` false.
+pub trait CanFdPeripheral[e]
+    // Hand an FD frame to a transmit mailbox.
+    fn can_transmit_fd(self, f: CanFdFrame, data: Vec[u8; 64]) -> CanTxAccepted [e]
+    // Take the next received frame, classic or FD, into `data`;
+    // `canframe.fd_none()` when the bus was quiet.
+    fn can_receive_fd(self, var data: Vec[u8; 64]) -> CanFdFrame [e]
+
 // ── Driving one ──────────────────────────────────────────────────────
 
 // Transmit a frame, refusing rather than trying when the node is
@@ -165,8 +195,13 @@ pub trait CanPeripheral[e]
 // once here because a driver that omits it spins: a bus-off
 // controller's transmissions never complete, so a retry loop around
 // one never ends.
-pub fn transmit_checked<P: CanPeripheral[e]>(p: P, f: CanFrame) -> CanTxAccepted [e]
-    todo("can-nv.canhal.transmit_checked")
+pub @tier(embedded)
+fn transmit_checked<P: CanPeripheral[e]>(p: P, f: CanFrame) -> CanTxAccepted [e]
+    if not canbus.may_transmit(p.can_bus_state())
+        return tx_refused(CAN_TX_BUS_OFF)
+    if not frame_ok(f)
+        return tx_refused(CAN_TX_REFUSED)
+    p.can_transmit(f)
 
 // Take the next frame the filter accepts, discarding up to `limit`
 // frames that it does not.
@@ -180,12 +215,22 @@ pub fn transmit_checked<P: CanPeripheral[e]>(p: P, f: CanFrame) -> CanTxAccepted
 //
 // Answers `canframe.none()` when `limit` frames went by without a
 // match.
-pub fn receive_filtered<P: CanPeripheral[e]>(p: P, filt: CanFilter, limit: Int) -> CanFrame [e]
-    todo("can-nv.canhal.receive_filtered")
+pub @tier(embedded)
+fn receive_filtered<P: CanPeripheral[e]>(p: P, filt: CanFilter, limit: Int) -> CanFrame [e]
+    for _i in 0..limit
+        let f = p.can_receive()
+        if not canframe.is_frame(f)
+            return f
+        if canfilter.accepts(filt, f)
+            return f
+    canframe.none()
 
 // Recover a bus-off node, doing nothing when it is not bus-off.
-pub fn recover_if_bus_off<P: CanPeripheral[e]>(p: P) -> ?CanError [e]
-    todo("can-nv.canhal.recover_if_bus_off")
+pub @tier(embedded)
+fn recover_if_bus_off<P: CanPeripheral[e]>(p: P) -> ?CanError [e]
+    if canbus.may_transmit(p.can_bus_state())
+        return None
+    p.can_recover()
 
 // ── Which parts have a controller ────────────────────────────────────
 
@@ -225,12 +270,34 @@ pub const CAN_CONTROLLER_SOCKETCAN = 7
 // fn main() [io]
 //     println("${canhal.controller_of("nrf52840-dk")}")   // 0, there is none
 // ```
-pub fn controller_of(board: Str) -> Int []
-    todo("can-nv.canhal.controller_of")
+pub @tier(embedded)
+fn controller_of(board: Str) -> Int []
+    if board == "nrf52840-dk" or board == "nrf52832-dk" or board == "nrf5340-dk" or board == "rp2040" or board == "pico2" or board == "rp2350"
+        return CAN_CONTROLLER_NONE
+    if board == "socketcan" or board == "linux"
+        return CAN_CONTROLLER_SOCKETCAN
+    if board == "stm32f407g-disc1" or board == "stm32f3discovery"
+        return CAN_CONTROLLER_BXCAN
+    if board == "nucleo-h723zg"
+        return CAN_CONTROLLER_FDCAN
+    if board == "frdm-mcxn947"
+        return CAN_CONTROLLER_FLEXCAN
+    if board == "esp32-c6-devkitc-1"
+        return CAN_CONTROLLER_TWAI
+    if prefixed(board, "stm32f1") or prefixed(board, "stm32f2") or prefixed(board, "stm32f3") or prefixed(board, "stm32f4") or prefixed(board, "stm32f7") or prefixed(board, "stm32l4")
+        return CAN_CONTROLLER_BXCAN
+    if prefixed(board, "stm32g0") or prefixed(board, "stm32g4") or prefixed(board, "stm32h7") or prefixed(board, "stm32u5")
+        return CAN_CONTROLLER_FDCAN
+    if prefixed(board, "imxrt") or prefixed(board, "s32k") or prefixed(board, "lpc") or prefixed(board, "mcxn")
+        return CAN_CONTROLLER_FLEXCAN
+    if prefixed(board, "esp32")
+        return CAN_CONTROLLER_TWAI
+    CAN_CONTROLLER_NONE
 
 // Whether a controller handles CAN FD.
-pub fn supports_fd(controller: Int) -> Bool []
-    todo("can-nv.canhal.supports_fd")
+pub @tier(embedded)
+fn supports_fd(controller: Int) -> Bool []
+    controller == CAN_CONTROLLER_FDCAN or controller == CAN_CONTROLLER_FLEXCAN or controller == CAN_CONTROLLER_MCP2518FD or controller == CAN_CONTROLLER_SOCKETCAN
 
 // How many hardware acceptance filter slots a controller typically
 // has.
@@ -240,9 +307,64 @@ pub fn supports_fd(controller: Int) -> Bool []
 // 128 message buffers depending on the part, and the MCP2515 has 6.
 // A driver asks this once and either programs its filters or widens
 // them.
-pub fn filter_slots_of(controller: Int) -> Int []
-    todo("can-nv.canhal.filter_slots_of")
+pub @tier(embedded)
+fn filter_slots_of(controller: Int) -> Int []
+    if controller == CAN_CONTROLLER_BXCAN
+        return 14
+    if controller == CAN_CONTROLLER_FDCAN
+        return 28
+    if controller == CAN_CONTROLLER_FLEXCAN
+        return 16
+    if controller == CAN_CONTROLLER_TWAI
+        return 1
+    if controller == CAN_CONTROLLER_MCP2515
+        return 6
+    if controller == CAN_CONTROLLER_MCP2518FD
+        return 32
+    if controller == CAN_CONTROLLER_SOCKETCAN
+        return 512
+    0
 
 // A controller in words, for a log or a build diagnostic.
-pub fn controller_name(controller: Int) -> Str []
-    todo("can-nv.canhal.controller_name")
+pub @tier(embedded)
+fn controller_name(controller: Int) -> Str []
+    if controller == CAN_CONTROLLER_BXCAN
+        return "ST bxCAN"
+    if controller == CAN_CONTROLLER_FDCAN
+        return "ST FDCAN (Bosch M_CAN)"
+    if controller == CAN_CONTROLLER_FLEXCAN
+        return "NXP FlexCAN"
+    if controller == CAN_CONTROLLER_TWAI
+        return "Espressif TWAI"
+    if controller == CAN_CONTROLLER_MCP2515
+        return "Microchip MCP2515 over SPI"
+    if controller == CAN_CONTROLLER_MCP2518FD
+        return "Microchip MCP2518FD over SPI"
+    if controller == CAN_CONTROLLER_SOCKETCAN
+        return "Linux SocketCAN"
+    "no CAN controller"
+
+// Whether a frame is one a bus can carry, asked without building the
+// reason: a `?CanError` with a payload is a heap cell on a device.
+pub @tier(embedded)
+fn frame_ok(f: CanFrame) -> Bool
+    if not canframe.is_frame(f)
+        return false
+    let id = canframe.frame_id(f)
+    var top = canframe.CAN_SFF_MAX_ID
+    if canframe.is_extended(f)
+        top = canframe.CAN_EFF_MAX_ID
+    let n = canframe.frame_len(f)
+    id >= 0 and id <= top and n >= 0 and n <= canframe.CAN_MAX_DLEN
+
+// Whether `s` begins with `p`, compared a byte at a time so it builds
+// at every tier.
+@tier(embedded)
+fn prefixed(s: Str, p: Str) -> Bool
+    let n = str.len(p)
+    if str.len(s) < n
+        return false
+    for i in 0..n
+        if str.byte_at_or(s, i, 0 - 1) != str.byte_at_or(p, i, 0 - 2)
+            return false
+    true
