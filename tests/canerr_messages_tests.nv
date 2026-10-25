@@ -1,0 +1,52 @@
+// canerr_messages_tests.nv — every error says what happened in words,
+// naming the values it carries, and the retry classification.
+
+use std.test
+use std.str
+use canerr
+use canbxcan
+
+fn says(e: CanError, part: Str) -> Bool
+    str.contains(canerr.describe(e), part)
+
+@test
+fn test_every_error_names_its_values() [io]
+    test.case("the message of each variant carries the numbers or names the error was raised with")
+    test.assert(says(CanIdTooWide(0x800, false), "0x800 does not fit 11 bits"))
+    test.assert(says(CanIdTooWide(0x20000000, true), "0x20000000 does not fit 29 bits"))
+    test.assert(says(CanIdTooWide(0, false), "0x0 "))
+    test.assert(says(CanLengthTooLong(9), "9"))
+    test.assert(says(CanFdLengthNotEncodable(13), "13"))
+    test.assert(says(CanRemoteWithPayload(0x123), "0x123"))
+    test.assert(str.len(canerr.describe(CanFdNotSupported)) > 0)
+    test.assert(says(CanQueueFull(16), "16"))
+    test.assert(says(CanFilterUnreachable(0xAB, 0xCD), "0xAB"))
+    test.assert(says(CanIsoTpBadSequence(2, 5), "5"))
+    test.assert(says(CanIsoTpTooLong(5000, 4095), "5000"))
+    test.assert(says(CanIsoTpOverflow, "overflow"))
+    test.assert(says(CanIsoTpTimeout("N_Bs"), "N_Bs"))
+    test.assert(says(CanBadLogLine(12), "12"))
+    test.assert(says(CanSocketRefused("no route"), "no route"))
+    test.assert(says(CanNoSuchInterface("can7"), "can7"))
+    test.assert(says(CanBusOff, "bus-off"))
+    test.assert(says(CanFrameRefused, "refused the frame"))
+    test.assert(says(CanShortWire(3), "3 are there"))
+    test.assert(says(CanFilterNotSupported, "filter"))
+    test.assert(says(CanTimingUnreachable(16000000, 1000000), "16000000"))
+
+@test
+fn test_only_a_condition_that_may_pass_is_transient() [io]
+    test.case("a retry loop may retry a full queue, an overflow, a timer, a refused socket and a bus-off node, and nothing else")
+    test.assert(canerr.is_transient(CanQueueFull(16)))
+    test.assert(canerr.is_transient(CanIsoTpOverflow))
+    test.assert(canerr.is_transient(CanIsoTpTimeout("N_As")))
+    test.assert(canerr.is_transient(CanSocketRefused("x")))
+    test.assert(canerr.is_transient(CanBusOff))
+    test.assert(canerr.is_transient(CanIdTooWide(0x800, false)) == false)
+    test.assert(canerr.is_transient(CanFrameRefused) == false)
+
+@test
+fn test_identifier_bits_follow_the_register_layout() [io]
+    test.case("a standard identifier sits in bits 31-21; an extended one in bits 31-3 with IDE set")
+    test.assert_eq(canbxcan.id_bits(0x123, false), 0x123 << 21)
+    test.assert_eq(canbxcan.id_bits(0x1ABCDEF, true), (0x1ABCDEF << 3) | 4)
