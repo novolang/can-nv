@@ -1,0 +1,145 @@
+// canfilter_algebra_tests.nv — filters as sets: list filters, inversion,
+// remote frames, validity, merging, covering and overlap, each checked
+// against the count of identifiers the filter accepts.
+
+use std.test
+use canfilter
+use canframe
+use canerr
+
+fn unreachable(e: ?CanError) -> Bool
+    match e
+        Some(CanFilterUnreachable(_, _)) => true
+        _ => false
+
+@test
+fn test_a_non_frame_and_a_remote_frame_are_not_accepted_by_default() [io]
+    test.case("none() and a fault match nothing; a remote frame passes only a filter that allows remote frames")
+    let f = canfilter.exact(0x123)
+    test.assert(canfilter.accepts(f, canframe.none()) == false)
+    test.assert(canfilter.accepts(f, canframe.fault(canframe.CAN_FAULT_REFUSED)) == false)
+    test.assert(canfilter.accepts(f, canframe.remote_frame(0x123, 0)) == false)
+    test.assert(canfilter.accepts(canfilter.allowing_remote(f), canframe.remote_frame(0x123, 0)))
+    test.assert(canfilter.accepts(f, canframe.frame(0x123, 0, 0)))
+    test.assert(canfilter.accepts_id(f, 0x123, true) == false)
+
+@test
+fn test_an_inverted_filter_accepts_the_complement() [io]
+    test.case("width counts the identifiers outside the match, list filters match their two identifiers")
+    let inv = canfilter.inverted(canfilter.exact(0x123))
+    test.assert(canfilter.accepts_id(inv, 0x123, false) == false)
+    test.assert(canfilter.accepts_id(inv, 0x124, false))
+    test.assert_eq(canfilter.width(inv), 0x7FF)
+    let l = canfilter.list(0x10, 0x20)
+    test.assert(canfilter.accepts_id(l, 0x10, false))
+    test.assert(canfilter.accepts_id(l, 0x20, false))
+    test.assert(canfilter.accepts_id(l, 0x30, false) == false)
+    test.assert_eq(canfilter.width(l), 2)
+    test.assert_eq(canfilter.width(canfilter.list(0x10, 0x10)), 1)
+    test.assert_eq(canfilter.width(canfilter.accept_all()), 0x800)
+    test.assert_eq(canfilter.width(canfilter.accept_all_ext()), 0x20000000)
+
+@test
+fn test_a_filter_with_bits_outside_its_format_is_unreachable() [io]
+    test.case("check_filter refuses identifiers and masks wider than the format, in mask and list form")
+    test.assert(canfilter.check_filter(canfilter.exact(0x123)) == None)
+    test.assert(unreachable(canfilter.check_filter(canfilter.filter(0x800, 0x7FF))))
+    test.assert(unreachable(canfilter.check_filter(canfilter.filter(0x123, 0x0F0))))
+    test.assert(canfilter.check_filter(canfilter.list(0x10, 0x20)) == None)
+    test.assert(unreachable(canfilter.check_filter(canfilter.list(0x800, 0x20))))
+    test.assert(unreachable(canfilter.check_filter(canfilter.list(0x10, 0x1000))))
+    test.assert(canfilter.check_filter(canfilter.list_ext(0x10000000, 0x20)) == None)
+
+@test
+fn test_merging_widens_to_the_smallest_filter_that_holds_both() [io]
+    test.case("two exact identifiers merge to the mask of their common bits; unlike formats widen to accept-all")
+    let m = canfilter.merge(canfilter.exact(0x100), canfilter.exact(0x101))
+    test.assert(canfilter.accepts_id(m, 0x100, false))
+    test.assert(canfilter.accepts_id(m, 0x101, false))
+    test.assert_eq(canfilter.width(m), 2)
+    test.assert_eq(canfilter.false_accept_width(canfilter.exact(0x100), canfilter.exact(0x101)), 0)
+    test.assert_eq(canfilter.false_accept_width(canfilter.exact(0x100), canfilter.exact(0x103)), 2)
+
+    test.assert(canfilter.can_merge(canfilter.exact(1), canfilter.exact_ext(1)) == false)
+    let wide = canfilter.merge(canfilter.exact(1), canfilter.exact_ext(1))
+    test.assert_eq(canfilter.width(wide), 0x800)
+    let wide_ext = canfilter.merge(canfilter.exact_ext(1), canfilter.exact(1))
+    test.assert_eq(canfilter.width(wide_ext), 0x20000000)
+
+    // a list merges through its mask form
+    let ml = canfilter.merge(canfilter.list(0x100, 0x101), canfilter.exact(0x102))
+    test.assert(canfilter.accepts_id(ml, 0x100, false))
+    test.assert(canfilter.accepts_id(ml, 0x102, false))
+    // an inverted list cannot merge, nor can a list with an inverted filter
+    let il = canfilter.merge(canfilter.inverted(canfilter.list(1, 2)), canfilter.exact(3))
+    test.assert_eq(canfilter.width(il), 0x800)
+    let ile = canfilter.merge(canfilter.inverted(canfilter.list_ext(1, 2)), canfilter.exact_ext(3))
+    test.assert_eq(canfilter.width(ile), 0x20000000)
+    let mixed = canfilter.merge(canfilter.exact_ext(3), canfilter.inverted(canfilter.exact_ext(3)))
+    test.assert_eq(canfilter.width(mixed), 0x20000000)
+    let mixed_std = canfilter.merge(canfilter.exact(3), canfilter.inverted(canfilter.exact(3)))
+    test.assert_eq(canfilter.width(mixed_std), 0x800)
+
+@test
+fn test_merging_two_inverted_filters_keeps_what_both_reject() [io]
+    test.case("the union of two exclusions overlapping is the narrower exclusion, disjoint exclusions union to everything")
+    let a = canfilter.inverted(canfilter.filter(0x100, 0x7F0))
+    let b = canfilter.inverted(canfilter.filter(0x100, 0x7F0))
+    let same = canfilter.merge(a, b)
+    test.assert_eq(canfilter.width(same), canfilter.width(a))
+    let far = canfilter.inverted(canfilter.exact(0x300))
+    let disjoint = canfilter.merge(a, far)
+    test.assert_eq(canfilter.width(disjoint), 0x800)
+    test.assert(canfilter.accepts_id(disjoint, 0x100, false))
+    let rtr = canfilter.merge(canfilter.exact(1), canfilter.allowing_remote(canfilter.exact(1)))
+    test.assert(canfilter.accepts(rtr, canframe.remote_frame(1, 0)))
+
+@test
+fn test_covering_and_overlap_follow_set_inclusion() [io]
+    test.case("a wide filter covers a narrow one inside it, not the reverse; inversion and lists change the answer as sets do")
+    let wide = canfilter.filter(0x100, 0x700)
+    let narrow = canfilter.exact(0x123)
+    test.assert(canfilter.covers(wide, narrow))
+    test.assert(canfilter.covers(narrow, wide) == false)
+    test.assert(canfilter.overlaps(wide, narrow))
+    test.assert(canfilter.overlaps(narrow, canfilter.exact(0x124)) == false)
+    test.assert(canfilter.overlaps(narrow, canfilter.exact_ext(0x123)) == false)
+    // different formats: only an empty filter is covered
+    test.assert(canfilter.covers(wide, canfilter.exact_ext(0x123)) == false)
+    // remote frames
+    test.assert(canfilter.covers(wide, canfilter.allowing_remote(narrow)) == false)
+    test.assert(canfilter.covers(canfilter.allowing_remote(wide), canfilter.allowing_remote(narrow)))
+    // inverted against plain
+    let inv = canfilter.inverted(canfilter.exact(0x500))
+    test.assert(canfilter.covers(inv, narrow))
+    test.assert(canfilter.covers(inv, canfilter.exact(0x500)) == false)
+    test.assert(canfilter.covers(narrow, inv) == false)
+    test.assert(canfilter.covers(canfilter.accept_all(), inv))
+    // two inverted: the smaller exclusion covers
+    let small = canfilter.inverted(canfilter.exact(0x500))
+    let big = canfilter.inverted(canfilter.filter(0x500, 0x7F0))
+    test.assert(canfilter.covers(small, big))
+    test.assert(canfilter.covers(big, small) == false)
+    test.assert(canfilter.overlaps(inv, narrow))
+    test.assert(canfilter.overlaps(inv, canfilter.exact(0x500)) == false)
+    test.assert(canfilter.overlaps(inv, big))
+    // lists
+    let l = canfilter.list(0x10, 0x20)
+    test.assert(canfilter.covers(canfilter.filter(0, 0x700), l))
+    test.assert(canfilter.covers(l, canfilter.exact(0x10)))
+    test.assert(canfilter.covers(l, canfilter.exact(0x30)) == false)
+    test.assert(canfilter.overlaps(l, canfilter.exact(0x20)))
+    test.assert(canfilter.overlaps(l, canfilter.exact(0x21)) == false)
+    test.assert(canfilter.overlaps(canfilter.exact(0x20), l))
+    test.assert(canfilter.overlaps(l, canfilter.list(0x20, 0x30)))
+    test.assert(canfilter.overlaps(l, canfilter.list(0x40, 0x30)) == false)
+    test.assert(canfilter.overlaps(canfilter.list(0x10, 0x10), canfilter.list(0x10, 0x40)))
+
+@test
+fn test_false_accepts_never_go_negative() [io]
+    test.case("two filters of different formats share nothing; a merge that is narrower than the union counts zero extra identifiers")
+    test.assert(canfilter.false_accept_width(canfilter.exact(1), canfilter.exact_ext(1)) >= 0)
+    let a = canfilter.inverted(canfilter.exact(0x300))
+    let b = canfilter.inverted(canfilter.exact(0x301))
+    test.assert(canfilter.false_accept_width(a, b) >= 0)
+    test.assert(canfilter.false_accept_width(canfilter.list(1, 2), canfilter.exact(3)) >= 0)
