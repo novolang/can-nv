@@ -1,0 +1,177 @@
+// canisotp_states_tests.nv — the edges of ISO-TP: frames that are not
+// what they are asked to be, the sender's flow-control states, the
+// receiver's refusals, the timers and the fault each failure reports.
+
+use std.test
+use canisotp
+use canframe
+use canerr
+
+fn fault_is(e: ?CanError, want: CanError) -> Bool
+    match e
+        Some(x) => x == want
+        None    => false
+
+@test
+fn test_a_frame_that_is_not_the_asked_type_answers_minus_one() [io]
+    test.case("every PCI reader answers -1 for another type, and for an empty or absent frame")
+    let single = canisotp.single_frame(0x7E0, 0x332211, 3)
+    let first = canisotp.first_frame(0x7E0, 20, 0x665544332211)
+    let cons = canisotp.consecutive_frame(0x7E0, 3, 0x7766, 2)
+    let flow = canisotp.flow_frame(0x7E0, canisotp.CAN_ISOTP_CONTINUE, 8, 0xF1)
+    test.assert_eq(canisotp.pci_type(canframe.none()), 0 - 1)
+    test.assert_eq(canisotp.pci_type(canframe.frame(0x1, 0, 0)), 0 - 1)
+    test.assert_eq(canisotp.pci_type(canframe.frame(0x1, 1, 0x40)), 0 - 1)
+    test.assert_eq(canisotp.single_len(first), 0 - 1)
+    test.assert_eq(canisotp.first_len(single), 0 - 1)
+    test.assert_eq(canisotp.consecutive_index(flow), 0 - 1)
+    test.assert_eq(canisotp.flow_status(cons), 0 - 1)
+    test.assert_eq(canisotp.single_len(single), 3)
+    test.assert_eq(canisotp.first_len(first), 20)
+    test.assert_eq(canisotp.consecutive_index(cons), 3)
+
+@test
+fn test_the_separation_time_rounds_to_what_the_field_can_say() [io]
+    test.case("zero, the 100 microsecond steps, whole milliseconds, and the 127 ms ceiling")
+    test.assert_eq(canisotp.st_min_encode(0), 0)
+    test.assert_eq(canisotp.st_min_encode(0 - 5), 0)
+    test.assert_eq(canisotp.st_min_encode(250), 0xF3)
+    test.assert_eq(canisotp.st_min_encode(900), 0xF9)
+    test.assert_eq(canisotp.st_min_encode(2000), 2)
+    test.assert_eq(canisotp.st_min_encode(1500), 2)
+    test.assert_eq(canisotp.st_min_encode(500000), 0x7F)
+    test.assert_eq(canisotp.st_min_us(0xF3), 300)
+    test.assert_eq(canisotp.st_min_us(5), 5000)
+
+@test
+fn test_frame_builders_clamp_their_lengths() [io]
+    test.case("a negative or oversized length never builds a frame longer than the format allows")
+    let s0 = canisotp.single_frame(0x1, 0xFF, 0 - 3)
+    test.assert_eq(canframe.frame_len(s0), 1)
+    let s9 = canisotp.single_frame(0x1, 0x1122334455667788, 9)
+    test.assert_eq(canframe.frame_len(s9), 8)
+    let c0 = canisotp.consecutive_frame(0x1, 17, 0xFF, 0 - 1)
+    test.assert_eq(canframe.frame_len(c0), 1)
+    test.assert_eq(canisotp.consecutive_index(c0), 1)
+    let c9 = canisotp.consecutive_frame(0x1, 2, 0x1122334455667788, 20)
+    test.assert_eq(canframe.frame_len(c9), 8)
+    test.assert_eq(canisotp.consecutive_count(7), 0)
+    test.assert_eq(canisotp.consecutive_count(20), 2)
+    test.assert_eq(canisotp.next_index(15), 0)
+
+@test
+fn test_a_message_that_fits_one_frame_is_done_at_once() [io]
+    test.case("seven bytes or fewer need no flow control, and a negative or over-4095 length is refused")
+    let s = canisotp.begin_send(canisotp.session(), 5)
+    test.assert_eq(canisotp.session_state(s), canisotp.CAN_ISOTP_STATE_DONE)
+    test.assert(canisotp.session_is_finished(s))
+    test.assert(canisotp.session_fault(s) == None)
+    let big = canisotp.begin_send(canisotp.session(), 5000)
+    test.assert(canisotp.session_is_finished(big))
+    test.assert(fault_is(canisotp.session_fault(big), CanIsoTpTooLong(0, 5000)))
+    let neg = canisotp.begin_send(canisotp.session(), 0 - 1)
+    test.assert_eq(canisotp.session_state(neg), canisotp.CAN_ISOTP_STATE_FAILED)
+
+@test
+fn test_a_sender_walks_flow_control_blocks() [io]
+    test.case("wait-for-flow, a block of two, wait again, then the rest with no block limit")
+    var s = canisotp.begin_send(canisotp.session(), 30)
+    test.assert_eq(canisotp.session_state(s), canisotp.CAN_ISOTP_STATE_WAIT_FLOW)
+    test.assert(canisotp.flow_due(s))
+    test.assert_eq(canisotp.session_done(s), 6)
+    test.assert_eq(canisotp.session_total(s), 30)
+    // a flow frame while sending changes nothing
+    let sending = canisotp.take_flow(s, canisotp.flow_frame(0x1, canisotp.CAN_ISOTP_CONTINUE, 2, 0xF2))
+    test.assert_eq(canisotp.session_state(sending), canisotp.CAN_ISOTP_STATE_SENDING)
+    test.assert_eq(canisotp.session_block_left(sending), 2)
+    test.assert_eq(canisotp.session_st_min_us(sending), 200)
+    test.assert_eq(canisotp.session_state(canisotp.take_flow(sending, canisotp.flow_frame(0x1, 0, 2, 0))), canisotp.CAN_ISOTP_STATE_SENDING)
+    s = canisotp.sent_consecutive(sending, 7)
+    test.assert_eq(canisotp.session_state(s), canisotp.CAN_ISOTP_STATE_SENDING)
+    test.assert_eq(canisotp.session_block_left(s), 1)
+    test.assert_eq(canisotp.session_index(s), 2)
+    s = canisotp.sent_consecutive(s, 7)
+    test.assert_eq(canisotp.session_state(s), canisotp.CAN_ISOTP_STATE_WAIT_FLOW)
+    test.assert_eq(canisotp.session_block_left(s), 0)
+    s = canisotp.take_flow(s, canisotp.flow_frame(0x1, canisotp.CAN_ISOTP_CONTINUE, 0, 0))
+    test.assert_eq(canisotp.session_block_left(s), 0)
+    s = canisotp.sent_consecutive(s, 7)
+    s = canisotp.sent_consecutive(s, 4)
+    test.assert_eq(canisotp.session_state(s), canisotp.CAN_ISOTP_STATE_DONE)
+    test.assert_eq(canisotp.session_done(s), 30)
+    // a consecutive frame reported outside the sending state is ignored
+    test.assert_eq(canisotp.session_state(canisotp.sent_consecutive(canisotp.begin_send(canisotp.session(), 30), 7)), canisotp.CAN_ISOTP_STATE_WAIT_FLOW)
+
+@test
+fn test_waits_are_counted_and_overflow_ends_the_transfer() [io]
+    test.case("ten wait frames are tolerated, the eleventh fails; an overflow flow status fails at once")
+    var s = canisotp.begin_send(canisotp.session(), 30)
+    let wait = canisotp.flow_frame(0x1, canisotp.CAN_ISOTP_WAIT, 0, 0)
+    for i in 0..canisotp.CAN_ISOTP_MAX_WAITS
+        s = canisotp.take_flow(s, wait)
+    test.assert_eq(canisotp.session_waits(s), 10)
+    test.assert(canisotp.flow_due(s))
+    s = canisotp.take_flow(s, wait)
+    test.assert_eq(canisotp.session_state(s), canisotp.CAN_ISOTP_STATE_FAILED)
+    test.assert(canisotp.session_fault(s) != None)
+    let o = canisotp.take_flow(canisotp.begin_send(canisotp.session(), 30), canisotp.flow_frame(0x1, canisotp.CAN_ISOTP_OVERFLOW, 0, 0))
+    test.assert(fault_is(canisotp.session_fault(o), CanIsoTpOverflow))
+    test.assert_eq(canisotp.session_block_left(o), 0)
+
+@test
+fn test_a_receiver_refuses_what_it_cannot_take() [io]
+    test.case("a non-first frame, a message over capacity, an out-of-order consecutive frame; a short first frame completes")
+    let notfirst = canisotp.begin_receive(canisotp.session(), canisotp.single_frame(0x1, 1, 1), 100)
+    test.assert(fault_is(canisotp.session_fault(notfirst), CanIsoTpBadSequence(0, 0)))
+    let first = canisotp.first_frame(0x1, 40, 0x665544332211)
+    let small = canisotp.begin_receive(canisotp.session(), first, 10)
+    test.assert(fault_is(canisotp.session_fault(small), CanIsoTpTooLong(40, 10)))
+    let r = canisotp.begin_receive(canisotp.session(), first, 100)
+    test.assert_eq(canisotp.session_state(r), canisotp.CAN_ISOTP_STATE_RECEIVING)
+    test.assert_eq(canisotp.session_done(r), 6)
+    let bad = canisotp.take_consecutive(r, canisotp.consecutive_frame(0x1, 5, 0, 7))
+    test.assert(fault_is(canisotp.session_fault(bad), CanIsoTpBadSequence(1, 5)))
+    // ignored while not receiving
+    test.assert_eq(canisotp.session_state(canisotp.take_consecutive(canisotp.session(), canisotp.consecutive_frame(0x1, 1, 0, 7))), canisotp.CAN_ISOTP_STATE_IDLE)
+    // a short first frame clamps what has arrived
+    let tiny = canisotp.begin_receive(canisotp.session(), canisotp.first_frame(0x1, 4, 0), 100)
+    test.assert_eq(canisotp.session_done(tiny), 4)
+    // the whole message
+    var s = r
+    var idx = 1
+    for i in 0..5
+        s = canisotp.take_consecutive(s, canisotp.consecutive_frame(0x1, idx, 0, 7))
+        idx = canisotp.next_index(idx)
+    test.assert_eq(canisotp.session_state(s), canisotp.CAN_ISOTP_STATE_DONE)
+    test.assert_eq(canisotp.session_done(s), 40)
+
+@test
+fn test_each_state_has_its_timer_and_its_fault() [io]
+    test.case("N_Bs while waiting for flow, N_Cr while receiving, N_As while sending; idle and done have none")
+    let wait = canisotp.begin_send(canisotp.session(), 30)
+    let sending = canisotp.take_flow(wait, canisotp.flow_frame(0x1, 0, 4, 0))
+    let recv = canisotp.begin_receive(canisotp.session(), canisotp.first_frame(0x1, 40, 0), 100)
+    test.assert_eq(canisotp.deadline_ms(wait, 100), 100 + canisotp.CAN_ISOTP_N_BS_MS)
+    test.assert_eq(canisotp.deadline_ms(recv, 100), 100 + canisotp.CAN_ISOTP_N_CR_MS)
+    test.assert_eq(canisotp.deadline_ms(sending, 100), 100 + canisotp.CAN_ISOTP_N_AS_MS)
+    test.assert_eq(canisotp.deadline_ms(canisotp.session(), 100), 0 - 1)
+    test.assert(canisotp.timed_out(wait, 0, 1001))
+    test.assert(canisotp.timed_out(wait, 0, 1000) == false)
+    test.assert(canisotp.timed_out(canisotp.session(), 0, 99999) == false)
+    test.assert(fault_is(canisotp.session_fault(canisotp.on_timeout(wait)), CanIsoTpTimeout("N_Bs")))
+    test.assert(fault_is(canisotp.session_fault(canisotp.on_timeout(recv)), CanIsoTpTimeout("N_Cr")))
+    test.assert(fault_is(canisotp.session_fault(canisotp.on_timeout(sending)), CanIsoTpTimeout("N_As")))
+    let idle = canisotp.on_timeout(canisotp.session())
+    test.assert_eq(canisotp.session_state(idle), canisotp.CAN_ISOTP_STATE_IDLE)
+    let waits = canisotp.session_fault(canisotp.take_flow(wait, canisotp.flow_frame(0x1, 5, 0, 0)))
+    test.assert(waits == Some(CanIsoTpOverflow))
+
+@test
+fn test_extended_addressing_costs_one_byte() [io]
+    test.case("a mixed-address frame spends a byte on the target address")
+    test.assert_eq(canisotp.addressing_overhead(true), 1)
+    test.assert_eq(canisotp.addressing_overhead(false), 0)
+    test.assert_eq(canisotp.single_max(true), canisotp.single_max(false) - 1)
+    test.assert_eq(canisotp.consecutive_max(true), canisotp.consecutive_max(false) - 1)
+    test.assert(canisotp.should_send_overflow(10, 9))
+    test.assert(canisotp.should_send_overflow(9, 9) == false)
