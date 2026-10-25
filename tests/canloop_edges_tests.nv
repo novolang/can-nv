@@ -1,0 +1,87 @@
+// canloop_edges_tests.nv — the loop-back controller's refusals and
+// housekeeping: a bus-off node, a frame it cannot carry, a mailbox
+// that does not exist, aborts, filters out of range and recovery.
+
+use std.test
+use canframe
+use canfilter
+use canbus
+use canhal
+use canloop
+use canerr
+
+@test
+fn test_the_handle_can_be_taken_without_a_reset() [io, mutate]
+    test.case("controller() answers the same handle as reset() and leaves the queues alone")
+    let c = canloop.reset(canloop.LOOP_INTERNAL)
+    let _ = c.can_transmit(canframe.frame(0x10, 0, 0))
+    let d = canloop.controller()
+    test.assert_eq(canloop.pending_tx(), 1)
+    test.assert(d.can_tx_done(0))
+
+@test
+fn test_a_frame_the_bus_cannot_carry_is_refused() [io, mutate]
+    test.case("an identifier past 11 bits on a standard frame is refused, and nothing is queued")
+    let c = canloop.reset(canloop.LOOP_INTERNAL)
+    let a = c.can_transmit(canframe.frame(0x800, 0, 0))
+    test.assert_eq(canhal.tx_status(a), canhal.CAN_TX_REFUSED)
+    test.assert_eq(canloop.pending_tx(), 0)
+
+@test
+fn test_a_mailbox_that_does_not_exist_is_done_and_aborting_it_is_harmless() [io, mutate]
+    test.case("out-of-range mailboxes read as done; an abort empties a real one and ignores an unreal one")
+    let c = canloop.reset(canloop.LOOP_INTERNAL)
+    test.assert(c.can_tx_done(0 - 1))
+    test.assert(c.can_tx_done(canloop.LOOP_MAILBOXES))
+    let a = c.can_transmit(canframe.frame(0x20, 0, 0))
+    test.assert_eq(canloop.pending_tx(), 1)
+    test.assert(c.can_tx_abort(canhal.accepted_mailbox(a)) == None)
+    test.assert_eq(canloop.pending_tx(), 0)
+    test.assert(c.can_tx_abort(0 - 1) == None)
+    test.assert(c.can_tx_abort(99) == None)
+    test.assert_eq(canloop.pending_tx(), 0)
+
+@test
+fn test_a_filter_slot_out_of_range_is_not_supported() [io, mutate]
+    test.case("slots 0 to 13 exist; anything else is refused")
+    let c = canloop.reset(canloop.LOOP_INTERNAL)
+    test.assert_eq(c.can_filter_slots(), canloop.LOOP_FILTER_SLOTS)
+    test.assert(c.can_set_filter(0 - 1, canfilter.accept_all()) == Some(CanFilterNotSupported))
+    test.assert(c.can_set_filter(canloop.LOOP_FILTER_SLOTS, canfilter.accept_all()) == Some(CanFilterNotSupported))
+    test.assert(c.can_set_filter(0, canfilter.exact(0x55)) == None)
+    let _ = c.can_transmit(canframe.frame(0x56, 0, 0))
+    let _ = c.can_transmit(canframe.frame(0x55, 0, 0))
+    canloop.run()
+    test.assert_eq(canloop.pending_rx(), 1)
+
+@test
+fn test_a_lone_node_goes_bus_off_and_recovers() [io, mutate]
+    test.case("with nobody to acknowledge, every send is an error until the node is bus-off, queues are flushed, transmit is refused, and recovery brings it back")
+    let c = canloop.reset(canloop.LOOP_ALONE)
+    canloop.set_error_frames(true)
+    for i in 0..40
+        let _ = c.can_transmit(canframe.frame(0x30, 0, 0))
+        canloop.run()
+    test.assert_eq(canbus.state_of(c.can_bus_state()), canbus.CAN_STATE_BUS_OFF)
+    test.assert_eq(canloop.pending_tx(), 0)
+    let a = c.can_transmit(canframe.frame(0x30, 0, 0))
+    test.assert_eq(canhal.tx_status(a), canhal.CAN_TX_BUS_OFF)
+    test.assert(canhal.tx_fault(a) == Some(CanBusOff))
+    test.assert(c.can_recover() == None)
+    test.assert(canbus.may_transmit(c.can_bus_state()))
+    test.assert(c.can_recover() == None)
+    canloop.set_error_frames(false)
+    canloop.set_mode(canloop.LOOP_INTERNAL)
+
+@test
+fn test_a_full_set_of_mailboxes_displaces_the_loser_or_refuses() [io, mutate]
+    test.case("a frame that wins arbitration over the worst pending one takes its mailbox; one that loses to all is refused as full")
+    let c = canloop.reset(canloop.LOOP_INTERNAL)
+    let _ = c.can_transmit(canframe.frame(0x300, 0, 0))
+    let _ = c.can_transmit(canframe.frame(0x400, 0, 0))
+    let _ = c.can_transmit(canframe.frame(0x500, 0, 0))
+    let win = c.can_transmit(canframe.frame(0x100, 0, 0))
+    test.assert(canhal.tx_ok(win))
+    test.assert(canhal.accepted_displaced(win) >= 0)
+    let lose = c.can_transmit(canframe.frame(0x7F0, 0, 0))
+    test.assert_eq(canhal.tx_status(lose), canhal.CAN_TX_FULL)
