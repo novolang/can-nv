@@ -1,0 +1,116 @@
+// canframe_edges_tests.nv — frames at the limits of their fields:
+// byte access out of range, the arbitration key of every format, the
+// validity check, the fault words, signal extraction and the FD
+// length table.
+
+use std.test
+use canframe
+use canerr
+
+@test
+fn test_a_byte_outside_the_payload_changes_nothing() [io]
+    test.case("an index below 0 or past 7 is ignored on a frame, a packed word and a read")
+    let f = canframe.frame(0x123, 2, 0x2211)
+    let g = canframe.frame_with_byte(f, 8, 0xFF)
+    test.assert_eq(canframe.frame_data(g), 0x2211)
+    test.assert_eq(canframe.frame_data(canframe.frame_with_byte(f, 0 - 1, 0xFF)), 0x2211)
+    test.assert_eq(canframe.byte_of(0x1122, 0 - 1), 0)
+    test.assert_eq(canframe.byte_of(0x1122, 8), 0)
+    test.assert_eq(canframe.with_byte(0x1122, 8, 0xFF), 0x1122)
+    test.assert_eq(canframe.with_byte(0x1122, 0 - 1, 0xFF), 0x1122)
+    let h = canframe.frame_with_byte(f, 4, 0x55)
+    test.assert_eq(canframe.frame_len(h), 5)
+
+@test
+fn test_the_arbitration_key_orders_every_format() [io]
+    test.case("a lower identifier wins, a data frame beats a remote request, a standard frame beats an extended one with the same base")
+    let std = canframe.arbitration_key(canframe.frame(0x100, 0, 0))
+    let std_rtr = canframe.arbitration_key(canframe.remote_frame(0x100, 0))
+    let ext = canframe.arbitration_key(canframe.frame_ext(0x100 << 18, 0, 0))
+    let ext_rtr = canframe.arbitration_key(canframe.remote_frame_ext(0x100 << 18, 0))
+    test.assert(std < std_rtr)
+    test.assert(std_rtr < ext)
+    test.assert(ext < ext_rtr)
+    test.assert(canframe.wins_arbitration(canframe.frame(0x100, 0, 0), canframe.frame(0x200, 0, 0)))
+
+@test
+fn test_check_frame_refuses_each_field_out_of_range() [io]
+    test.case("identifier too wide in either format, a negative identifier, a length past eight, a remote frame with a payload")
+    test.assert(canframe.check_frame(canframe.frame(0x7FF, 8, 0)) == None)
+    test.assert(canframe.check_frame(canframe.frame_ext(0x1FFFFFFF, 8, 0)) == None)
+    test.assert(canframe.check_frame(CanFrame { id: 0x1FFFFFFF + 1, flags: canframe.CAN_FLAG_EXTENDED, len: 0, data: 0 }) == Some(CanIdTooWide(0x20000000, true)))
+    test.assert(canframe.check_frame(CanFrame { id: 0 - 1, flags: canframe.CAN_FLAG_EXTENDED, len: 0, data: 0 }) == Some(CanIdTooWide(0 - 1, true)))
+    test.assert(canframe.check_frame(CanFrame { id: 0x800, flags: 0, len: 0, data: 0 }) == Some(CanIdTooWide(0x800, false)))
+    test.assert(canframe.check_frame(CanFrame { id: 0x1, flags: 0, len: 9, data: 0 }) == Some(CanLengthTooLong(9)))
+    test.assert(canframe.check_frame(CanFrame { id: 0x1, flags: 0, len: 0 - 1, data: 0 }) == Some(CanLengthTooLong(0 - 1)))
+    test.assert(canframe.check_frame(CanFrame { id: 0x1, flags: canframe.CAN_FLAG_RTR, len: 2, data: 5 }) == Some(CanRemoteWithPayload(1)))
+
+@test
+fn test_a_fault_names_its_reason() [io]
+    test.case("each fault code answers its error; a real frame has code 0 and no error")
+    test.assert_eq(canframe.fault_code(canframe.frame(1, 0, 0)), 0)
+    test.assert(canframe.fault_of(canframe.frame(1, 0, 0)) == None)
+    test.assert(canframe.fault_of(canframe.fault(canframe.CAN_FAULT_ID_TOO_WIDE)) == Some(CanIdTooWide(0, false)))
+    test.assert(canframe.fault_of(canframe.fault(canframe.CAN_FAULT_BAD_LENGTH)) == Some(CanLengthTooLong(0)))
+    test.assert(canframe.fault_of(canframe.fault(canframe.CAN_FAULT_REFUSED)) == Some(CanSocketRefused("the controller or the socket refused")))
+    test.assert(canframe.fault_of(canframe.fault(canframe.CAN_FAULT_DISCONNECTED)) == Some(CanSocketRefused("the peer went away")))
+    test.assert(canframe.fault_of(canframe.fault(canframe.CAN_FAULT_MALFORMED)) == Some(CanBadLogLine(0)))
+    test.assert(canframe.is_frame(canframe.none()) == false)
+
+@test
+fn test_a_signal_outside_the_payload_is_zero() [io]
+    test.case("negative start, zero length and a field that runs past bit 64 read 0, in both byte orders; a 64-bit field reads whole")
+    let d = canframe.pack8(1, 2, 3, 4, 5, 6, 7, 8)
+    test.assert_eq(canframe.signal_le(d, 0 - 1, 4), 0)
+    test.assert_eq(canframe.signal_le(d, 0, 0), 0)
+    test.assert_eq(canframe.signal_le(d, 60, 8), 0)
+    test.assert_eq(canframe.signal_le(d, 0, 64), d)
+    test.assert_eq(canframe.signal_le(d, 8, 8), 2)
+    test.assert_eq(canframe.signal_be(d, 0 - 1, 4), 0)
+    test.assert_eq(canframe.signal_be(d, 0, 0), 0)
+    test.assert_eq(canframe.signal_be(d, 60, 8), 0)
+    test.assert_eq(canframe.signal_be(d, 0, 64), 0x0102030405060708)
+    test.assert_eq(canframe.signal_be(d, 0, 8), 1)
+
+@test
+fn test_the_fd_length_table_in_both_directions() [io]
+    test.case("every DLC above 8 names its length, lengths between rungs pad up, and a length past 64 has no encoding")
+    test.assert_eq(canframe.dlc_for(0 - 1), 0 - 1)
+    test.assert_eq(canframe.dlc_for(8), 8)
+    test.assert_eq(canframe.dlc_for(12), 9)
+    test.assert_eq(canframe.dlc_for(16), 10)
+    test.assert_eq(canframe.dlc_for(20), 11)
+    test.assert_eq(canframe.dlc_for(24), 12)
+    test.assert_eq(canframe.dlc_for(32), 13)
+    test.assert_eq(canframe.dlc_for(48), 14)
+    test.assert_eq(canframe.dlc_for(64), 15)
+    test.assert_eq(canframe.dlc_for(13), 0 - 1)
+    test.assert_eq(canframe.fd_len_for_dlc(0 - 1), 0)
+    test.assert_eq(canframe.fd_len_for_dlc(5), 5)
+    test.assert_eq(canframe.fd_len_for_dlc(9), 12)
+    test.assert_eq(canframe.fd_len_for_dlc(10), 16)
+    test.assert_eq(canframe.fd_len_for_dlc(11), 20)
+    test.assert_eq(canframe.fd_len_for_dlc(12), 24)
+    test.assert_eq(canframe.fd_len_for_dlc(13), 32)
+    test.assert_eq(canframe.fd_len_for_dlc(14), 48)
+    test.assert_eq(canframe.fd_len_for_dlc(15), 64)
+    test.assert_eq(canframe.classic_len_for_dlc(0 - 1), 0)
+    test.assert_eq(canframe.classic_len_for_dlc(12), 8)
+    test.assert_eq(canframe.classic_len_for_dlc(3), 3)
+    test.assert_eq(canframe.fd_padded_len(5), 5)
+    test.assert_eq(canframe.fd_padded_len(13), 16)
+    test.assert_eq(canframe.fd_padded_len(60), 64)
+    test.assert_eq(canframe.fd_padded_len(65), 0 - 1)
+    test.assert(canframe.fd_len_is_valid(20))
+    test.assert(canframe.fd_len_is_valid(21) == false)
+    test.assert_eq(canframe.fd_dlc(canframe.fd_frame(0x1, 13, false)), 10)
+
+@test
+fn test_check_fd_frame_refuses_each_field_out_of_range() [io]
+    test.case("identifier too wide in either format and a length no DLC encodes")
+    test.assert(canframe.check_fd_frame(canframe.fd_frame(0x7FF, 64, false)) == None)
+    test.assert(canframe.check_fd_frame(canframe.fd_frame_ext(0x1FFFFFFF, 12, true)) == None)
+    test.assert(canframe.check_fd_frame(CanFdFrame { id: 0x20000000, flags: canframe.CAN_FD_FLAG_FD | canframe.CAN_FLAG_EXTENDED, len: 8 }) == Some(CanIdTooWide(0x20000000, true)))
+    test.assert(canframe.check_fd_frame(CanFdFrame { id: 0 - 1, flags: canframe.CAN_FD_FLAG_FD | canframe.CAN_FLAG_EXTENDED, len: 8 }) == Some(CanIdTooWide(0 - 1, true)))
+    test.assert(canframe.check_fd_frame(CanFdFrame { id: 0x800, flags: canframe.CAN_FD_FLAG_FD, len: 8 }) == Some(CanIdTooWide(0x800, false)))
+    test.assert(canframe.check_fd_frame(canframe.fd_frame(0x1, 13, false)) != None)
