@@ -1,0 +1,237 @@
+// cansocket_wire_tests.nv — the wire layout and the socket calls that
+// need no interface.
+//
+// A socket opened on every interface (`open_all`) binds to index 0, so
+// it exists on any Linux host with AF_CAN and carries no frames:
+// every option call, every empty receive and every refused write
+// below runs there.  Calls that need an interface to exist are in
+// tests/socketcan.sh, which runs them on a virtual one.
+
+use std.test
+use std.bytes
+use std.str
+use cansocket
+use canframe
+use canfilter
+use canbus
+use canerr
+
+// A frame as the sixteen bytes `frame_to_wire` writes.
+fn wire_of(f: CanFrame) -> [u8]
+    var out: [u8] = []
+    for i in 0..16
+        list.push(out, cansocket.frame_to_wire(f, i) as u8)
+    out
+
+fn is_err(e: ?CanError) -> Bool
+    match e
+        Some(_) => true
+        None    => false
+
+@test
+fn test_a_byte_outside_the_sixteen_is_zero() [io]
+    test.case("an index below zero or past the structure answers 0 rather than reading beyond it")
+    let f = canframe.frame(0x123, 3, 0x332211)
+    test.assert_eq(cansocket.frame_to_wire(f, 0 - 1), 0)
+    test.assert_eq(cansocket.frame_to_wire(f, 16), 0)
+    test.assert_eq(cansocket.frame_to_wire(f, 5), 0)
+    test.assert_eq(cansocket.frame_to_wire(f, 7), 0)
+
+@test
+fn test_a_remote_frame_carries_the_rtr_bit() [io]
+    test.case("bit 30 of the identifier word marks a remote request")
+    let r = canframe.remote_frame(0x123, 4)
+    test.assert_eq(cansocket.frame_to_wire(r, 3), 0x40)
+    let re = canframe.remote_frame_ext(0x123, 4)
+    test.assert_eq(cansocket.frame_to_wire(re, 3), 0xC0)
+
+@test
+fn test_a_frame_survives_the_wire_in_every_format() [io]
+    test.case("standard, extended, remote and extended remote read back as they were written")
+    let std = canframe.frame(0x123, 3, 0x332211)
+    let a = cansocket.frame_from_wire(wire_of(std), 0)
+    test.assert_eq(canframe.frame_id(a), 0x123)
+    test.assert_eq(canframe.frame_len(a), 3)
+    test.assert_eq(canframe.frame_byte(a, 2), 0x33)
+    test.assert(canframe.is_extended(a) == false)
+
+    let ext = canframe.frame_ext(0x1ABCDEF, 2, 0x4433)
+    let b = cansocket.frame_from_wire(wire_of(ext), 0)
+    test.assert(canframe.is_extended(b))
+    test.assert_eq(canframe.frame_id(b), 0x1ABCDEF)
+    test.assert_eq(canframe.frame_byte(b, 1), 0x44)
+
+    let r = cansocket.frame_from_wire(wire_of(canframe.remote_frame(0x55, 2)), 0)
+    test.assert(canframe.is_remote(r))
+    test.assert(canframe.is_extended(r) == false)
+    test.assert_eq(canframe.frame_id(r), 0x55)
+
+    let re = cansocket.frame_from_wire(wire_of(canframe.remote_frame_ext(0x155, 2)), 0)
+    test.assert(canframe.is_remote(re))
+    test.assert(canframe.is_extended(re))
+    test.assert_eq(canframe.frame_id(re), 0x155)
+
+@test
+fn test_too_few_bytes_read_as_a_zeroed_frame() [io]
+    test.case("a negative offset and a short buffer both answer the zeroed frame, and check_wire says how many bytes there were")
+    let short: [u8] = [1 as u8, 2 as u8, 3 as u8]
+    let z = cansocket.frame_from_wire(short, 0)
+    test.assert_eq(canframe.frame_id(z), 0)
+    test.assert_eq(canframe.frame_len(z), 0)
+    let n = cansocket.frame_from_wire(wire_of(canframe.frame(0x10, 1, 7)), 0 - 1)
+    test.assert_eq(canframe.frame_len(n), 0)
+    match cansocket.check_wire(short, 0)
+        Some(CanShortWire(have)) => test.assert_eq(have, 3)
+        _ => test.assert(false)
+    match cansocket.check_wire(short, 9)
+        Some(CanShortWire(have)) => test.assert_eq(have, 0)
+        _ => test.assert(false)
+    test.assert(is_err(cansocket.check_wire(wire_of(canframe.frame(1, 0, 0)), 0)) == false)
+
+@test
+fn test_a_length_byte_past_eight_is_clamped() [io]
+    test.case("a classic frame never claims more than eight payload bytes, whatever the byte says")
+    var w = wire_of(canframe.frame(0x10, 8, 0))
+    w[4] = 15 as u8
+    let f = cansocket.frame_from_wire(w, 0)
+    test.assert_eq(canframe.frame_len(f), 8)
+
+@test
+fn test_an_error_frame_maps_its_class_and_protocol_bits() [io]
+    test.case("SocketCAN's error identifier and payload become this package's CAN_ERR_* kinds, and back")
+    let kinds = canbus.CAN_ERR_ACK | canbus.CAN_ERR_BIT | canbus.CAN_ERR_FORM | canbus.CAN_ERR_STUFF | canbus.CAN_ERR_CRC
+    let e = CanFrame { id: kinds, flags: canframe.CAN_FLAG_ERROR, len: 8, data: 0 }
+    let w = wire_of(e)
+    test.assert_eq(w[3] as Int & 0x20, 0x20)
+    test.assert_eq(w[0] as Int, 0x28)
+    test.assert_eq(w[10] as Int, 0x07)
+    test.assert_eq(w[11] as Int, 0x08)
+    let back = cansocket.frame_from_wire(w, 0)
+    test.assert(canframe.is_error_frame(back))
+    test.assert_eq(canframe.frame_id(back), kinds)
+
+    let ack = CanFrame { id: canbus.CAN_ERR_ACK, flags: canframe.CAN_FLAG_ERROR, len: 8, data: 0 }
+    test.assert_eq(wire_of(ack)[0] as Int, 0x20 & 0xFF)
+    test.assert_eq(wire_of(ack)[10] as Int, 0)
+    test.assert_eq(wire_of(ack)[11] as Int, 0)
+
+@test
+fn test_an_fd_header_reads_its_flags() [io]
+    test.case("extended identifier, bit-rate switch and error-state indicator come out of the identifier word and the flags byte")
+    var w: [u8] = []
+    for i in 0..72
+        list.push(w, 0 as u8)
+    w[0] = 0x56 as u8
+    w[1] = 0x34 as u8
+    w[2] = 0x12 as u8
+    w[3] = 0x80 as u8
+    w[4] = 12 as u8
+    w[5] = 0x03 as u8
+    let f = cansocket.fd_frame_from_wire(w, 0)
+    test.assert(canframe.fd_is_extended(f))
+    test.assert(canframe.fd_has_brs(f))
+    test.assert(canframe.fd_has_esi(f))
+    test.assert_eq(canframe.fd_id(f), 0x123456)
+    test.assert_eq(canframe.fd_len(f), 12)
+    w[3] = 0 as u8
+    w[5] = 0 as u8
+    let g = cansocket.fd_frame_from_wire(w, 0)
+    test.assert(canframe.fd_is_extended(g) == false)
+    test.assert(canframe.fd_has_brs(g) == false)
+    test.assert_eq(canframe.fd_id(g), 0x456)
+    let short: [u8] = [0 as u8]
+    test.assert_eq(canframe.fd_len(cansocket.fd_frame_from_wire(short, 0)), 0)
+    test.assert_eq(canframe.fd_len(cansocket.fd_frame_from_wire(w, 0 - 1)), 0)
+
+fn payload(i: Int) -> Int [mutate]
+    0x40 + i
+
+@test
+fn test_an_fd_frame_writes_seventy_two_bytes() [io, mutate]
+    test.case("identifier word, length, flags byte, two zero bytes and the caller's payload up to the length")
+    let f = canframe.fd_frame_ext(0x123456, 10, true)
+    test.assert_eq(cansocket.fd_frame_to_wire(f, payload, 0 - 1), 0)
+    test.assert_eq(cansocket.fd_frame_to_wire(f, payload, 72), 0)
+    test.assert_eq(cansocket.fd_frame_to_wire(f, payload, 0), 0x56)
+    test.assert_eq(cansocket.fd_frame_to_wire(f, payload, 3), 0x80)
+    test.assert_eq(cansocket.fd_frame_to_wire(f, payload, 4), 10)
+    test.assert_eq(cansocket.fd_frame_to_wire(f, payload, 5), 0x05)
+    test.assert_eq(cansocket.fd_frame_to_wire(f, payload, 6), 0)
+    test.assert_eq(cansocket.fd_frame_to_wire(f, payload, 8), 0x40)
+    test.assert_eq(cansocket.fd_frame_to_wire(f, payload, 17), 0x49)
+    test.assert_eq(cansocket.fd_frame_to_wire(f, payload, 18), 0)
+    let s = canframe.fd_frame(0x123, 8, false)
+    test.assert_eq(cansocket.fd_frame_to_wire(s, payload, 3), 0)
+    test.assert_eq(cansocket.fd_frame_to_wire(s, payload, 5), 0x04)
+    let e = CanFdFrame { id: 0x7, flags: canframe.CAN_FD_FLAG_FD | canframe.CAN_FD_FLAG_ESI, len: 8 }
+    test.assert_eq(cansocket.fd_frame_to_wire(e, payload, 5), 0x06)
+
+// ── Sockets that need no interface ───────────────────────────────────
+
+@test
+fn test_a_socket_on_every_interface_answers_its_properties() [io, net, fs]
+    test.case("open_all binds index 0: no interface name, no FD, a descriptor, and close twice is not an error")
+    match cansocket.open_all()
+        Ok(s) =>
+            test.assert_eq(cansocket.interface_of(s), "")
+            test.assert(cansocket.carries_fd(s) == false)
+            test.assert(cansocket.fd_of(s) >= 0)
+            test.assert(is_err(cansocket.close(s)) == false)
+            test.assert(is_err(cansocket.close(s)) == false)
+        Err(_) => test.assert(false)
+
+@test
+fn test_the_options_of_a_raw_socket_are_taken() [io, net, fs]
+    test.case("filters of every shape, the error mask, loop-back and receive-own are accepted by the kernel")
+    match cansocket.open_all()
+        Ok(s) =>
+            let fs_ = [canfilter.exact(0x123),
+                       canfilter.filter(0x100, 0x700),
+                       canfilter.exact_ext(0x1ABCDEF),
+                       canfilter.list(0x10, 0x20),
+                       canfilter.list_ext(0x100, 0x200),
+                       canfilter.inverted(canfilter.exact(0x7FF)),
+                       canfilter.allowing_remote(canfilter.exact(0x55))]
+            test.assert(is_err(cansocket.set_filters(s, fs_)) == false)
+            test.assert(is_err(cansocket.set_filters(s, [])) == false)
+            test.assert(is_err(cansocket.set_error_mask(s, canbus.CAN_ERR_ACK | canbus.CAN_ERR_CRC)) == false)
+            test.assert(is_err(cansocket.set_loopback(s, true)) == false)
+            test.assert(is_err(cansocket.set_loopback(s, false)) == false)
+            test.assert(is_err(cansocket.set_receive_own(s, true)) == false)
+            test.assert(is_err(cansocket.set_receive_own(s, false)) == false)
+            let _ = cansocket.close(s)
+        Err(_) => test.assert(false)
+
+@test
+fn test_an_empty_socket_reports_nothing_and_a_write_is_refused() [io, net, fs]
+    test.case("a receive with no frame is none rather than a fault; receive_into counts 0; a write with no interface is refused")
+    match cansocket.open_all()
+        Ok(s) =>
+            test.assert(is_err(cansocket.set_receive_timeout(s, 0)) == false)
+            test.assert(canframe.is_none(cansocket.receive(s)))
+            test.assert(canframe.is_none(cansocket.receive_from(s)))
+            var dst: Vec[u8; 72] = Vec.new()
+            match cansocket.receive_into(s, var dst)
+                Ok(n) => test.assert_eq(n, 0)
+                Err(_) => test.assert(false)
+            test.assert(is_err(cansocket.set_receive_timeout(s, 1)) == false)
+            test.assert(canframe.is_none(cansocket.receive(s)))
+            test.assert(cansocket.last_interface_index(s) >= 0)
+            test.assert(is_err(cansocket.send(s, canframe.frame(0x1, 1, 7))))
+            test.assert(cansocket.send_fd(s, canframe.fd_frame(0x1, 12, false), payload) == Some(CanFdNotSupported))
+            let _ = cansocket.close(s)
+        Err(_) => test.assert(false)
+
+@test
+fn test_an_interface_index_names_the_interface() [io, fs]
+    test.case("index 0 is every interface, the loop-back device is index 1 on a host, and an index nobody holds is refused by number")
+    match cansocket.interface_name(0)
+        Ok(n) => test.assert_eq(n, "")
+        Err(_) => test.assert(false)
+    match cansocket.interface_name(1)
+        Ok(n) => test.assert(str.len(n) > 0)
+        Err(_) => test.assert(false)
+    match cansocket.interface_name(0x7FFFFFF)
+        Ok(_) => test.assert(false)
+        Err(e) => test.assert(e == CanNoSuchInterface("#134217727"))
+    test.assert(cansocket.is_virtual("lo") == false)
