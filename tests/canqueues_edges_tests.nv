@@ -1,0 +1,82 @@
+// canqueues_edges_tests.nv — the transmit queue and the receive ring at
+// their bounds: zero capacity, a negative request, full, empty, a
+// head that has wrapped past the end of the caller's array.
+
+use std.test
+use canframe
+use cantxq
+use canring
+use canerr
+
+@test
+fn test_a_negative_capacity_is_an_empty_queue_that_holds_nothing() [io]
+    test.case("capacity is clamped to 0; such a queue is empty and full at once, refuses to enqueue and keeps its slot at 0")
+    let q = cantxq.queue(0 - 4)
+    test.assert_eq(cantxq.capacity(q), 0)
+    test.assert(cantxq.is_empty(q))
+    test.assert(cantxq.is_full(q))
+    test.assert_eq(cantxq.enqueue_at(q), 0 - 1)
+    test.assert_eq(cantxq.len(cantxq.enqueued(q)), 0)
+    test.assert(cantxq.check_enqueue(q, canframe.frame(1, 0, 0)) == Some(CanQueueFull(0)))
+    let r = canring.ring(0 - 4)
+    test.assert_eq(canring.ring_capacity(r), 0)
+    test.assert(canring.ring_is_full(r))
+    test.assert(canring.ring_is_empty(r))
+    test.assert_eq(canring.ring_len(canring.put(r)), 0)
+
+@test
+fn test_a_full_queue_does_not_grow_and_a_frame_check_comes_first() [io]
+    test.case("enqueued on a full queue answers the same queue; an invalid frame is named before a full queue")
+    var q = cantxq.queue(2)
+    q = cantxq.enqueued(cantxq.enqueued(q))
+    test.assert(cantxq.is_full(q))
+    test.assert_eq(cantxq.len(cantxq.enqueued(q)), 2)
+    test.assert(cantxq.check_enqueue(q, canframe.frame(1, 0, 0)) == Some(CanQueueFull(2)))
+    test.assert(cantxq.check_enqueue(q, canframe.frame(0x800, 0, 0)) == Some(CanIdTooWide(0x800, false)))
+    test.assert(cantxq.check_enqueue(cantxq.queue(2), canframe.frame(1, 0, 0)) == None)
+
+fn id_of(i: Int) -> Int
+    0x100 + i
+
+@test
+fn test_slots_wrap_past_the_end_of_the_array() [io]
+    test.case("after the head has moved, the oldest frames sit at the end and the newest at the start, and lookups follow the wrap")
+    var q = cantxq.queue(3)
+    for _i in 0..3
+        q = cantxq.enqueued(q)
+    // hand the oldest to the controller twice, then add two more: the head is 2
+    q = cantxq.dequeued(q, cantxq.dequeue_fifo_index(q))
+    q = cantxq.dequeued(q, cantxq.dequeue_fifo_index(q))
+    q = cantxq.enqueued(q)
+    q = cantxq.enqueued(q)
+    test.assert_eq(cantxq.len(q), 3)
+    test.assert_eq(cantxq.dequeue_fifo_index(q), 2)
+    test.assert_eq(cantxq.enqueue_at(cantxq.dequeued(q, 2)), 2)
+    // a slot the queue does not hold is left alone
+    test.assert_eq(cantxq.len(cantxq.dequeued(q, 7)), 3)
+    test.assert_eq(cantxq.len(cantxq.dequeued(q, 0 - 1)), 3)
+    test.assert_eq(cantxq.len(cantxq.dequeued(cantxq.queue(3), 0)), 0)
+    // the id lookup reads through the wrap
+    test.assert(cantxq.holds_id(q, 0x100 + 0, id_of))
+    test.assert(cantxq.holds_id(q, 0x900, id_of) == false)
+    test.assert_eq(cantxq.index_of_id(q, 0x100 + 1, id_of), 1)
+    test.assert_eq(cantxq.index_of_id(q, 0x900, id_of), 0 - 1)
+    test.assert_eq(cantxq.len(cantxq.cleared(q)), 0)
+    test.assert_eq(cantxq.dropped(cantxq.dropped_one(q)), 1)
+
+@test
+fn test_an_empty_ring_gives_nothing_and_a_full_one_counts_overruns() [io]
+    test.case("take_at on empty is -1 and taken is a no-op; put on full is a no-op and overran counts the loss; the head wraps")
+    var r = canring.ring(2)
+    test.assert_eq(canring.take_at(r), 0 - 1)
+    test.assert_eq(canring.ring_len(canring.taken(r)), 0)
+    r = canring.put(canring.put(r))
+    test.assert(canring.ring_is_full(r))
+    test.assert_eq(canring.ring_len(canring.put(r)), 2)
+    r = canring.overran(r)
+    test.assert_eq(canring.ring_overruns(r), 1)
+    r = canring.taken(r)
+    r = canring.put(r)
+    test.assert_eq(canring.take_at(r), 1)
+    test.assert_eq(canring.put_at(canring.taken(r)), 1)
+    test.assert_eq(canring.ring_len(canring.emptied(r)), 0)
