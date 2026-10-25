@@ -15,6 +15,7 @@
 use std.test
 use canisotp
 use canframe
+use canerr
 
 // Whether a check refused.  An optional is matched rather than
 // compared, so the two-line helper is what every assertion below

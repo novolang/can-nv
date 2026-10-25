@@ -14,6 +14,7 @@
 use std.test
 use canbus
 use canframe
+use canerr
 
 // Whether a check refused.  An optional is matched rather than
 // compared, so the two-line helper is what every assertion below
@@ -160,8 +161,11 @@ fn test_a_clock_that_cannot_produce_the_rate_is_refused() [io]
     test.assert(canbus.time_quanta(8000000, 500000) > 0)
     test.assert(refused(canbus.check_timing(8000000, 500000)) == false)
 
-    test.assert_eq(canbus.time_quanta(7000000, 500000), 0 - 1)
-    test.assert(refused(canbus.check_timing(7000000, 500000)))
+    // 7.3728 MHz, a UART crystal: 14.75 clocks a bit, so no whole number
+    // of quanta makes 500 kbit/s to within 0.1 per cent.  (7 MHz does:
+    // fourteen quanta of one clock each.)
+    test.assert_eq(canbus.time_quanta(7372800, 500000), 0 - 1)
+    test.assert(refused(canbus.check_timing(7372800, 500000)))
 
 @test
 fn test_a_state_read_from_a_controllers_registers_is_the_same_type() [io]

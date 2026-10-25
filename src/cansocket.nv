@@ -387,11 +387,11 @@ fn set_filters(s: CanSocket, filters: [CanFilter]) -> ?CanError [net]
     var at = 0
     for f in filters
         if canfilter.filter_is_list(f)
-            b = put_kernel_filter(b, at, canfilter.filter_id(f), full_mask(f), f)
-            b = put_kernel_filter(b, at + 8, canfilter.filter_mask(f), full_mask(f), f)
+            b = put_kernel_filter(var b, at, canfilter.filter_id(f), full_mask(f), f)
+            b = put_kernel_filter(var b, at + 8, canfilter.filter_mask(f), full_mask(f), f)
             at = at + 16
         else
-            b = put_kernel_filter(b, at, canfilter.filter_id(f), canfilter.filter_mask(f), f)
+            b = put_kernel_filter(var b, at, canfilter.filter_id(f), canfilter.filter_mask(f), f)
             at = at + 8
     option(s, CAN_RAW_FILTER, b)
 

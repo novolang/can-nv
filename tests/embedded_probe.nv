@@ -16,22 +16,15 @@
 // it.  All three are `@value` structs of machine words in the caller's
 // own frame, which is the property this file exists to keep true.
 //
-// WHAT IS DELIBERATELY OUT.  `cansocket` is `host` and named in the
-// manifest's `host_modules`, so the audit leaves it behind.
-// `cantxq`, `canbus`, `candump` and `canhal` are `core` and check
-// clean at the embedded tier too; they are not named here because this
-// file covers the receive path an interrupt handler runs.
+// WHAT IS DELIBERATELY OUT.  `cansocket` performs on a host and is
+// built at `@tier(app)`; `candump` renders text and is `@tier(rt)`.
+// The loopback controller, the drivers, the queue, the ring and the
+// bit-timing solver build for a device too, and the example programs
+// under `examples/embedded/can_demo` run them; this probe keeps to the
+// three modules a receive interrupt runs.
 //
-// THE PROBE NAMES ONLY THIS PACKAGE'S TYPES.
-//
-// WHAT THE TIER ACTUALLY CHECKS AT 0.0.1 is narrower than it will be.
-// Every body under `src/` is a `todo()`, so what links today is the
-// SIGNATURES and the types: `@value` structs of `Int` and `Bool` in
-// and out, with no allocator anywhere in the shape.  There is no
-// arithmetic in the binary yet, so this probe does not prove a frame
-// is filtered without allocating; it proves that nothing in the shape
-// of the surface needs an allocator or a host.  Keeping it green once
-// the bodies land is a named cost of the implementation step.
+// The build is also a run: `tests/orbit/test_can_nv_qemu.sh` boots the
+// image on the emulated AN386 and reads its one line.
 
 use canframe
 use canfilter
@@ -195,12 +188,12 @@ fn score() -> Int
 @tier(rt)
 fn main() [hw, time]
     bsp.board.init()
-    // 40 is the number of checks in `score` on the path a linked build
+    // 44 is the number of checks in `score` on the path a linked build
     // takes.  The count is printed on a failure rather than only
     // compared, so a device that disagrees with the host says HOW MANY
     // it lost and a bisect has somewhere to start.
     let n = score()
-    if n == 40
+    if n == 44
         hal.uart.write("PASS: can-embedded\n")
     else
         hal.uart.write("FAIL: can-embedded\n")

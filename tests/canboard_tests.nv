@@ -1,0 +1,70 @@
+// canboard_tests — the board's controller behind CanPeripheral, on the
+// host.
+//
+// The frame conversions are checked both ways for each kind of frame.
+// The host has no CAN controller: `hal.can` refuses the open and the
+// send, receives nothing, and reads the counters as 0, so `CanBoard`
+// answers each method's refusal or its empty answer.  On a board the
+// same calls reach the controller; tests/can.sh of the FRDM-MCXN947
+// runs them there.
+
+use std.test
+use embedded_hal.{ BoardCan, CanBusFrame }
+use canframe
+use canfilter
+use canbus
+use canhal
+use canboard
+use canboard.{ CanBoard }
+
+@test
+fn test_a_standard_data_frame_crosses_both_ways() [io]
+    let f = canframe.frame(0x123, 3, 0x332211)
+    let b = canboard.to_bus_frame(f)
+    test.assert(b.id == 0x123 and not b.extended and not b.remote and b.len == 3)
+    test.assert(b.data == 0x332211)
+    let back = canboard.of_bus_frame(b)
+    test.assert(canframe.frame_id(back) == 0x123)
+    test.assert(canframe.frame_byte(back, 2) == 0x33)
+    test.assert(not canframe.is_extended(back))
+
+@test
+fn test_an_extended_data_frame_crosses_both_ways() [io]
+    let b = canboard.to_bus_frame(canframe.frame_ext(0x18DAF110, 8, -1))
+    test.assert(b.extended and b.len == 8 and b.data == -1)
+    let back = canboard.of_bus_frame(b)
+    test.assert(canframe.is_extended(back))
+    test.assert(canframe.frame_id(back) == 0x18DAF110)
+
+@test
+fn test_remote_frames_cross_both_ways() [io]
+    let b = canboard.to_bus_frame(canframe.remote_frame(0x7FF, 4))
+    test.assert(b.remote and not b.extended and b.len == 4)
+    test.assert(canframe.is_remote(canboard.of_bus_frame(b)))
+    let e = canboard.of_bus_frame(CanBusFrame { id: 0x1FFFFFFF, extended: true, remote: true, len: 0, data: 0 })
+    test.assert(canframe.is_remote(e) and canframe.is_extended(e))
+    test.assert(canframe.frame_id(e) == 0x1FFFFFFF)
+
+@test
+fn test_the_host_has_no_controller_to_open() [io, hw]
+    let c = canboard.board_open(0, 500000, true)
+    test.assert(not canboard.board_started(c))
+    test.assert(canboard.board_bitrate(c) == 0)
+
+@test
+fn test_the_board_controller_answers_as_absent_hardware() [io, hw]
+    let c = CanBoard { bus: BoardCan { id: 0 } }
+    // The send is refused by the hook, which reads as a full mailbox.
+    test.assert(canhal.tx_status(c.can_transmit(canframe.frame(0x100, 1, 7))) == canhal.CAN_TX_FULL)
+    test.assert(canhal.tx_status(c.can_transmit(canframe.frame(0x800, 1, 7))) == canhal.CAN_TX_REFUSED)
+    test.assert(not c.can_tx_done(0))
+    test.assert(not c.can_tx_done(1))
+    test.assert(c.can_tx_abort(0) != None)
+    test.assert(canframe.is_none(c.can_receive()))
+    test.assert(c.can_set_filter(0, canfilter.accept_all()) != None)
+    test.assert(c.can_filter_slots() == 0)
+    test.assert(canbus.tx_errors(c.can_bus_state()) == 0)
+    test.assert(c.can_recover() == None)
+    // The trait's free functions run over it too.
+    test.assert(canframe.is_none(canhal.receive_filtered(c, canfilter.accept_all(), 3)))
+    test.assert(canhal.recover_if_bus_off(c) == None)

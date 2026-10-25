@@ -14,6 +14,7 @@
 use std.test
 use canfilter
 use canframe
+use canerr
 
 // Whether a check refused.  An optional is matched rather than
 // compared, so the two-line helper is what every assertion below
@@ -148,3 +149,22 @@ fn test_overlap_is_not_coverage() [io]
 
     test.assert(canfilter.overlaps(canfilter.exact(0x100),
                                    canfilter.exact(0x200)) == false)
+
+@test
+fn test_a_list_filter_matches_exactly_its_two_identifiers() [io]
+    test.case("a bxCAN bank in list mode and an M_CAN dual-ID element hold two identifiers in one slot")
+    let f = canfilter.list(0x2A0, 0x2A5)
+    test.assert(canfilter.filter_is_list(f))
+    test.assert(canfilter.accepts_id(f, 0x2A0, false))
+    test.assert(canfilter.accepts_id(f, 0x2A5, false))
+    test.assert(canfilter.accepts_id(f, 0x2A1, false) == false)
+    test.assert_eq(canfilter.width(f), 2)
+    let x = canfilter.list_ext(0x18DAF110, 0x18DAF120)
+    test.assert(canfilter.accepts_id(x, 0x18DAF120, true))
+    test.assert(canfilter.accepts_id(x, 0x18DAF120, false) == false)
+    test.case("a mask filter covers a list inside it, and a merge widens the list into one mask")
+    test.assert(canfilter.covers(canfilter.filter(0x2A0, 0x7F0), f))
+    test.assert(canfilter.covers(f, canfilter.exact(0x2A5)))
+    let m = canfilter.merge(f, canfilter.exact(0x2A0))
+    test.assert(canfilter.accepts_id(m, 0x2A5, false))
+    test.assert(canfilter.filter_is_list(m) == false)

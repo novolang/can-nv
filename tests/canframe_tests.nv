@@ -17,6 +17,7 @@
 
 use std.test
 use canframe
+use canerr
 
 // Whether a check refused.  An optional is matched rather than
 // compared, so the two-line helper is what every assertion below
@@ -91,8 +92,14 @@ fn test_the_smaller_identifier_wins_the_bus() [io]
                                           canframe.frame(0x100, 0, 0)) == false)
 
     test.case("a standard identifier beats an extended one sharing its first eleven bits, because the extension bit is recessive")
+    // The first eleven bits of a 29-bit identifier are its top eleven,
+    // so the extended frame that shares 0x123's is 0x123 << 18.
     test.assert(canframe.wins_arbitration(canframe.frame(0x123, 0, 0),
-                                          canframe.frame_ext(0x123, 0, 0)))
+                                          canframe.frame_ext(0x123 << 18, 0, 0)))
+
+    test.case("and an extended identifier whose top eleven bits are smaller wins against a larger standard one")
+    test.assert(canframe.wins_arbitration(canframe.frame_ext(0x123, 0, 0),
+                                          canframe.frame(0x123, 0, 0)))
 
     test.case("and a data frame beats a remote frame with the same identifier, for the same reason")
     test.assert(canframe.wins_arbitration(canframe.frame(0x123, 0, 0),
@@ -107,8 +114,11 @@ fn test_the_arbitration_key_orders_the_same_way_the_bus_does() [io]
 
     test.case("and it agrees with wins_arbitration on every pair, which is what makes it safe to sort by")
     let std_key = canframe.arbitration_key(canframe.frame(0x123, 0, 0))
-    let ext_key = canframe.arbitration_key(canframe.frame_ext(0x123, 0, 0))
+    let ext_key = canframe.arbitration_key(canframe.frame_ext(0x123 << 18, 0, 0))
     test.assert(std_key < ext_key)
+    let rtr_key = canframe.arbitration_key(canframe.remote_frame(0x123, 0))
+    test.assert(std_key < rtr_key)
+    test.assert(rtr_key < ext_key)
 
 @test
 fn test_nothing_arrived_is_not_a_frame_and_says_so() [io]
@@ -217,3 +227,17 @@ fn test_the_flag_bits_do_not_collide() [io]
     test.assert_eq(canframe.CAN_FLAG_ERROR, 0x04)
     test.assert_eq(canframe.CAN_FLAG_NONE, 0x80)
     test.assert_eq(canframe.CAN_FLAG_FAULT, 0x100)
+
+@test
+fn test_an_fd_receive_says_nothing_or_a_refusal_the_same_way() [io]
+    test.assert(canframe.fd_is_none(canframe.fd_none()))
+    test.assert(canframe.fd_is_frame(canframe.fd_none()) == false)
+    let bad = canframe.fd_fault(canframe.CAN_FAULT_BAD_LENGTH)
+    test.assert(canframe.fd_is_fault(bad))
+    test.assert(canframe.fd_is_frame(bad) == false)
+    test.assert(canframe.fd_is_fd(canframe.fd_frame(0x123, 12, false)))
+    test.case("a classic frame received on the FD path keeps its header and has the FD flag clear")
+    let c = canframe.fd_of_classic(canframe.remote_frame_ext(0x18DAF110, 4))
+    test.assert(canframe.fd_is_fd(c) == false)
+    test.assert(canframe.fd_is_extended(c))
+    test.assert_eq(canframe.fd_len(c), 4)

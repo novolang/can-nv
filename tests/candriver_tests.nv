@@ -1,0 +1,37 @@
+// The drivers' handles and the words they program, on the host.
+//
+// The bring-up functions, `canbxcan.start` and `canfdcan.start` and the
+// clock and pin routines beside them, write a controller's registers
+// and run only on a board: `tests/driver_probe.nv` builds them for the
+// STM32F407G-DISC1 and the NUCLEO-H723ZG, and the programs under
+// `examples/embedded/can_demo` run them on the bench.
+
+use std.test
+use canbxcan
+use canfdcan
+
+@test
+fn test_the_bxcan_handles_name_the_f4s_instances() [io]
+    test.case("CAN2's filter banks live in CAN1's block, from bank 14 on")
+    let a = canbxcan.can1()
+    let b = canbxcan.can2()
+    test.assert_eq(a.base, canbxcan.BXCAN1_BASE)
+    test.assert_eq(a.filters, canbxcan.BXCAN1_BASE)
+    test.assert_eq(a.first_bank, 0)
+    test.assert_eq(b.base, canbxcan.BXCAN2_BASE)
+    test.assert_eq(b.filters, canbxcan.BXCAN1_BASE)
+    test.assert_eq(b.first_bank, 14)
+    test.assert_eq(canbxcan.BXCAN1_BASE, 0x40006400)
+    test.assert_eq(canbxcan.BXCAN2_BASE, 0x40006800)
+
+@test
+fn test_the_fdcan_handles_split_the_message_ram() [io]
+    test.case("each instance gets 2 KB of the 10 KB message RAM at 0x4000AC00")
+    let a = canfdcan.fdcan1()
+    let b = canfdcan.fdcan2()
+    test.assert_eq(a.base, 0x4000A000)
+    test.assert_eq(b.base, 0x4000A400)
+    test.assert_eq(a.ram, canfdcan.FDCAN_MESSAGE_RAM)
+    test.assert_eq(b.ram, canfdcan.FDCAN_MESSAGE_RAM + canfdcan.FDCAN_RAM_PER_INSTANCE)
+    test.case("and the layout fits: 28 + 2 × 8 filter words, 16 + 8 elements of 72 bytes")
+    test.assert(28 * 4 + 8 * 8 + (canfdcan.FDCAN_RX_DEPTH + canfdcan.FDCAN_TX_DEPTH) * 72 <= canfdcan.FDCAN_RAM_PER_INSTANCE)

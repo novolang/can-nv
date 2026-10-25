@@ -103,8 +103,8 @@ fn test_a_receive_into_a_buffer_answers_a_count_rather_than_a_frame() [io, net, 
     test.case("the allocation-free path: a capture writer puts the sixteen bytes straight in a file and decodes only if it cares")
     match cansocket.open("vcan0")
         Ok(s)  =>
-            var buf = bytes.cursor_le(bytes.zeros(cansocket.CAN_WIRE_LEN))
-            match cansocket.receive_into(s, buf)
+            var buf: Vec[u8; 72] = Vec.new()
+            match cansocket.receive_into(s, var buf)
                 Ok(n)  => test.assert(n >= 0)
                 Err(_) => test.assert(true)
         Err(_) => test.assert(true)
