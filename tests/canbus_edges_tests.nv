@@ -1,0 +1,103 @@
+// canbus_edges_tests.nv — the error counters at their saturation
+// points, the names of states and error kinds, and the timing solver
+// at the limits of its search.
+
+use std.test
+use canbus
+use canframe
+use canfdcan
+use canfilter
+
+@test
+fn test_every_state_and_error_kind_has_a_name() [io]
+    test.case("four states and five error kinds are named, anything else is 'unknown' or 'no error'")
+    test.assert_eq(canbus.state_name(canbus.CAN_STATE_ERROR_ACTIVE), "error-active")
+    test.assert_eq(canbus.state_name(canbus.CAN_STATE_ERROR_WARNING), "error-warning")
+    test.assert_eq(canbus.state_name(canbus.CAN_STATE_ERROR_PASSIVE), "error-passive")
+    test.assert_eq(canbus.state_name(canbus.CAN_STATE_BUS_OFF), "bus-off")
+    test.assert_eq(canbus.state_name(99), "unknown")
+    test.assert_eq(canbus.error_kind_name(canbus.CAN_ERR_BIT), "bit error")
+    test.assert_eq(canbus.error_kind_name(canbus.CAN_ERR_STUFF), "stuff error")
+    test.assert_eq(canbus.error_kind_name(canbus.CAN_ERR_FORM), "form error")
+    test.assert_eq(canbus.error_kind_name(canbus.CAN_ERR_CRC), "CRC error")
+    test.assert_eq(canbus.error_kind_name(canbus.CAN_ERR_ACK), "acknowledgement error")
+    test.assert_eq(canbus.error_kind_name(0), "no error")
+
+@test
+fn test_the_counters_saturate() [io]
+    test.case("the transmit counter stops at the bus-off limit, the receive counter at 255, and a success never drives either below its floor")
+    var s = canbus.bus_state()
+    for _i in 0..40
+        s = canbus.on_tx_error(s)
+    test.assert_eq(canbus.tx_errors(s), canbus.CAN_BUS_OFF_LIMIT)
+    test.assert_eq(canbus.state_of(s), canbus.CAN_STATE_BUS_OFF)
+    // a success does not lift a bus-off counter
+    test.assert_eq(canbus.tx_errors(canbus.on_tx_success(s)), canbus.CAN_BUS_OFF_LIMIT)
+    test.assert_eq(canbus.tx_errors(canbus.on_tx_success(canbus.bus_state())), 0)
+    var r = canbus.bus_state()
+    for _i in 0..300
+        r = canbus.on_rx_error(r)
+    test.assert_eq(canbus.rx_errors(r), 255)
+    // a received frame drops a passive counter back under the limit
+    test.assert_eq(canbus.rx_errors(canbus.on_rx_success(r)), canbus.CAN_ERROR_PASSIVE_LIMIT - 1)
+    test.assert_eq(canbus.rx_errors(canbus.on_rx_success(canbus.bus_state())), 0)
+    test.assert_eq(canbus.rx_errors(canbus.on_rx_success(canbus.bus_state_of(0, 10))), 9)
+
+@test
+fn test_only_a_bus_off_controller_counts_recovery_sequences() [io]
+    test.case("an error-active controller ignores them; a bus-off one counts 128 and may rejoin")
+    let a = canbus.on_recovery_sequence(canbus.bus_state())
+    test.assert(canbus.may_rejoin(a) == false)
+    var s = canbus.bus_state_of(canbus.CAN_BUS_OFF_LIMIT, 0)
+    for _i in 0..canbus.CAN_BUS_OFF_RECOVERY_SEQUENCES
+        s = canbus.on_recovery_sequence(s)
+    test.assert(canbus.may_rejoin(s))
+    test.assert(canbus.is_error_active(canbus.rejoined(s)))
+
+@test
+fn test_an_error_frame_carries_the_counters_in_bytes_six_and_seven() [io]
+    test.case("a data frame answers a fresh state; an error frame answers the counters it carries")
+    test.assert_eq(canbus.tx_errors(canbus.state_from_error_frame(canframe.frame(1, 0, 0))), 0)
+    let e = CanFrame { id: canbus.CAN_ERR_BIT, flags: canframe.CAN_FLAG_ERROR, len: 8, data: canframe.pack8(0, 0, 1, 0, 0, 0, 100, 20) }
+    let s = canbus.state_from_error_frame(e)
+    test.assert_eq(canbus.tx_errors(s), 100)
+    test.assert_eq(canbus.rx_errors(s), 20)
+
+fn limits(tseg1_min: Int, tseg2_max: Int, sjw_max: Int, full: Bool) -> CanTimingLimits
+    CanTimingLimits { brp_max: 64, tseg1_min: tseg1_min, tseg1_max: 16, tseg2_min: 2, tseg2_max: tseg2_max,
+                      sjw_max: sjw_max, tq_min: 8, tq_max: 25, sjw_full: full }
+
+@test
+fn test_the_solver_clamps_the_second_segment_to_the_controller() [io]
+    test.case("a sample point at either extreme still lands inside the limits of tseg2")
+    let hi = canbus.solve_timing(16000000, 500000, 1000, limits(1, 8, 4, false))
+    test.assert(canbus.timing_ok(hi))
+    test.assert(canbus.timing_tseg2(hi) >= 2)
+    let lo = canbus.solve_timing(16000000, 500000, 0, limits(1, 8, 4, false))
+    test.assert(canbus.timing_ok(lo))
+    test.assert(canbus.timing_tseg2(lo) <= 8)
+    test.assert_eq(canbus.timing_bitrate(lo), 500000)
+
+@test
+fn test_the_solver_answers_no_timing_when_no_split_fits() [io]
+    test.case("a first segment that must be longer than any bit allows leaves nothing; the reading functions then answer 0")
+    let none = canbus.solve_timing(16000000, 500000, 875, limits(40, 8, 4, false))
+    test.assert(canbus.timing_ok(none) == false)
+    test.assert_eq(canbus.timing_bitrate(none), 0)
+    test.assert_eq(canbus.timing_sample_permille(none), 0)
+    test.assert_eq(canbus.timing_quanta(none), 0)
+    test.assert(canbus.timing_ok(canbus.solve_timing(0, 500000, 875, limits(1, 8, 4, false))) == false)
+
+@test
+fn test_the_synchronisation_jump_width_is_capped() [io]
+    test.case("a controller whose SJW follows tseg2 still caps it at its own maximum")
+    let t = canbus.solve_timing(16000000, 500000, 750, limits(1, 8, 1, true))
+    test.assert(canbus.timing_ok(t))
+    test.assert_eq(canbus.timing_sjw(t), 1)
+
+@test
+fn test_a_list_filter_is_a_dual_id_extended_element() [io]
+    test.case("FDCAN's second extended filter word carries type 1 for a list of two identifiers and type 2 for an identifier and mask")
+    test.assert_eq(canfdcan.ext_element1(canfilter.list_ext(0x100, 0x200)) >>> 30, 1)
+    test.assert_eq(canfdcan.ext_element1(canfilter.list_ext(0x100, 0x200)) & 0x1FFFFFFF, 0x200)
+    test.assert_eq(canfdcan.ext_element1(canfilter.filter_ext(0x100, 0x1FFF0000)) >>> 30, 2)
