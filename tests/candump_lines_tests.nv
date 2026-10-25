@@ -100,3 +100,9 @@ fn test_an_fd_compact_line_carries_both_flag_bits() [io, mutate]
     test.assert_eq(candump.render_fd_compact(brs, fd_byte), "123##1A0A1")
     let esi = CanFdFrame { id: 0x123, flags: canframe.CAN_FD_FLAG_FD | canframe.CAN_FD_FLAG_BRS | canframe.CAN_FD_FLAG_ESI, len: 1 }
     test.assert_eq(candump.render_fd_compact(esi, fd_byte), "123##3A0")
+
+@test
+fn test_an_identifier_with_no_digits_or_too_many_is_malformed() [io]
+    test.case("hex_value refuses the empty string and anything longer than fifteen digits")
+    test.assert_eq(canframe.fault_code(candump.parse_compact("#11")), canframe.CAN_FAULT_MALFORMED)
+    test.assert_eq(canframe.fault_code(candump.parse_compact("0000000000000000#11")), canframe.CAN_FAULT_MALFORMED)

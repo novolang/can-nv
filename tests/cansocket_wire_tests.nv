@@ -235,3 +235,27 @@ fn test_an_interface_index_names_the_interface() [io, fs]
         Ok(_) => test.assert(false)
         Err(e) => test.assert(e == CanNoSuchInterface("#134217727"))
     test.assert(cansocket.is_virtual("lo") == false)
+
+@test
+fn test_a_closed_socket_refuses_every_call() [io, net, fs]
+    test.case("a read that fails is not a read that found nothing, and an option or timeout the kernel refuses says so")
+    match cansocket.open_all()
+        Ok(s) =>
+            let _ = cansocket.close(s)
+            test.assert(canframe.is_fault(cansocket.receive(s)))
+            test.assert(canframe.is_fault(cansocket.receive_from(s)))
+            var dst: Vec[u8; 72] = Vec.new()
+            match cansocket.receive_into(s, var dst)
+                Ok(_) => test.assert(false)
+                Err(e) => test.assert(e == CanSocketRefused("the read failed"))
+            test.assert(is_err(cansocket.set_receive_timeout(s, 5)))
+            test.assert(is_err(cansocket.set_loopback(s, true)))
+            test.assert(is_err(cansocket.set_filters(s, [canfilter.exact(1)])))
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_name_that_cannot_be_an_interface_is_not_one() [io, fs]
+    test.case("the empty name and a name with a slash are refused before sysfs is asked")
+    test.assert(cansocket.interface_exists("") == false)
+    test.assert(cansocket.interface_exists("../lo") == false)
+    test.assert(cansocket.interface_exists("lo") == false)

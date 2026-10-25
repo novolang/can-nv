@@ -143,3 +143,14 @@ fn test_false_accepts_never_go_negative() [io]
     let b = canfilter.inverted(canfilter.exact(0x301))
     test.assert(canfilter.false_accept_width(a, b) >= 0)
     test.assert(canfilter.false_accept_width(canfilter.list(1, 2), canfilter.exact(3)) >= 0)
+
+@test
+fn test_inversion_on_one_side_changes_overlap_and_cover() [io]
+    test.case("a plain filter against an inverted one, and an inverted filter against a list, are answered as sets")
+    let plain = canfilter.exact(0x500)
+    let inv = canfilter.inverted(canfilter.exact(0x500))
+    test.assert(canfilter.overlaps(plain, inv) == false)
+    test.assert(canfilter.overlaps(canfilter.exact(0x501), inv))
+    test.assert(canfilter.overlaps(canfilter.filter(0x500, 0x700), inv))
+    test.assert(canfilter.covers(inv, canfilter.list(0x10, 0x20)))
+    test.assert(canfilter.covers(inv, canfilter.list(0x500, 0x20)) == false)

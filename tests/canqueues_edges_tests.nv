@@ -53,6 +53,10 @@ fn test_slots_wrap_past_the_end_of_the_array() [io]
     test.assert_eq(cantxq.dequeue_fifo_index(q), 2)
     test.assert_eq(cantxq.enqueue_at(cantxq.dequeued(q, 2)), 2)
     // a slot the queue does not hold is left alone
+    test.assert_eq(cantxq.len(cantxq.dequeued(q, 0)), 2)
+    // a queue value that claims a frame but no storage must not divide by zero
+    let broken = CanTxQueue { head: 0, count: 1, capacity: 0, dropped: 0 }
+    test.assert_eq(cantxq.index_of_id(broken, 0x100, id_of), 0)
     test.assert_eq(cantxq.len(cantxq.dequeued(q, 7)), 3)
     test.assert_eq(cantxq.len(cantxq.dequeued(q, 0 - 1)), 3)
     test.assert_eq(cantxq.len(cantxq.dequeued(cantxq.queue(3), 0)), 0)

@@ -313,6 +313,7 @@ fn false_accept_width(a: CanFilter, b: CanFilter) -> Int []
     let m = merge(a, b)
     let either = width(a) + width(b) - both_width(a, b)
     let extra = width(m) - either
+    // cov: skip — a defensive floor: a merge is a superset of both filters, so the extra width is never negative for any pair the filters can build
     if extra < 0
         return 0
     extra
