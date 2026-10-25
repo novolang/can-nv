@@ -1,7 +1,5 @@
 // canerr.nv — what a CAN operation can be wrong about.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // A BUS ERROR IS NOT A PROGRAM ERROR, and the type says so by not
 // carrying one.  A CAN controller reports bit errors, stuff errors,
 // form errors, CRC errors and acknowledgement errors continuously and
@@ -63,6 +61,20 @@ pub enum CanError
     CanSocketRefused(detail: Str)
     // The interface named does not exist on this machine.
     CanNoSuchInterface(name: Str)
+    // No bit timing produces this rate from this clock to within 0.1 per
+    // cent, with the segments the controller can program.
+    CanTimingUnreachable(clock_hz: Int, bitrate: Int)
+    // The node is bus-off and may not transmit until it recovers.
+    CanBusOff
+    // The controller refused the frame itself: a CAN FD frame on a
+    // classic controller, or an identifier or length out of range.
+    CanFrameRefused
+    // The controller's acceptance hardware cannot hold this filter, or
+    // the slot does not exist: an inverted filter on a controller that
+    // only accepts, or a slot past the last.
+    CanFilterNotSupported
+    // Fewer bytes than a frame's wire form needs: `have` of sixteen.
+    CanShortWire(have: Int)
 
 // The one-line report: what was refused, and the number that decided
 // it.
@@ -77,8 +89,9 @@ pub enum CanError
 //     println(canerr.describe(CanFdNotSupported))
 // ```
 impl Error for CanError
+    @tier(rt)
     fn message(self) -> Str
-        todo("can-nv.canerr.CanError.message")
+        describe(self)
 
 // The same sentence as `message`, as a free function, for a caller
 // that has an error value rather than a `Result` to call `.message()`
@@ -90,8 +103,46 @@ impl Error for CanError
 // fn main() [io]
 //     println(canerr.describe(CanIdTooWide(0x800, false)))
 // ```
-pub fn describe(e: CanError) -> Str []
-    todo("can-nv.canerr.describe")
+pub @tier(rt)
+fn describe(e: CanError) -> Str []
+    match e
+        CanIdTooWide(id, extended)              =>
+            if extended
+                "identifier 0x${hex(id)} does not fit 29 bits; the largest extended identifier is 0x1FFFFFFF"
+            else
+                "identifier 0x${hex(id)} does not fit 11 bits; the largest standard identifier is 0x7FF"
+        CanLengthTooLong(len)                   => "a classic frame carries at most 8 bytes, not ${len}"
+        CanFdLengthNotEncodable(len)            => "a CAN FD frame cannot carry ${len} bytes; the lengths above 8 are 12, 16, 20, 24, 32, 48 and 64"
+        CanRemoteWithPayload(id)                => "the remote frame on 0x${hex(id)} carries a payload, which a remote frame cannot"
+        CanFdNotSupported                       => "the controller sends classic frames only, so a CAN FD frame or a bit rate switch is refused"
+        CanQueueFull(capacity)                  => "the transmit queue is full at ${capacity} frames"
+        CanFilterUnreachable(id, mask)          => "filter 0x${hex(id)} has bits outside its mask 0x${hex(mask)}, so those bits are never compared"
+        CanIsoTpBadSequence(want, got)          => "ISO-TP consecutive frame ${got} arrived where ${want} was due"
+        CanIsoTpTooLong(len, capacity)          => "an ISO-TP message of ${len} bytes does not fit a buffer of ${capacity}"
+        CanIsoTpOverflow                        => "the ISO-TP receiver answered overflow and refused the transfer"
+        CanIsoTpTimeout(which)                  => "the ISO-TP timer ${which} expired"
+        CanBadLogLine(at)                       => "the candump line does not parse at character ${at}"
+        CanSocketRefused(detail)                => "the CAN socket was refused: ${detail}"
+        CanNoSuchInterface(name)                => "no CAN interface named ${name} on this machine"
+        CanBusOff                               => "the node is bus-off and may not transmit until it recovers"
+        CanFrameRefused                         => "the controller refused the frame: its format, identifier or length is not one this bus carries"
+        CanShortWire(have)                      => "a frame on the wire is 16 bytes, and ${have} are there"
+        CanFilterNotSupported                   => "the controller cannot hold this filter in that slot; widen it with canfilter.merge and filter the rest in software"
+        CanTimingUnreachable(clock_hz, bitrate) => "a ${clock_hz} Hz clock cannot produce ${bitrate} bit/s to within 0.1 per cent"
+
+// Upper-case hexadecimal digits of a non-negative number, without a
+// prefix.
+@tier(rt)
+fn hex(n: Int) -> Str
+    if n <= 0
+        return "0"
+    var out = ""
+    for k in 0..16
+        let v = n >>> (4 * k)
+        if v > 0
+            let d = v & 15
+            out = str.slice("0123456789ABCDEF", d, d + 1) + out
+    out
 
 // Whether retrying the same operation could succeed — a full queue, a
 // flow-control overflow, a timer — as against a value that will be
@@ -107,5 +158,12 @@ pub fn describe(e: CanError) -> Str []
 // fn main() [io]
 //     println("${canerr.is_transient(CanQueueFull(16))}")   // true
 // ```
-pub fn is_transient(e: CanError) -> Bool []
-    todo("can-nv.canerr.is_transient")
+pub @tier(embedded)
+fn is_transient(e: CanError) -> Bool []
+    match e
+        CanQueueFull(_)     => true
+        CanIsoTpOverflow    => true
+        CanIsoTpTimeout(_)  => true
+        CanSocketRefused(_) => true
+        CanBusOff           => true
+        _                   => false

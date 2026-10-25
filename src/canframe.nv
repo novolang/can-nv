@@ -1,7 +1,5 @@
 // canframe.nv — a CAN frame as a value, identifiers included.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `CanFrame` IS THE LOAD-BEARING INTERFACE OF THIS PACKAGE, and the
 // reason is arithmetic: a classic CAN frame carries AT MOST EIGHT
 // BYTES, eight bytes is sixty-four bits, and sixty-four bits is one
@@ -33,6 +31,8 @@
 // wins the bus.  `wins_arbitration` is that comparison, and it exists
 // because a queue sorted the other way is a queue that inverts the one
 // ordering the protocol guarantees.
+
+use canerr
 
 // ── Identifier widths ────────────────────────────────────────────────
 
@@ -125,8 +125,9 @@ struct CanFrame
 //     let f = canframe.frame(0x123, 2, 0x2211)
 //     println("${canframe.frame_byte(f, 0)}")   // 17, which is 0x11
 // ```
-pub fn frame(id: Int, len: Int, data: Int) -> CanFrame []
-    todo("can-nv.canframe.frame")
+pub @tier(embedded)
+fn frame(id: Int, len: Int, data: Int) -> CanFrame []
+    CanFrame { id: id, flags: 0, len: len, data: data }
 
 // Build a data frame with an extended 29-bit identifier.
 //
@@ -142,35 +143,42 @@ pub fn frame(id: Int, len: Int, data: Int) -> CanFrame []
 //     let f = canframe.frame_ext(0x18DAF110, 8, 0)
 //     println("${canframe.is_extended(f)}")   // true
 // ```
-pub fn frame_ext(id: Int, len: Int, data: Int) -> CanFrame []
-    todo("can-nv.canframe.frame_ext")
+pub @tier(embedded)
+fn frame_ext(id: Int, len: Int, data: Int) -> CanFrame []
+    CanFrame { id: id, flags: CAN_FLAG_EXTENDED, len: len, data: data }
 
 // Build a remote transmission request with a standard identifier.
 //
 // `len` is how many bytes the REQUESTER wants back, not how many
 // follow — a remote frame has no payload.
-pub fn remote_frame(id: Int, len: Int) -> CanFrame []
-    todo("can-nv.canframe.remote_frame")
+pub @tier(embedded)
+fn remote_frame(id: Int, len: Int) -> CanFrame []
+    CanFrame { id: id, flags: CAN_FLAG_RTR, len: len, data: 0 }
 
 // Build a remote transmission request with an extended identifier.
-pub fn remote_frame_ext(id: Int, len: Int) -> CanFrame []
-    todo("can-nv.canframe.remote_frame_ext")
+pub @tier(embedded)
+fn remote_frame_ext(id: Int, len: Int) -> CanFrame []
+    CanFrame { id: id, flags: CAN_FLAG_EXTENDED | CAN_FLAG_RTR, len: len, data: 0 }
 
 // The identifier.
-pub fn frame_id(f: CanFrame) -> Int []
-    todo("can-nv.canframe.frame_id")
+pub @tier(embedded)
+fn frame_id(f: CanFrame) -> Int []
+    f.id
 
 // The `CAN_FLAG_*` bits.
-pub fn frame_flags(f: CanFrame) -> Int []
-    todo("can-nv.canframe.frame_flags")
+pub @tier(embedded)
+fn frame_flags(f: CanFrame) -> Int []
+    f.flags
 
 // How many payload bytes are meaningful.
-pub fn frame_len(f: CanFrame) -> Int []
-    todo("can-nv.canframe.frame_len")
+pub @tier(embedded)
+fn frame_len(f: CanFrame) -> Int []
+    f.len
 
 // The packed payload word.
-pub fn frame_data(f: CanFrame) -> Int []
-    todo("can-nv.canframe.frame_data")
+pub @tier(embedded)
+fn frame_data(f: CanFrame) -> Int []
+    f.data
 
 // Payload byte `i`, or 0 past `len`.
 //
@@ -181,8 +189,11 @@ pub fn frame_data(f: CanFrame) -> Int []
 //     let f = canframe.frame(0x123, 3, 0x332211)
 //     println("${canframe.frame_byte(f, 2)}")   // 51, which is 0x33
 // ```
-pub fn frame_byte(f: CanFrame, i: Int) -> Int []
-    todo("can-nv.canframe.frame_byte")
+pub @tier(embedded)
+fn frame_byte(f: CanFrame, i: Int) -> Int []
+    if i < 0 or i >= f.len or i >= CAN_MAX_DLEN
+        return 0
+    byte_of(f.data, i)
 
 // The frame with byte `i` set, and `len` grown to cover it.
 //
@@ -196,20 +207,29 @@ pub fn frame_byte(f: CanFrame, i: Int) -> Int []
 //     let f = canframe.frame_with_byte(canframe.frame(0x123, 0, 0), 0, 0xAB)
 //     println("${canframe.frame_len(f)}")   // 1
 // ```
-pub fn frame_with_byte(f: CanFrame, i: Int, v: Int) -> CanFrame []
-    todo("can-nv.canframe.frame_with_byte")
+pub @tier(embedded)
+fn frame_with_byte(f: CanFrame, i: Int, v: Int) -> CanFrame []
+    if i < 0 or i >= CAN_MAX_DLEN
+        return f
+    var n = f.len
+    if i + 1 > n
+        n = i + 1
+    CanFrame { id: f.id, flags: f.flags, len: n, data: with_byte(f.data, i, v) }
 
 // Whether the frame uses a 29-bit identifier.
-pub fn is_extended(f: CanFrame) -> Bool []
-    todo("can-nv.canframe.is_extended")
+pub @tier(embedded)
+fn is_extended(f: CanFrame) -> Bool []
+    (f.flags & CAN_FLAG_EXTENDED) != 0
 
 // Whether the frame is a remote transmission request.
-pub fn is_remote(f: CanFrame) -> Bool []
-    todo("can-nv.canframe.is_remote")
+pub @tier(embedded)
+fn is_remote(f: CanFrame) -> Bool []
+    (f.flags & CAN_FLAG_RTR) != 0
 
 // Whether the frame is a controller-generated error frame.
-pub fn is_error_frame(f: CanFrame) -> Bool []
-    todo("can-nv.canframe.is_error_frame")
+pub @tier(embedded)
+fn is_error_frame(f: CanFrame) -> Bool []
+    (f.flags & CAN_FLAG_ERROR) != 0 and is_frame(f)
 
 // Whether `a` wins the bus against `b`.
 //
@@ -229,8 +249,9 @@ pub fn is_error_frame(f: CanFrame) -> Bool []
 // fn main() [io]
 //     println("${canframe.wins_arbitration(canframe.frame(0x100, 0, 0), canframe.frame(0x200, 0, 0))}")
 // ```
-pub fn wins_arbitration(a: CanFrame, b: CanFrame) -> Bool []
-    todo("can-nv.canframe.wins_arbitration")
+pub @tier(embedded)
+fn wins_arbitration(a: CanFrame, b: CanFrame) -> Bool []
+    arbitration_key(a) < arbitration_key(b)
 
 // The one number whose numeric order is the bus's own order.
 //
@@ -253,15 +274,41 @@ pub fn wins_arbitration(a: CanFrame, b: CanFrame) -> Bool []
 //     let lo = canframe.arbitration_key(canframe.frame(0x200, 0, 0))
 //     println("${hi < lo}")   // true — the smaller identifier wins
 // ```
-pub fn arbitration_key(f: CanFrame) -> Int []
-    todo("can-nv.canframe.arbitration_key")
+pub @tier(embedded)
+fn arbitration_key(f: CanFrame) -> Int []
+    // The bits in the order they cross the bus: the eleven base bits,
+    // then SRR and IDE (recessive for an extended frame, where a
+    // standard frame sends RTR and a dominant IDE), the eighteen
+    // extension bits, and the extended frame's own RTR.  A standard
+    // frame's RTR sits in the SRR position.
+    if is_extended(f)
+        let base = (f.id >>> 18) & 0x7FF
+        let ext = f.id & 0x3FFFF
+        var rtr = 0
+        if is_remote(f)
+            rtr = 1
+        return (base << 21) | (1 << 20) | (1 << 19) | (ext << 1) | rtr
+    var srr = 0
+    if is_remote(f)
+        srr = 1
+    ((f.id & 0x7FF) << 21) | (srr << 20)
 
 // Why a frame cannot be put on a bus, or nothing.
 //
 // A `@value` struct cannot be a `Result` payload (SPEC § 14.5), so the
 // constructors cannot refuse and this is the refusal beside them.
-pub fn check_frame(f: CanFrame) -> ?CanError []
-    todo("can-nv.canframe.check_frame")
+pub @tier(rt)
+fn check_frame(f: CanFrame) -> ?CanError []
+    if is_extended(f)
+        if f.id < 0 or f.id > CAN_EFF_MAX_ID
+            return Some(CanIdTooWide(f.id, true))
+    elif f.id < 0 or f.id > CAN_SFF_MAX_ID
+        return Some(CanIdTooWide(f.id, false))
+    if f.len < 0 or f.len > CAN_MAX_DLEN
+        return Some(CanLengthTooLong(f.len))
+    if is_remote(f) and f.data != 0
+        return Some(CanRemoteWithPayload(f.id))
+    None
 
 // ── Not a frame ──────────────────────────────────────────────────────
 
@@ -273,8 +320,9 @@ pub fn check_frame(f: CanFrame) -> ?CanError []
 // fn main() [io]
 //     println("${canframe.is_none(canframe.none())}")   // true
 // ```
-pub fn none() -> CanFrame []
-    todo("can-nv.canframe.none")
+pub @tier(embedded)
+fn none() -> CanFrame []
+    CanFrame { id: 0, flags: CAN_FLAG_NONE, len: 0, data: 0 }
 
 // The value a fallible answer gives instead of refusing, carrying a
 // `CAN_FAULT_*` code.
@@ -285,16 +333,19 @@ pub fn none() -> CanFrame []
 // fn main() [io]
 //     println("${canframe.is_fault(canframe.fault(canframe.CAN_FAULT_MALFORMED))}")
 // ```
-pub fn fault(code: Int) -> CanFrame []
-    todo("can-nv.canframe.fault")
+pub @tier(embedded)
+fn fault(code: Int) -> CanFrame []
+    CanFrame { id: code, flags: CAN_FLAG_FAULT, len: 0, data: 0 }
 
 // Whether this is the "nothing arrived" value.
-pub fn is_none(f: CanFrame) -> Bool []
-    todo("can-nv.canframe.is_none")
+pub @tier(embedded)
+fn is_none(f: CanFrame) -> Bool []
+    (f.flags & CAN_FLAG_NONE) != 0
 
 // Whether this is a refusal rather than a frame.
-pub fn is_fault(f: CanFrame) -> Bool []
-    todo("can-nv.canframe.is_fault")
+pub @tier(embedded)
+fn is_fault(f: CanFrame) -> Bool []
+    (f.flags & CAN_FLAG_FAULT) != 0
 
 // Whether this is a real frame — neither the nothing value nor a
 // refusal.
@@ -309,27 +360,44 @@ pub fn is_fault(f: CanFrame) -> Bool []
 // fn main() [io]
 //     println("${canframe.is_frame(canframe.frame(0x123, 0, 0))}")   // true
 // ```
-pub fn is_frame(f: CanFrame) -> Bool []
-    todo("can-nv.canframe.is_frame")
+pub @tier(embedded)
+fn is_frame(f: CanFrame) -> Bool []
+    (f.flags & (CAN_FLAG_NONE | CAN_FLAG_FAULT)) == 0
 
 // The `CAN_FAULT_*` code a fault carries, or 0.
-pub fn fault_code(f: CanFrame) -> Int []
-    todo("can-nv.canframe.fault_code")
+pub @tier(embedded)
+fn fault_code(f: CanFrame) -> Int []
+    if is_fault(f)
+        return f.id
+    0
 
 // Why a fault value is a fault, in words, or nothing when it is a real
 // frame.
-pub fn fault_of(f: CanFrame) -> ?CanError []
-    todo("can-nv.canframe.fault_of")
+pub @tier(rt)
+fn fault_of(f: CanFrame) -> ?CanError []
+    if not is_fault(f)
+        return None
+    if f.id == CAN_FAULT_ID_TOO_WIDE
+        return Some(CanIdTooWide(0, false))
+    if f.id == CAN_FAULT_BAD_LENGTH
+        return Some(CanLengthTooLong(f.len))
+    if f.id == CAN_FAULT_REFUSED
+        return Some(CanSocketRefused("the controller or the socket refused"))
+    if f.id == CAN_FAULT_DISCONNECTED
+        return Some(CanSocketRefused("the peer went away"))
+    Some(CanBadLogLine(0))
 
 // ── Packing a payload ────────────────────────────────────────────────
 
 // Two bytes into a payload word, `b0` lowest.
-pub fn pack2(b0: Int, b1: Int) -> Int []
-    todo("can-nv.canframe.pack2")
+pub @tier(embedded)
+fn pack2(b0: Int, b1: Int) -> Int []
+    (b0 & 0xFF) | ((b1 & 0xFF) << 8)
 
 // Four bytes into a payload word, `b0` lowest.
-pub fn pack4(b0: Int, b1: Int, b2: Int, b3: Int) -> Int []
-    todo("can-nv.canframe.pack4")
+pub @tier(embedded)
+fn pack4(b0: Int, b1: Int, b2: Int, b3: Int) -> Int []
+    pack2(b0, b1) | ((b2 & 0xFF) << 16) | ((b3 & 0xFF) << 24)
 
 // Eight bytes into a payload word, `b0` lowest — a whole classic
 // frame's payload in one call.
@@ -341,16 +409,24 @@ pub fn pack4(b0: Int, b1: Int, b2: Int, b3: Int) -> Int []
 //     let d = canframe.pack8(1, 2, 3, 4, 5, 6, 7, 8)
 //     println("${canframe.byte_of(d, 7)}")   // 8
 // ```
-pub fn pack8(b0: Int, b1: Int, b2: Int, b3: Int, b4: Int, b5: Int, b6: Int, b7: Int) -> Int []
-    todo("can-nv.canframe.pack8")
+pub @tier(embedded)
+fn pack8(b0: Int, b1: Int, b2: Int, b3: Int, b4: Int, b5: Int, b6: Int, b7: Int) -> Int []
+    pack4(b0, b1, b2, b3) | ((b4 & 0xFF) << 32) | ((b5 & 0xFF) << 40) | ((b6 & 0xFF) << 48) | ((b7 & 0xFF) << 56)
 
 // Byte `i` of a packed payload word.
-pub fn byte_of(data: Int, i: Int) -> Int []
-    todo("can-nv.canframe.byte_of")
+pub @tier(embedded)
+fn byte_of(data: Int, i: Int) -> Int []
+    if i < 0 or i > 7
+        return 0
+    (data >>> (8 * i)) & 0xFF
 
 // A packed payload word with byte `i` set.
-pub fn with_byte(data: Int, i: Int, v: Int) -> Int []
-    todo("can-nv.canframe.with_byte")
+pub @tier(embedded)
+fn with_byte(data: Int, i: Int, v: Int) -> Int []
+    if i < 0 or i > 7
+        return data
+    let m = 0xFF << (8 * i)
+    (data & ~m) | ((v & 0xFF) << (8 * i))
 
 // A big-endian unsigned integer of `width` bytes read from bit offset
 // `start` of a payload, which is how nearly every automotive signal is
@@ -360,12 +436,30 @@ pub fn with_byte(data: Int, i: Int, v: Int) -> Int []
 // framing, and the one it gets wrong: DBC files describe signals in
 // bits at a big-endian offset, and reading them as little-endian
 // bytes produces plausible numbers that are wrong by a factor of 256.
-pub fn signal_be(data: Int, start_bit: Int, bit_len: Int) -> Int []
-    todo("can-nv.canframe.signal_be")
+pub @tier(embedded)
+fn signal_be(data: Int, start_bit: Int, bit_len: Int) -> Int []
+    // Motorola order: byte 0 is the most significant, so the payload is
+    // read as one big-endian 64-bit number and `start_bit` counts from
+    // its top.
+    if bit_len <= 0 or start_bit < 0 or start_bit + bit_len > 64
+        return 0
+    var be = 0
+    for i in 0..8
+        be = (be << 8) | byte_of(data, i)
+    let v = be >>> (64 - start_bit - bit_len)
+    if bit_len >= 64
+        return v
+    v & ((1 << bit_len) - 1)
 
 // The same, little-endian — the other convention a DBC file may use.
-pub fn signal_le(data: Int, start_bit: Int, bit_len: Int) -> Int []
-    todo("can-nv.canframe.signal_le")
+pub @tier(embedded)
+fn signal_le(data: Int, start_bit: Int, bit_len: Int) -> Int []
+    if bit_len <= 0 or start_bit < 0 or start_bit + bit_len > 64
+        return 0
+    let v = data >>> start_bit
+    if bit_len >= 64
+        return v
+    v & ((1 << bit_len) - 1)
 
 // ── CAN FD ───────────────────────────────────────────────────────────
 
@@ -404,36 +498,92 @@ struct CanFdFrame
 //     let f = canframe.fd_frame(0x123, 48, true)
 //     println("${canframe.fd_dlc(f)}")   // 14
 // ```
-pub fn fd_frame(id: Int, len: Int, bit_rate_switch: Bool) -> CanFdFrame []
-    todo("can-nv.canframe.fd_frame")
+pub @tier(embedded)
+fn fd_frame(id: Int, len: Int, bit_rate_switch: Bool) -> CanFdFrame []
+    var fl = CAN_FD_FLAG_FD
+    if bit_rate_switch
+        fl = fl | CAN_FD_FLAG_BRS
+    CanFdFrame { id: id, flags: fl, len: len }
+
+// The value an FD receive answers when nothing arrived.
+pub @tier(embedded)
+fn fd_none() -> CanFdFrame []
+    CanFdFrame { id: 0, flags: CAN_FLAG_NONE, len: 0 }
+
+// The value an FD receive answers instead of refusing, carrying a
+// `CAN_FAULT_*` code in its identifier.
+pub @tier(embedded)
+fn fd_fault(code: Int) -> CanFdFrame []
+    CanFdFrame { id: code, flags: CAN_FLAG_FAULT, len: 0 }
+
+// Whether this is the "nothing arrived" value.
+pub @tier(embedded)
+fn fd_is_none(f: CanFdFrame) -> Bool []
+    (f.flags & CAN_FLAG_NONE) != 0
+
+// Whether this is a refusal rather than a frame.
+pub @tier(embedded)
+fn fd_is_fault(f: CanFdFrame) -> Bool []
+    (f.flags & CAN_FLAG_FAULT) != 0
+
+// Whether this is a real frame, neither nothing nor a refusal.
+pub @tier(embedded)
+fn fd_is_frame(f: CanFdFrame) -> Bool []
+    (f.flags & (CAN_FLAG_NONE | CAN_FLAG_FAULT)) == 0
+
+// Whether the frame uses the FD format.  A controller that receives
+// classic and FD frames through one path answers classic ones with
+// this clear.
+pub @tier(embedded)
+fn fd_is_fd(f: CanFdFrame) -> Bool []
+    (f.flags & CAN_FD_FLAG_FD) != 0
+
+// A classic frame's header as an FD-path frame: the same identifier,
+// format, remote bit and length, with the FD flag clear.  Its payload
+// is still the classic frame's own.
+pub @tier(embedded)
+fn fd_of_classic(f: CanFrame) -> CanFdFrame []
+    CanFdFrame { id: f.id,
+        flags: f.flags & (CAN_FLAG_EXTENDED | CAN_FLAG_RTR | CAN_FLAG_NONE | CAN_FLAG_FAULT),
+        len: f.len }
 
 // Build a CAN FD frame header with an extended identifier.
-pub fn fd_frame_ext(id: Int, len: Int, bit_rate_switch: Bool) -> CanFdFrame []
-    todo("can-nv.canframe.fd_frame_ext")
+pub @tier(embedded)
+fn fd_frame_ext(id: Int, len: Int, bit_rate_switch: Bool) -> CanFdFrame []
+    var fl = CAN_FD_FLAG_FD | CAN_FLAG_EXTENDED
+    if bit_rate_switch
+        fl = fl | CAN_FD_FLAG_BRS
+    CanFdFrame { id: id, flags: fl, len: len }
 
 // The identifier.
-pub fn fd_id(f: CanFdFrame) -> Int []
-    todo("can-nv.canframe.fd_id")
+pub @tier(embedded)
+fn fd_id(f: CanFdFrame) -> Int []
+    f.id
 
 // The flag bits.
-pub fn fd_flags(f: CanFdFrame) -> Int []
-    todo("can-nv.canframe.fd_flags")
+pub @tier(embedded)
+fn fd_flags(f: CanFdFrame) -> Int []
+    f.flags
 
 // How many payload bytes are meaningful.
-pub fn fd_len(f: CanFdFrame) -> Int []
-    todo("can-nv.canframe.fd_len")
+pub @tier(embedded)
+fn fd_len(f: CanFdFrame) -> Int []
+    f.len
 
 // Whether the payload is sent at the faster data rate.
-pub fn fd_has_brs(f: CanFdFrame) -> Bool []
-    todo("can-nv.canframe.fd_has_brs")
+pub @tier(embedded)
+fn fd_has_brs(f: CanFdFrame) -> Bool []
+    (f.flags & CAN_FD_FLAG_BRS) != 0
 
 // Whether the transmitting node reported itself error-passive.
-pub fn fd_has_esi(f: CanFdFrame) -> Bool []
-    todo("can-nv.canframe.fd_has_esi")
+pub @tier(embedded)
+fn fd_has_esi(f: CanFdFrame) -> Bool []
+    (f.flags & CAN_FD_FLAG_ESI) != 0
 
 // Whether the identifier is 29 bits.
-pub fn fd_is_extended(f: CanFdFrame) -> Bool []
-    todo("can-nv.canframe.fd_is_extended")
+pub @tier(embedded)
+fn fd_is_extended(f: CanFdFrame) -> Bool []
+    (f.flags & CAN_FLAG_EXTENDED) != 0
 
 // ── DLC: the four bits that are not a length ─────────────────────────
 
@@ -452,21 +602,63 @@ pub fn fd_is_extended(f: CanFdFrame) -> Bool []
 //     println("${canframe.dlc_for(48)}")   // 14
 //     println("${canframe.dlc_for(9)}")    // -1, there is no such length
 // ```
-pub fn dlc_for(len: Int) -> Int []
-    todo("can-nv.canframe.dlc_for")
+pub @tier(embedded)
+fn dlc_for(len: Int) -> Int []
+    if len < 0
+        return 0 - 1
+    if len <= 8
+        return len
+    if len == 12
+        return 9
+    if len == 16
+        return 10
+    if len == 20
+        return 11
+    if len == 24
+        return 12
+    if len == 32
+        return 13
+    if len == 48
+        return 14
+    if len == 64
+        return 15
+    0 - 1
 
 // The payload length a CAN FD data length code names.
-pub fn fd_len_for_dlc(dlc: Int) -> Int []
-    todo("can-nv.canframe.fd_len_for_dlc")
+pub @tier(embedded)
+fn fd_len_for_dlc(dlc: Int) -> Int []
+    if dlc < 0
+        return 0
+    if dlc <= 8
+        return dlc
+    if dlc == 9
+        return 12
+    if dlc == 10
+        return 16
+    if dlc == 11
+        return 20
+    if dlc == 12
+        return 24
+    if dlc == 13
+        return 32
+    if dlc == 14
+        return 48
+    64
 
 // The payload length a CLASSIC data length code names, which clamps
 // every code above 8 to 8.
-pub fn classic_len_for_dlc(dlc: Int) -> Int []
-    todo("can-nv.canframe.classic_len_for_dlc")
+pub @tier(embedded)
+fn classic_len_for_dlc(dlc: Int) -> Int []
+    if dlc < 0
+        return 0
+    if dlc > 8
+        return 8
+    dlc
 
 // The data length code of an FD frame's length.
-pub fn fd_dlc(f: CanFdFrame) -> Int []
-    todo("can-nv.canframe.fd_dlc")
+pub @tier(embedded)
+fn fd_dlc(f: CanFdFrame) -> Int []
+    dlc_for(fd_padded_len(f.len))
 
 // Whether `len` is a length a CAN FD frame can actually carry.
 //
@@ -482,13 +674,30 @@ pub fn fd_dlc(f: CanFdFrame) -> Int []
 //     println("${canframe.fd_len_is_valid(9)}")    // false
 //     println("${canframe.fd_len_is_valid(12)}")   // true
 // ```
-pub fn fd_len_is_valid(len: Int) -> Bool []
-    todo("can-nv.canframe.fd_len_is_valid")
+pub @tier(embedded)
+fn fd_len_is_valid(len: Int) -> Bool []
+    dlc_for(len) >= 0
 
 // The length an FD payload of `len` bytes is padded up to.
-pub fn fd_padded_len(len: Int) -> Int []
-    todo("can-nv.canframe.fd_padded_len")
+pub @tier(embedded)
+fn fd_padded_len(len: Int) -> Int []
+    if len <= 8
+        return len
+    if len > CAN_FD_MAX_DLEN
+        return 0 - 1
+    for dlc in 9..15
+        if fd_len_for_dlc(dlc) >= len
+            return fd_len_for_dlc(dlc)
+    CAN_FD_MAX_DLEN
 
 // Why an FD frame header cannot be put on a bus, or nothing.
-pub fn check_fd_frame(f: CanFdFrame) -> ?CanError []
-    todo("can-nv.canframe.check_fd_frame")
+pub @tier(rt)
+fn check_fd_frame(f: CanFdFrame) -> ?CanError []
+    if fd_is_extended(f)
+        if f.id < 0 or f.id > CAN_EFF_MAX_ID
+            return Some(CanIdTooWide(f.id, true))
+    elif f.id < 0 or f.id > CAN_SFF_MAX_ID
+        return Some(CanIdTooWide(f.id, false))
+    if not fd_len_is_valid(f.len)
+        return Some(CanFdLengthNotEncodable(f.len))
+    None

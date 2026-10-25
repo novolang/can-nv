@@ -1,0 +1,129 @@
+// canring.nv — a receive ring over the caller's frames.
+//
+// A controller holds two or three received frames in hardware; a
+// program that services it less often than frames arrive needs a ring
+// behind it.  This module is that ring's bookkeeping, in the shape of
+// `cantxq`: it answers indices into a `Vec[CanFrame; N]` the program
+// owns, so the frames live in the program's `.bss` or stack and nothing
+// is allocated.  The ring holds four integers.
+//
+// A full ring refuses the newest frame and counts it as an overrun, as
+// a controller's own FIFO does: the frames already received are kept in
+// order, and the count says how many were lost.
+//
+// The storage is prepared once, with one `canframe.none()` per slot, so
+// that every index the ring answers exists:
+//
+// ```novo
+// use canframe
+// use canring
+//
+// fn main() [io]
+//     var frames: Vec[CanFrame; 8] = Vec.new()
+//     for _i in 0..8
+//         let _ = frames.push(canframe.none())
+//     var r = canring.ring(8)
+//
+//     // The receive side: a frame arrives.
+//     let at = canring.put_at(r)
+//     if at >= 0
+//         frames[at] = canframe.frame(0x123, 1, 0x2A)
+//         r = canring.put(r)
+//     else
+//         r = canring.overran(r)
+//
+//     // The program side: the oldest frame leaves.
+//     let i = canring.take_at(r)
+//     if i >= 0
+//         println("${canframe.frame_id(frames[i])}")   // 291
+//         r = canring.taken(r)
+// ```
+
+use canframe
+
+// The ring's bookkeeping over the caller's array of `capacity` frames.
+pub @value
+struct CanRxRing
+    // The index of the oldest frame.
+    head: Int
+    // How many frames are held.
+    count: Int
+    // How many slots the caller's array has.
+    capacity: Int
+    // How many frames arrived while the ring was full and were lost.
+    overruns: Int
+
+// An empty ring over `capacity` slots.
+pub @tier(embedded)
+fn ring(capacity: Int) -> CanRxRing []
+    var cap = capacity
+    if cap < 0
+        cap = 0
+    CanRxRing { head: 0, count: 0, capacity: cap, overruns: 0 }
+
+// How many frames are held.
+pub @tier(embedded)
+fn ring_len(r: CanRxRing) -> Int []
+    r.count
+
+// How many slots the caller's array has.
+pub @tier(embedded)
+fn ring_capacity(r: CanRxRing) -> Int []
+    r.capacity
+
+// Whether no frame is held.
+pub @tier(embedded)
+fn ring_is_empty(r: CanRxRing) -> Bool []
+    r.count == 0
+
+// Whether every slot holds a frame.
+pub @tier(embedded)
+fn ring_is_full(r: CanRxRing) -> Bool []
+    r.count >= r.capacity
+
+// How many frames were lost to a full ring.
+pub @tier(embedded)
+fn ring_overruns(r: CanRxRing) -> Int []
+    r.overruns
+
+// The slot the next received frame goes in, or -1 when the ring is
+// full.  The caller writes the frame there and calls `put`.
+pub @tier(embedded)
+fn put_at(r: CanRxRing) -> Int []
+    if ring_is_full(r) or r.capacity == 0
+        return 0 - 1
+    (r.head + r.count) % r.capacity
+
+// The ring after a frame has been written to `put_at`'s slot.
+pub @tier(embedded)
+fn put(r: CanRxRing) -> CanRxRing []
+    if ring_is_full(r)
+        return r
+    CanRxRing { head: r.head, count: r.count + 1, capacity: r.capacity, overruns: r.overruns }
+
+// The ring after a frame arrived with nowhere to go.
+pub @tier(embedded)
+fn overran(r: CanRxRing) -> CanRxRing []
+    CanRxRing { head: r.head, count: r.count, capacity: r.capacity, overruns: r.overruns + 1 }
+
+// The slot holding the oldest frame, or -1 when the ring is empty.
+pub @tier(embedded)
+fn take_at(r: CanRxRing) -> Int []
+    if r.count == 0
+        return 0 - 1
+    r.head
+
+// The ring after the oldest frame has been read.
+pub @tier(embedded)
+fn taken(r: CanRxRing) -> CanRxRing []
+    if r.count == 0
+        return r
+    CanRxRing { head: (r.head + 1) % r.capacity,
+        count: r.count - 1,
+        capacity: r.capacity,
+        overruns: r.overruns }
+
+// The ring with every frame dropped; the overrun count is kept.
+pub @tier(embedded)
+fn emptied(r: CanRxRing) -> CanRxRing []
+    CanRxRing { head: 0, count: 0, capacity: r.capacity, overruns: r.overruns }

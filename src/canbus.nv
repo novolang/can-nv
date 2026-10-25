@@ -1,8 +1,6 @@
 // canbus.nv — error confinement: the two counters that decide whether
 // a node is allowed to speak.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // A CAN NODE POLICES ITSELF, and this is the arithmetic it does.  A
 // transmit error adds 8 to the transmit counter, a receive error adds
 // 1 to the receive counter, and a success subtracts 1 from whichever
@@ -32,6 +30,7 @@
 // beside its peripheral handle and an interrupt updates it.
 
 use canframe
+use canerr
 
 // ── The thresholds ───────────────────────────────────────────────────
 
@@ -57,6 +56,9 @@ pub const CAN_STATE_ERROR_ACTIVE = 0
 // because it is the last moment at which a problem is still cheap to
 // investigate.
 pub const CAN_STATE_ERROR_WARNING = 1
+// The counter value at which a node reports error-warning: 96.
+pub const CAN_ERROR_WARNING_LIMIT = 96
+
 // Error-passive: a counter has reached 128.  The node still sends and
 // receives, but signals errors only passively, so a broken node can no
 // longer disturb a working bus.
@@ -80,6 +82,9 @@ pub const CAN_ERR_CRC = 0x08
 // An acknowledgement error: nobody acknowledged the frame.  The error
 // a node alone on a bus gets on every transmission, forever.
 pub const CAN_ERR_ACK = 0x10
+// Every error kind at once, the mask an error frame's kinds are read
+// through.
+pub const CAN_ERR_ALL = 0x1F
 
 // ── The state ────────────────────────────────────────────────────────
 
@@ -101,21 +106,25 @@ struct CanBusState
 // fn main() [io]
 //     println("${canbus.state_of(canbus.bus_state())}")   // 0, error-active
 // ```
-pub fn bus_state() -> CanBusState []
-    todo("can-nv.canbus.bus_state")
+pub @tier(embedded)
+fn bus_state() -> CanBusState []
+    CanBusState { tx_errors: 0, rx_errors: 0, recovery: 0 }
 
 // A state with the counters a controller's registers hold, for a
 // driver that reads them rather than tracking them.
-pub fn bus_state_of(tx_errors: Int, rx_errors: Int) -> CanBusState []
-    todo("can-nv.canbus.bus_state_of")
+pub @tier(embedded)
+fn bus_state_of(tx_errors: Int, rx_errors: Int) -> CanBusState []
+    CanBusState { tx_errors: tx_errors, rx_errors: rx_errors, recovery: 0 }
 
 // The transmit error counter.
-pub fn tx_errors(s: CanBusState) -> Int []
-    todo("can-nv.canbus.tx_errors")
+pub @tier(embedded)
+fn tx_errors(s: CanBusState) -> Int []
+    s.tx_errors
 
 // The receive error counter.
-pub fn rx_errors(s: CanBusState) -> Int []
-    todo("can-nv.canbus.rx_errors")
+pub @tier(embedded)
+fn rx_errors(s: CanBusState) -> Int []
+    s.rx_errors
 
 // Which of the four states the counters put the node in.
 //
@@ -125,43 +134,88 @@ pub fn rx_errors(s: CanBusState) -> Int []
 // fn main() [io]
 //     println("${canbus.state_of(canbus.bus_state_of(200, 0))}")   // 2
 // ```
-pub fn state_of(s: CanBusState) -> Int []
-    todo("can-nv.canbus.state_of")
+pub @tier(embedded)
+fn state_of(s: CanBusState) -> Int []
+    if s.tx_errors >= CAN_BUS_OFF_LIMIT
+        return CAN_STATE_BUS_OFF
+    if s.tx_errors >= CAN_ERROR_PASSIVE_LIMIT or s.rx_errors >= CAN_ERROR_PASSIVE_LIMIT
+        return CAN_STATE_ERROR_PASSIVE
+    if s.tx_errors >= CAN_ERROR_WARNING_LIMIT or s.rx_errors >= CAN_ERROR_WARNING_LIMIT
+        return CAN_STATE_ERROR_WARNING
+    CAN_STATE_ERROR_ACTIVE
 
 // The state in words, for a log.
-pub fn state_name(state: Int) -> Str []
-    todo("can-nv.canbus.state_name")
+pub @tier(embedded)
+fn state_name(state: Int) -> Str []
+    if state == CAN_STATE_ERROR_ACTIVE
+        return "error-active"
+    if state == CAN_STATE_ERROR_WARNING
+        return "error-warning"
+    if state == CAN_STATE_ERROR_PASSIVE
+        return "error-passive"
+    if state == CAN_STATE_BUS_OFF
+        return "bus-off"
+    "unknown"
 
 // The state after a transmit error: the transmit counter up by 8.
-pub fn on_tx_error(s: CanBusState) -> CanBusState []
-    todo("can-nv.canbus.on_tx_error")
+pub @tier(embedded)
+fn on_tx_error(s: CanBusState) -> CanBusState []
+    // A bus-off node has stopped counting: the counter stays at the
+    // limit until it rejoins.
+    var tx = s.tx_errors + CAN_TX_ERROR_WEIGHT
+    if tx > CAN_BUS_OFF_LIMIT
+        tx = CAN_BUS_OFF_LIMIT
+    CanBusState { tx_errors: tx, rx_errors: s.rx_errors, recovery: s.recovery }
 
 // The state after a receive error: the receive counter up by 1.
-pub fn on_rx_error(s: CanBusState) -> CanBusState []
-    todo("can-nv.canbus.on_rx_error")
+pub @tier(embedded)
+fn on_rx_error(s: CanBusState) -> CanBusState []
+    var rx = s.rx_errors + CAN_RX_ERROR_WEIGHT
+    // ISO 11898-1 stops the receive counter mattering above the
+    // error-passive limit; it is held below 256 so it never reads as a
+    // bus-off transmit counter would.
+    if rx > 255
+        rx = 255
+    CanBusState { tx_errors: s.tx_errors, rx_errors: rx, recovery: s.recovery }
 
 // The state after a successful transmission: the transmit counter
 // down by 1, never below zero.
-pub fn on_tx_success(s: CanBusState) -> CanBusState []
-    todo("can-nv.canbus.on_tx_success")
+pub @tier(embedded)
+fn on_tx_success(s: CanBusState) -> CanBusState []
+    if s.tx_errors >= CAN_BUS_OFF_LIMIT or s.tx_errors == 0
+        return s
+    CanBusState { tx_errors: s.tx_errors - 1, rx_errors: s.rx_errors, recovery: s.recovery }
 
 // The state after a successful reception: the receive counter down by
 // 1, never below zero.
-pub fn on_rx_success(s: CanBusState) -> CanBusState []
-    todo("can-nv.canbus.on_rx_success")
+pub @tier(embedded)
+fn on_rx_success(s: CanBusState) -> CanBusState []
+    // ISO 11898-1 § 12.1.4.2: a success above the error-passive limit
+    // sets the counter to a value from 119 to 127; this package uses 127.
+    var rx = s.rx_errors - 1
+    if s.rx_errors > CAN_ERROR_PASSIVE_LIMIT - 1
+        rx = CAN_ERROR_PASSIVE_LIMIT - 1
+    if rx < 0
+        rx = 0
+    CanBusState { tx_errors: s.tx_errors, rx_errors: rx, recovery: s.recovery }
 
 // The state after one recovery sequence while bus-off.
-pub fn on_recovery_sequence(s: CanBusState) -> CanBusState []
-    todo("can-nv.canbus.on_recovery_sequence")
+pub @tier(embedded)
+fn on_recovery_sequence(s: CanBusState) -> CanBusState []
+    if state_of(s) != CAN_STATE_BUS_OFF
+        return s
+    CanBusState { tx_errors: s.tx_errors, rx_errors: s.rx_errors, recovery: s.recovery + 1 }
 
 // Whether a bus-off node has seen enough recovery sequences to rejoin.
-pub fn may_rejoin(s: CanBusState) -> Bool []
-    todo("can-nv.canbus.may_rejoin")
+pub @tier(embedded)
+fn may_rejoin(s: CanBusState) -> Bool []
+    state_of(s) == CAN_STATE_BUS_OFF and s.recovery >= CAN_BUS_OFF_RECOVERY_SEQUENCES
 
 // A node that has rejoined: both counters and the recovery count back
 // to zero.
-pub fn rejoined(s: CanBusState) -> CanBusState []
-    todo("can-nv.canbus.rejoined")
+pub @tier(embedded)
+fn rejoined(s: CanBusState) -> CanBusState []
+    bus_state()
 
 // Whether the node may transmit at all.
 //
@@ -175,12 +229,15 @@ pub fn rejoined(s: CanBusState) -> CanBusState []
 // fn main() [io]
 //     println("${canbus.may_transmit(canbus.bus_state_of(256, 0))}")   // false
 // ```
-pub fn may_transmit(s: CanBusState) -> Bool []
-    todo("can-nv.canbus.may_transmit")
+pub @tier(embedded)
+fn may_transmit(s: CanBusState) -> Bool []
+    state_of(s) != CAN_STATE_BUS_OFF
 
 // Whether the node still signals errors actively.
-pub fn is_error_active(s: CanBusState) -> Bool []
-    todo("can-nv.canbus.is_error_active")
+pub @tier(embedded)
+fn is_error_active(s: CanBusState) -> Bool []
+    let st = state_of(s)
+    st == CAN_STATE_ERROR_ACTIVE or st == CAN_STATE_ERROR_WARNING
 
 // How many consecutive transmit errors would take this node from here
 // to bus-off.
@@ -195,8 +252,11 @@ pub fn is_error_active(s: CanBusState) -> Bool []
 // fn main() [io]
 //     println("${canbus.tx_errors_to_bus_off(canbus.bus_state())}")   // 32
 // ```
-pub fn tx_errors_to_bus_off(s: CanBusState) -> Int []
-    todo("can-nv.canbus.tx_errors_to_bus_off")
+pub @tier(embedded)
+fn tx_errors_to_bus_off(s: CanBusState) -> Int []
+    if s.tx_errors >= CAN_BUS_OFF_LIMIT
+        return 0
+    (CAN_BUS_OFF_LIMIT - s.tx_errors + CAN_TX_ERROR_WEIGHT - 1) / CAN_TX_ERROR_WEIGHT
 
 // How many transmissions a node alone on a bus makes before it goes
 // bus-off.
@@ -213,8 +273,9 @@ pub fn tx_errors_to_bus_off(s: CanBusState) -> Int []
 // fn main() [io]
 //     println("${canbus.would_go_bus_off_alone()}")   // 32
 // ```
-pub fn would_go_bus_off_alone() -> Int []
-    todo("can-nv.canbus.would_go_bus_off_alone")
+pub @tier(embedded)
+fn would_go_bus_off_alone() -> Int []
+    tx_errors_to_bus_off(bus_state())
 
 // ── Error frames ─────────────────────────────────────────────────────
 
@@ -224,17 +285,34 @@ pub fn would_go_bus_off_alone() -> Int []
 // error frame reporting nothing would answer — `canframe.is_error_frame`
 // is the question that distinguishes them, and this function does not
 // pretend to.
-pub fn error_kinds(f: CanFrame) -> Int []
-    todo("can-nv.canbus.error_kinds")
+pub @tier(embedded)
+fn error_kinds(f: CanFrame) -> Int []
+    if not canframe.is_error_frame(f)
+        return 0
+    canframe.frame_id(f) & CAN_ERR_ALL
 
 // The state an error frame's payload reports, for a controller whose
 // error frames carry the counters — which SocketCAN's do.
-pub fn state_from_error_frame(f: CanFrame) -> CanBusState []
-    todo("can-nv.canbus.state_from_error_frame")
+pub @tier(embedded)
+fn state_from_error_frame(f: CanFrame) -> CanBusState []
+    if not canframe.is_error_frame(f)
+        return bus_state()
+    bus_state_of(canframe.frame_byte(f, 6), canframe.frame_byte(f, 7))
 
 // One error kind in words.
-pub fn error_kind_name(kind: Int) -> Str []
-    todo("can-nv.canbus.error_kind_name")
+pub @tier(embedded)
+fn error_kind_name(kind: Int) -> Str []
+    if kind == CAN_ERR_BIT
+        return "bit error"
+    if kind == CAN_ERR_STUFF
+        return "stuff error"
+    if kind == CAN_ERR_FORM
+        return "form error"
+    if kind == CAN_ERR_CRC
+        return "CRC error"
+    if kind == CAN_ERR_ACK
+        return "acknowledgement error"
+    "no error"
 
 // ── Bit timing, which is the other way a bus fails silently ──────────
 
@@ -245,8 +323,27 @@ pub fn error_kind_name(kind: Int) -> Str []
 // `i` from 0 to 8, and -1 outside.  A list rather than a constant per
 // rate because the useful operation is "try each in turn", which is
 // what a tool that does not know a bus's rate does.
-pub fn standard_bitrate(i: Int) -> Int []
-    todo("can-nv.canbus.standard_bitrate")
+pub @tier(embedded)
+fn standard_bitrate(i: Int) -> Int []
+    if i == 0
+        return 10000
+    if i == 1
+        return 20000
+    if i == 2
+        return 50000
+    if i == 3
+        return 100000
+    if i == 4
+        return 125000
+    if i == 5
+        return 250000
+    if i == 6
+        return 500000
+    if i == 7
+        return 800000
+    if i == 8
+        return 1000000
+    0 - 1
 
 // How many standard bit rates there are: 9.
 pub const CAN_STANDARD_BITRATES = 9
@@ -265,8 +362,11 @@ pub const CAN_STANDARD_BITRATES = 9
 // fn main() [io]
 //     println("${canbus.sample_point_permille(500000)}")   // 875
 // ```
-pub fn sample_point_permille(bitrate: Int) -> Int []
-    todo("can-nv.canbus.sample_point_permille")
+pub @tier(embedded)
+fn sample_point_permille(bitrate: Int) -> Int []
+    if bitrate >= 500000
+        return 875
+    750
 
 // How many time quanta a bit is divided into for this peripheral
 // clock and bit rate, or -1 when the clock cannot produce the rate
@@ -275,9 +375,235 @@ pub fn sample_point_permille(bitrate: Int) -> Int []
 // The refusal is the valuable half: a clock that is 1.2% off produces
 // a bus that works between two boards with the same error and fails
 // against anything else, and the failure looks like a wiring fault.
-pub fn time_quanta(clock_hz: Int, bitrate: Int) -> Int []
-    todo("can-nv.canbus.time_quanta")
+pub @tier(embedded)
+fn time_quanta(clock_hz: Int, bitrate: Int) -> Int []
+    let t = solve_timing(clock_hz, bitrate, sample_point_permille(bitrate), classic_limits())
+    if not timing_ok(t)
+        return 0 - 1
+    timing_quanta(t)
 
 // Why a bit timing cannot be used, or nothing.
-pub fn check_timing(clock_hz: Int, bitrate: Int) -> ?CanError []
-    todo("can-nv.canbus.check_timing")
+pub @tier(rt)
+fn check_timing(clock_hz: Int, bitrate: Int) -> ?CanError []
+    if time_quanta(clock_hz, bitrate) < 0
+        return Some(CanTimingUnreachable(clock_hz, bitrate))
+    None
+
+// ── The bit-timing solver ────────────────────────────────────────────
+//
+// A CAN bit is divided into time quanta, each one period of the
+// controller's clock divided by the prescaler.  The bit is the
+// synchronisation segment (one quantum), then `tseg1` quanta (the
+// propagation and first phase segments together), then `tseg2`
+// quanta.  The bus is sampled between the two phase segments, so the
+// sample point is `(1 + tseg1) / (1 + tseg1 + tseg2)`.
+//
+// The solver tries every prescaler a controller allows.  For each one
+// whose quantum divides the bit into a count of quanta the controller
+// can program, it places the sample point as near the target as the
+// segment limits allow.  Of the candidates it keeps the one whose bit
+// rate is nearest the one asked for, then the one whose sample point is
+// nearest, then the one with the most quanta, which resynchronises in
+// the finest steps.  A rate more than 0.1 per cent off is no
+// candidate at all.
+//
+// A controller's limits are a value, so one solver serves bxCAN,
+// M_CAN's nominal phase and its data phase.
+
+// What one controller's bit-timing registers can hold.  Every count is
+// in time quanta, as the bus sees it, not as the register encodes it:
+// a register that stores `tseg1 - 1` has a `tseg1_min` of 1.
+pub @value
+struct CanTimingLimits
+    brp_max: Int
+    tseg1_min: Int
+    tseg1_max: Int
+    tseg2_min: Int
+    tseg2_max: Int
+    sjw_max: Int
+    // The fewest and the most quanta in a bit.
+    tq_min: Int
+    tq_max: Int
+    // The synchronisation jump width the solver chooses: as wide as
+    // the second phase segment (CiA 601-3's advice for CAN FD), or one
+    // quantum (the classic tables', ST's and the CAN in Automation
+    // calculator's).
+    sjw_full: Bool
+
+// A solved bit timing.  `prescaler` is 0 when no timing was found.
+pub @value
+struct CanBitTiming
+    // The clock it was solved for, in hertz.
+    clock_hz: Int
+    // The bit rate asked for, in bits per second.
+    bitrate: Int
+    // The clock divider that makes one time quantum, 1 or more.
+    prescaler: Int
+    // The propagation and first phase segments together, in quanta.
+    tseg1: Int
+    // The second phase segment, in quanta.
+    tseg2: Int
+    // The synchronisation jump width, in quanta.
+    sjw: Int
+
+// The ISO 11898-1 limits for a classic bus: 8 to 25 quanta, a first
+// segment of up to 16 and a second of up to 8.
+pub @tier(embedded)
+fn classic_limits() -> CanTimingLimits []
+    CanTimingLimits { brp_max: 1024, tseg1_min: 1, tseg1_max: 16, tseg2_min: 1, tseg2_max: 8,
+                      sjw_max: 4, tq_min: 8, tq_max: 25, sjw_full: false }
+
+// ST's bxCAN (RM0090 § 32.7.7, CAN_BTR): BRP 1 to 1024, TS1 1 to 16,
+// TS2 1 to 8, SJW 1 to 4.
+pub @tier(embedded)
+fn bxcan_limits() -> CanTimingLimits []
+    classic_limits()
+
+// Bosch M_CAN's nominal phase as ST ships it in FDCAN (RM0468
+// § 56.5.2, FDCAN_NBTP): NBRP 1 to 512, NTSEG1 2 to 256, NTSEG2 1 to
+// 128, NSJW 1 to 128.
+pub @tier(embedded)
+fn fdcan_nominal_limits() -> CanTimingLimits []
+    CanTimingLimits { brp_max: 512, tseg1_min: 2, tseg1_max: 256, tseg2_min: 1, tseg2_max: 128,
+                      sjw_max: 128, tq_min: 8, tq_max: 385, sjw_full: true }
+
+// M_CAN's data phase (FDCAN_DBTP): DBRP 1 to 32, DTSEG1 1 to 32,
+// DTSEG2 1 to 16, DSJW 1 to 16.  A data phase may be as short as four
+// quanta, which is what a fast data rate on a slow clock leaves.
+pub @tier(embedded)
+fn fdcan_data_limits() -> CanTimingLimits []
+    CanTimingLimits { brp_max: 32, tseg1_min: 1, tseg1_max: 32, tseg2_min: 1, tseg2_max: 16,
+                      sjw_max: 16, tq_min: 4, tq_max: 49, sjw_full: true }
+
+// The sample point a CAN FD data phase wants, in tenths of a percent:
+// 750, the figure CiA 601-3 recommends for data rates up to 5 Mbit/s.
+pub @tier(embedded)
+fn data_sample_point_permille(bitrate: Int) -> Int []
+    750
+
+// No timing: what the solver answers when no prescaler works.
+pub @tier(embedded)
+fn no_timing(clock_hz: Int, bitrate: Int) -> CanBitTiming []
+    CanBitTiming { clock_hz: clock_hz, bitrate: bitrate, prescaler: 0, tseg1: 0, tseg2: 0, sjw: 0 }
+
+// The timing for `bitrate` from a `clock_hz` controller clock, with the
+// sample point nearest `sample_permille` that `lim` allows, or
+// `no_timing` when the clock cannot produce the rate to within 0.1 per
+// cent.
+//
+// ```novo
+// use canbus
+//
+// fn main() [io]
+//     let t = canbus.solve_timing(42000000, 500000, 875, canbus.bxcan_limits())
+//     println("${canbus.timing_prescaler(t)} ${canbus.timing_tseg1(t)} ${canbus.timing_tseg2(t)}")   // 6 11 2
+// ```
+pub @tier(embedded)
+fn solve_timing(clock_hz: Int, bitrate: Int, sample_permille: Int,
+                lim: CanTimingLimits) -> CanBitTiming []
+    var best = no_timing(clock_hz, bitrate)
+    if clock_hz <= 0 or bitrate <= 0
+        return best
+    var best_rate_err = 0
+    var best_sp_err = 0
+    for brp in 1..lim.brp_max + 1
+        // Quanta per bit, rounded to the nearest whole quantum.
+        let per = brp * bitrate
+        let tq = (clock_hz + per / 2) / per
+        if tq < lim.tq_min
+            break
+        if tq <= lim.tq_max
+            let actual = clock_hz / (brp * tq)
+            var rate_err = (actual - bitrate) * 1000000 / bitrate
+            if rate_err < 0
+                rate_err = 0 - rate_err
+            if rate_err <= 1000
+                let t = place_sample(clock_hz, bitrate, brp, tq, sample_permille, lim)
+                if t.prescaler > 0
+                    var sp_err = timing_sample_permille(t) - sample_permille
+                    if sp_err < 0
+                        sp_err = 0 - sp_err
+                    let better = best.prescaler == 0 or rate_err < best_rate_err or rate_err == best_rate_err and sp_err < best_sp_err
+                    if better
+                        best = t
+                        best_rate_err = rate_err
+                        best_sp_err = sp_err
+    best
+
+// The segments for `tq` quanta with the sample point as near the
+// target as the limits allow, or `no_timing`.
+@tier(embedded)
+fn place_sample(clock_hz: Int, bitrate: Int, brp: Int, tq: Int, sample_permille: Int,
+                lim: CanTimingLimits) -> CanBitTiming
+    // The quantum the bus is sampled after, counted from 1.
+    var at = (tq * sample_permille + 500) / 1000
+    var tseg2 = tq - at
+    if tseg2 < lim.tseg2_min
+        tseg2 = lim.tseg2_min
+    if tseg2 > lim.tseg2_max
+        tseg2 = lim.tseg2_max
+    var tseg1 = tq - 1 - tseg2
+    if tseg1 > lim.tseg1_max
+        tseg1 = lim.tseg1_max
+        tseg2 = tq - 1 - tseg1
+    if tseg1 < lim.tseg1_min or tseg2 < lim.tseg2_min or tseg2 > lim.tseg2_max
+        return no_timing(clock_hz, bitrate)
+    var sjw = 1
+    if lim.sjw_full
+        sjw = tseg2
+    if sjw > lim.sjw_max
+        sjw = lim.sjw_max
+    CanBitTiming { clock_hz: clock_hz,
+        bitrate: bitrate,
+        prescaler: brp,
+        tseg1: tseg1,
+        tseg2: tseg2,
+        sjw: sjw }
+
+// Whether the solver found a timing.
+pub @tier(embedded)
+fn timing_ok(t: CanBitTiming) -> Bool []
+    t.prescaler > 0
+
+// The clock divider.
+pub @tier(embedded)
+fn timing_prescaler(t: CanBitTiming) -> Int []
+    t.prescaler
+
+// The first segment, propagation included, in quanta.
+pub @tier(embedded)
+fn timing_tseg1(t: CanBitTiming) -> Int []
+    t.tseg1
+
+// The second phase segment, in quanta.
+pub @tier(embedded)
+fn timing_tseg2(t: CanBitTiming) -> Int []
+    t.tseg2
+
+// The synchronisation jump width, in quanta.
+pub @tier(embedded)
+fn timing_sjw(t: CanBitTiming) -> Int []
+    t.sjw
+
+// The quanta in one bit.
+pub @tier(embedded)
+fn timing_quanta(t: CanBitTiming) -> Int []
+    if t.prescaler == 0
+        return 0
+    1 + t.tseg1 + t.tseg2
+
+// The sample point, in tenths of a percent, rounded down.
+pub @tier(embedded)
+fn timing_sample_permille(t: CanBitTiming) -> Int []
+    let q = timing_quanta(t)
+    if q == 0
+        return 0
+    (1 + t.tseg1) * 1000 / q
+
+// The bit rate the timing actually produces.
+pub @tier(embedded)
+fn timing_bitrate(t: CanBitTiming) -> Int []
+    let q = timing_quanta(t)
+    if q == 0
+        return 0
+    t.clock_hz / (t.prescaler * q)

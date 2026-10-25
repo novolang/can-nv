@@ -1,0 +1,396 @@
+// canbxcan.nv — ST's bxCAN, the classic CAN controller of the STM32F1,
+// F2, F3, F4, F7 and L4 families.
+//
+// `BxCan` is a handle that holds the controller's base address; every
+// fact about the controller's state is read from its registers, so the
+// handle is a `@value` of three integers and `CanPeripheral[hw]` is
+// implemented over it directly.  The register map is RM0090 (STM32F4),
+// chapter 32; the F1's and the L4's bxCAN are the same block.
+//
+// The controller has three transmit mailboxes, two receive FIFOs of
+// three frames each, and 28 filter banks shared between CAN1 and CAN2.
+// This driver gives CAN1 banks 0 to 13 and CAN2 banks 14 to 27, so
+// each instance has 14 filter slots, and routes every filter to FIFO 0.
+// A slot holds one mask filter or a list of two identifiers.  An
+// inverted filter has no hardware form and is refused.  After `start`
+// slot 0 holds a filter that accepts everything, so frames arrive
+// before the program sets one; setting slot 0 replaces it.
+//
+// The transmit priority is the identifier's (MCR.TXFP clear), which is
+// the order arbitration gives.  A transmit into three full mailboxes
+// aborts the pending frame that loses arbitration when the new one
+// outranks it, and answers that mailbox as displaced.  A bus-off
+// controller stays off (MCR.ABOM clear) until `can_recover` asks: the
+// pending frames are aborted, and the controller enters and leaves
+// initialisation mode and waits for 128 sequences of eleven recessive
+// bits.
+//
+// The loopback modes need no transceiver and no second node.  In
+// silent loopback (`BXCAN_MODE_SILENT_LOOPBACK`) the transmitter is
+// connected to the receiver inside the chip and nothing reaches the
+// pins, so a frame sent is received by the same controller through its
+// filters.
+//
+// Every wait on the hardware is a bounded count of register reads, so
+// a controller without a clock answers false rather than hanging.
+
+use canframe
+use canfilter
+use canbus
+use canhal
+use canerr
+
+// The base addresses on the STM32F4 (RM0090 § 2.3, the memory map).
+pub const BXCAN1_BASE = 0x40006400
+// CAN2, which shares CAN1's filter banks.
+pub const BXCAN2_BASE = 0x40006800
+
+// The operating modes, the two BTR bits LBKM (30) and SILM (31).
+// Normal: on the bus through the transceiver.
+pub const BXCAN_MODE_NORMAL = 0
+// Loopback: frames sent are received too, and also driven on TX.
+pub const BXCAN_MODE_LOOPBACK = 1
+// Silent: listen only, never drive the bus.
+pub const BXCAN_MODE_SILENT = 2
+// Silent loopback: the internal self-test, with nothing on the pins.
+pub const BXCAN_MODE_SILENT_LOOPBACK = 3
+
+// The filter slots each instance has.
+pub const BXCAN_FILTER_SLOTS = 14
+
+// The register offsets (RM0090 § 32.9).
+const MCR = 0x000
+const MSR = 0x004
+const TSR = 0x008
+const RF0R = 0x00C
+const ESR = 0x018
+const BTR = 0x01C
+const TX0 = 0x180
+const RX0 = 0x1B0
+const FMR = 0x200
+const FM1R = 0x204
+const FS1R = 0x20C
+const FFA1R = 0x214
+const FA1R = 0x21C
+const FBANK = 0x240
+
+// How many register reads a wait on the hardware makes before it gives
+// up: well over the 128 × 11 bit times recovery takes at 10 kbit/s on
+// a 168 MHz core.
+const SPIN = 2000000
+
+// A bxCAN instance: its registers, the CAN1 block that holds the
+// filter banks, and the first bank it owns.
+pub @value
+struct BxCan
+    base: Int
+    filters: Int
+    first_bank: Int
+
+// CAN1 on an STM32F4.
+pub @tier(embedded)
+fn can1() -> BxCan []
+    BxCan { base: BXCAN1_BASE, filters: BXCAN1_BASE, first_bank: 0 }
+
+// CAN2 on an STM32F4.  Its filter banks are in CAN1's block, so CAN1's
+// clock must be on too; `f4_clock_on` turns on both.
+pub @tier(embedded)
+fn can2() -> BxCan []
+    BxCan { base: BXCAN2_BASE, filters: BXCAN1_BASE, first_bank: 14 }
+
+// The CAN_BTR value for a timing and a mode: SILM and LBKM, SJW - 1,
+// TS2 - 1, TS1 - 1 and BRP - 1.
+//
+// ```novo
+// use canbus
+// use canbxcan
+//
+// fn main() [io]
+//     let t = canbus.solve_timing(42000000, 500000, 875, canbus.bxcan_limits())
+//     println("${canbxcan.btr_of(t, canbxcan.BXCAN_MODE_NORMAL)}")   // 1703941, which is 0x001A0005
+// ```
+pub @tier(embedded)
+fn btr_of(t: CanBitTiming, mode: Int) -> Int []
+    ((mode & 3) << 30) | ((canbus.timing_sjw(t) - 1) << 24) | ((canbus.timing_tseg2(t) - 1) << 20) | ((canbus.timing_tseg1(t) - 1) << 16) | (canbus.timing_prescaler(t) - 1)
+
+// Turns on the STM32F4's clock to CAN1 and CAN2 (RCC_APB1ENR, CAN1EN
+// bit 25 and CAN2EN bit 26).  bxCAN runs on APB1: 42 MHz on an F4
+// whose core runs at 168 MHz.
+pub @tier(embedded)
+// cov: skip — reads and writes the STM32F4's RCC and GPIO registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the STM32F407G-DISC1, and examples/embedded/can_demo in the novo-lang repository runs it
+fn f4_clock_on() [hw]
+    let apb1enr = 0x40023840
+    hw.mem_write32(apb1enr, hw.mem_read32(apb1enr) | (1 << 25) | (1 << 26))
+
+// Routes CAN1 to PD0 (RX) and PD1 (TX), alternate function 9, on an
+// STM32F4: the pins the STM32F407G-DISC1 brings out for CAN1.  A
+// transceiver goes between them and the bus; none is needed for the
+// loopback modes.
+pub @tier(embedded)
+// cov: skip — reads and writes the STM32F4's RCC and GPIO registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the STM32F407G-DISC1, and examples/embedded/can_demo in the novo-lang repository runs it
+fn f4_route_pd0_pd1() [hw]
+    let ahb1enr = 0x40023830
+    hw.mem_write32(ahb1enr, hw.mem_read32(ahb1enr) | (1 << 3))
+    let gpiod = 0x40020C00
+    // MODER: pins 0 and 1 to alternate function (2).
+    hw.mem_write32(gpiod, (hw.mem_read32(gpiod) & ~0xF) | 0xA)
+    // AFRL: pins 0 and 1 to AF9.
+    hw.mem_write32(gpiod + 0x20, (hw.mem_read32(gpiod + 0x20) & ~0xFF) | 0x99)
+
+// Reads a register.
+@tier(embedded)
+// cov: skip — reads the bxCAN controller's registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the STM32F407G-DISC1, and examples/embedded/can_demo in the novo-lang repository runs it
+fn rd(d: BxCan, off: Int) -> Int [hw]
+    hw.mem_read32(d.base + off) & 0xFFFFFFFF
+
+// Writes a register.
+@tier(embedded)
+// cov: skip — writes the bxCAN controller's registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the STM32F407G-DISC1, and examples/embedded/can_demo in the novo-lang repository runs it
+fn wr(d: BxCan, off: Int, v: Int) [hw]
+    hw.mem_write32(d.base + off, v & 0xFFFFFFFF)
+
+// Waits until MSR.INAK reads `want`; answers whether it did.
+@tier(embedded)
+// cov: skip — reads the bxCAN controller's registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the STM32F407G-DISC1, and examples/embedded/can_demo in the novo-lang repository runs it
+fn wait_inak(d: BxCan, want: Int) -> Bool [hw]
+    for _i in 0..SPIN
+        if (rd(d, MSR) & 1) == want
+            return true
+    false
+
+// Starts the controller: leaves sleep, enters initialisation, programs
+// the timing and the mode, gives this instance its filter banks with
+// slot 0 accepting everything, and leaves initialisation.  Answers
+// false when the controller did not answer, which on a part whose
+// clock is off is the first call.
+pub @tier(embedded)
+// cov: skip — reads and writes the bxCAN controller's registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the STM32F407G-DISC1, and examples/embedded/can_demo in the novo-lang repository runs it
+fn start(d: BxCan, t: CanBitTiming, mode: Int) -> Bool [hw]
+    if not canbus.timing_ok(t)
+        return false
+    // Clear SLEEP (bit 1), request initialisation (INRQ, bit 0).
+    wr(d, MCR, (rd(d, MCR) & ~2) | 1)
+    if not wait_inak(d, 1)
+        return false
+    // Priority by identifier (TXFP clear), automatic retransmission,
+    // no automatic bus-off recovery, the FIFO overwritten when full
+    // (RFLM clear), debug freeze (DBF, bit 16) as reset leaves it.
+    wr(d, MCR, (1 << 16) | 1)
+    wr(d, BTR, btr_of(t, mode))
+    // The filter banks: CAN2's start at 14.
+    let fmr = d.filters + FMR
+    hw.mem_write32(fmr, (hw.mem_read32(fmr) & ~0x3F00) | (14 << 8) | 1)
+    let first = d.first_bank
+    for b in first..first + BXCAN_FILTER_SLOTS
+        hw.mem_write32(d.filters + FA1R, hw.mem_read32(d.filters + FA1R) & ~(1 << b))
+    hw.mem_write32(fmr, hw.mem_read32(fmr) & ~1)
+    let _ = program_bank(d, 0, canfilter.accept_all())
+    // Leave initialisation.
+    wr(d, MCR, rd(d, MCR) & ~1)
+    wait_inak(d, 0)
+
+// The identifier register layout of a filter bank and a mailbox:
+// STID in bits 31 to 21, or the 29-bit identifier in bits 31 to 3 with
+// IDE (bit 2).
+pub @tier(embedded)
+fn id_bits(id: Int, extended: Bool) -> Int []
+    if extended
+        return ((id & 0x1FFFFFFF) << 3) | 4
+    (id & 0x7FF) << 21
+
+// Programs filter slot `slot` with `f`, in mask mode or list mode.
+@tier(embedded)
+// cov: skip — reads and writes the bxCAN controller's registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the STM32F407G-DISC1, and examples/embedded/can_demo in the novo-lang repository runs it
+fn program_bank(d: BxCan, slot: Int, f: CanFilter) -> Bool [hw]
+    if slot < 0 or slot >= BXCAN_FILTER_SLOTS or canfilter.filter_is_inverted(f)
+        return false
+    let b = d.first_bank + slot
+    let bit = 1 << b
+    let fb = d.filters
+    let ext = canfilter.filter_is_extended(f)
+    hw.mem_write32(fb + FMR, hw.mem_read32(fb + FMR) | 1)
+    hw.mem_write32(fb + FA1R, hw.mem_read32(fb + FA1R) & ~bit)
+    // 32-bit scale, FIFO 0.
+    hw.mem_write32(fb + FS1R, hw.mem_read32(fb + FS1R) | bit)
+    hw.mem_write32(fb + FFA1R, hw.mem_read32(fb + FFA1R) & ~bit)
+    if canfilter.filter_is_list(f)
+        hw.mem_write32(fb + FM1R, hw.mem_read32(fb + FM1R) | bit)
+        hw.mem_write32(fb + FBANK + 8 * b, id_bits(canfilter.filter_id(f), ext) & 0xFFFFFFFF)
+        hw.mem_write32(fb + FBANK + 8 * b + 4, id_bits(canfilter.filter_mask(f), ext) & 0xFFFFFFFF)
+    else
+        hw.mem_write32(fb + FM1R, hw.mem_read32(fb + FM1R) & ~bit)
+        var mask = 0
+        if ext
+            mask = ((canfilter.filter_mask(f) & 0x1FFFFFFF) << 3) | 4
+        else
+            mask = ((canfilter.filter_mask(f) & 0x7FF) << 21) | 4
+        // RTR (bit 1) must match 0 unless the filter lets remote frames in.
+        if (canfilter.filter_flags(f) & canfilter.CAN_FILTER_ALLOW_RTR) == 0
+            mask = mask | 2
+        hw.mem_write32(fb + FBANK + 8 * b, id_bits(canfilter.filter_id(f), ext) & 0xFFFFFFFF)
+        hw.mem_write32(fb + FBANK + 8 * b + 4, mask & 0xFFFFFFFF)
+    hw.mem_write32(fb + FA1R, hw.mem_read32(fb + FA1R) | bit)
+    hw.mem_write32(fb + FMR, hw.mem_read32(fb + FMR) & ~1)
+    true
+
+// Turns every filter slot of this instance off, so nothing is
+// received until one is set.
+pub @tier(embedded)
+// cov: skip — reads and writes the bxCAN controller's registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the STM32F407G-DISC1, and examples/embedded/can_demo in the novo-lang repository runs it
+fn clear_filters(d: BxCan) [hw]
+    let fb = d.filters
+    hw.mem_write32(fb + FMR, hw.mem_read32(fb + FMR) | 1)
+    for b in d.first_bank..d.first_bank + BXCAN_FILTER_SLOTS
+        hw.mem_write32(fb + FA1R, hw.mem_read32(fb + FA1R) & ~(1 << b))
+    hw.mem_write32(fb + FMR, hw.mem_read32(fb + FMR) & ~1)
+
+// Whether receive FIFO 0 lost a frame since the last call, which also
+// clears the flag (RF0R.FOVR0).
+pub @tier(embedded)
+// cov: skip — reads and writes the bxCAN controller's registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the STM32F407G-DISC1, and examples/embedded/can_demo in the novo-lang repository runs it
+fn overran(d: BxCan) -> Bool [hw]
+    let r = rd(d, RF0R)
+    if (r & (1 << 4)) == 0
+        return false
+    wr(d, RF0R, 1 << 4)
+    true
+
+// The arbitration key of the frame pending in mailbox `m`.
+@tier(embedded)
+// cov: skip — reads the bxCAN controller's registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the STM32F407G-DISC1, and examples/embedded/can_demo in the novo-lang repository runs it
+fn pending_key(d: BxCan, m: Int) -> Int [hw]
+    let tir = rd(d, TX0 + 16 * m)
+    let ext = (tir & 4) != 0
+    var f = canframe.frame((tir >>> 21) & 0x7FF, 0, 0)
+    if ext
+        f = canframe.frame_ext((tir >>> 3) & 0x1FFFFFFF, 0, 0)
+    if (tir & 2) != 0
+        if ext
+            f = canframe.remote_frame_ext((tir >>> 3) & 0x1FFFFFFF, 0)
+        else
+            f = canframe.remote_frame((tir >>> 21) & 0x7FF, 0)
+    canframe.arbitration_key(f)
+
+// Writes `f` to mailbox `m` and requests its transmission.
+@tier(embedded)
+// cov: skip — writes the bxCAN controller's registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the STM32F407G-DISC1, and examples/embedded/can_demo in the novo-lang repository runs it
+fn load_mailbox(d: BxCan, m: Int, f: CanFrame) [hw]
+    let at = TX0 + 16 * m
+    var tir = id_bits(canframe.frame_id(f), canframe.is_extended(f))
+    if canframe.is_remote(f)
+        tir = tir | 2
+    wr(d, at, tir)
+    wr(d, at + 4, canframe.frame_len(f) & 0xF)
+    let data = canframe.frame_data(f)
+    wr(d, at + 8, data & 0xFFFFFFFF)
+    wr(d, at + 12, (data >>> 32) & 0xFFFFFFFF)
+    wr(d, at, tir | 1)
+
+// cov: skip — reads and writes the bxCAN controller's registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the STM32F407G-DISC1, and examples/embedded/can_demo in the novo-lang repository runs it
+impl CanPeripheral[hw] for BxCan
+    @tier(embedded)
+    fn can_transmit(self, f: CanFrame) -> CanTxAccepted [hw]
+        let esr = rd(self, ESR)
+        if (esr & 4) != 0
+            return canhal.tx_refused(canhal.CAN_TX_BUS_OFF)
+        if not canhal.frame_ok(f)
+            return canhal.tx_refused(canhal.CAN_TX_REFUSED)
+        let tsr = rd(self, TSR)
+        for m in 0..3
+            if (tsr & (1 << (26 + m))) != 0
+                load_mailbox(self, m, f)
+                return canhal.accepted(m, 0 - 1)
+        // Every mailbox is pending: displace the one that loses
+        // arbitration, if this frame outranks it.
+        var worst = 0
+        var worst_key = pending_key(self, 0)
+        for m in 1..3
+            let k = pending_key(self, m)
+            if k >= worst_key
+                worst = m
+                worst_key = k
+        if canframe.arbitration_key(f) >= worst_key
+            return canhal.tx_refused(canhal.CAN_TX_FULL)
+        // ABRQ: bit 7 of the mailbox's byte in TSR.
+        wr(self, TSR, 1 << (8 * worst + 7))
+        for _i in 0..SPIN
+            if (rd(self, TSR) & (1 << (26 + worst))) != 0
+                load_mailbox(self, worst, f)
+                return canhal.accepted(worst, worst)
+        canhal.tx_refused(canhal.CAN_TX_FULL)
+
+    @tier(embedded)
+    fn can_tx_done(self, mailbox: Int) -> Bool [hw]
+        if mailbox < 0 or mailbox > 2
+            return true
+        (rd(self, TSR) & (1 << (26 + mailbox))) != 0
+
+    @tier(embedded)
+    fn can_tx_abort(self, mailbox: Int) -> ?CanError [hw]
+        if mailbox >= 0 and mailbox <= 2
+            wr(self, TSR, 1 << (8 * mailbox + 7))
+        None
+
+    @tier(embedded)
+    fn can_receive(self) -> CanFrame [hw]
+        if (rd(self, RF0R) & 3) == 0
+            return canframe.none()
+        let rir = rd(self, RX0)
+        let n = rd(self, RX0 + 4) & 0xF
+        let lo = rd(self, RX0 + 8)
+        let hi = rd(self, RX0 + 12)
+        // Release the FIFO's output slot (RFOM0).
+        wr(self, RF0R, 1 << 5)
+        var len = n
+        if len > 8
+            len = 8
+        let ext = (rir & 4) != 0
+        let rtr = (rir & 2) != 0
+        if ext
+            let id = (rir >>> 3) & 0x1FFFFFFF
+            if rtr
+                return canframe.remote_frame_ext(id, len)
+            return canframe.frame_ext(id, len, lo | (hi << 32))
+        let id = (rir >>> 21) & 0x7FF
+        if rtr
+            return canframe.remote_frame(id, len)
+        canframe.frame(id, len, lo | (hi << 32))
+
+    @tier(embedded)
+    fn can_set_filter(self, slot: Int, f: CanFilter) -> ?CanError [hw]
+        if not program_bank(self, slot, f)
+            return Some(CanFilterNotSupported)
+        None
+
+    @tier(embedded)
+    fn can_filter_slots(self) -> Int
+        BXCAN_FILTER_SLOTS
+
+    @tier(embedded)
+    fn can_bus_state(self) -> CanBusState [hw]
+        let esr = rd(self, ESR)
+        let rec = (esr >>> 24) & 0xFF
+        if (esr & 4) != 0
+            return canbus.bus_state_of(canbus.CAN_BUS_OFF_LIMIT, rec)
+        canbus.bus_state_of((esr >>> 16) & 0xFF, rec)
+
+    @tier(embedded)
+    fn can_recover(self) -> ?CanError [hw]
+        if (rd(self, ESR) & 4) == 0
+            return None
+        // What is pending is aborted first, so the frame that took the
+        // node off is not sent again the moment it rejoins.  With ABOM
+        // clear, recovery is the software's: enter and leave
+        // initialisation, and the controller rejoins after 128
+        // sequences of eleven recessive bits.
+        wr(self, TSR, (1 << 7) | (1 << 15) | (1 << 23))
+        wr(self, MCR, rd(self, MCR) | 1)
+        if not wait_inak(self, 1)
+            return Some(CanBusOff)
+        wr(self, MCR, rd(self, MCR) & ~1)
+        if not wait_inak(self, 0)
+            return Some(CanBusOff)
+        for _i in 0..SPIN
+            if (rd(self, ESR) & 4) == 0
+                return None
+        Some(CanBusOff)

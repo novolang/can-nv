@@ -1,8 +1,6 @@
 // cantxq.nv — a bounded transmit queue that does not invert the bus's
 // own ordering.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // A FIFO IS THE WRONG QUEUE FOR CAN, and that is the only reason this
 // module exists.  CAN arbitration is by identifier: when two nodes
 // start a frame at the same moment the numerically smaller identifier
@@ -20,23 +18,27 @@
 // named, so a driver's choice is visible at its call site rather than
 // implied by which package it picked.
 //
-// THE STORAGE IS THE CALLER'S.  This module holds the bookkeeping and
-// answers INDICES into storage the caller declares.  On a device that
-// is a `Vec[CanFrame; N]` from the language's fixed-capacity family
-// (SPEC section 14.8), a module-level `var` sized to that product's
-// burst.  The queue cannot own that storage itself, because a
-// capacity is an integer literal in the type and a package cannot be
-// generic over it.
+// The storage is the caller's.  This module keeps the bookkeeping and
+// answers indices into a `Vec[CanFrame; N]` the caller declares, which
+// on a device is a module-level `var` in `.bss` sized to the product's
+// burst.  A queue that owned its frames would have to allocate.  The
+// occupied slots are one run in arrival order; taking a frame from the
+// middle moves the oldest frame into the emptied slot (`refill_from`).
+//
+// The readers `dequeue_index` and the others take, `key_at` and
+// `id_at`, read the caller's storage, which is a module-level `var`
+// and so costs `[mutate]`; the queue functions that call them are
+// charged the same.
 
 use canframe
+use canerr
 
 // ── The queue ────────────────────────────────────────────────────────
 
 // A bounded transmit queue: which slots of the caller's array are
 // occupied, and in what order they arrived.
 //
-// The frames themselves are the caller's.  What this holds is a ring's
-// bookkeeping and a drop count, which is four integers.
+// The frames themselves are the caller's.  This is four integers.
 pub @value
 struct CanTxQueue
     // The index of the oldest occupied slot.
@@ -58,37 +60,47 @@ struct CanTxQueue
 // fn main() [io]
 //     println("${cantxq.capacity(cantxq.queue(16))}")   // 16
 // ```
-pub fn queue(capacity: Int) -> CanTxQueue []
-    todo("can-nv.cantxq.queue")
+pub @tier(embedded)
+fn queue(capacity: Int) -> CanTxQueue []
+    var cap = capacity
+    if cap < 0
+        cap = 0
+    CanTxQueue { head: 0, count: 0, capacity: cap, dropped: 0 }
 
 // How many frames are queued.
-pub fn len(q: CanTxQueue) -> Int []
-    todo("can-nv.cantxq.len")
+pub @tier(embedded)
+fn len(q: CanTxQueue) -> Int []
+    q.count
 
 // How many slots the caller's array has.
-pub fn capacity(q: CanTxQueue) -> Int []
-    todo("can-nv.cantxq.capacity")
+pub @tier(embedded)
+fn capacity(q: CanTxQueue) -> Int []
+    q.capacity
 
 // Whether nothing is queued.
-pub fn is_empty(q: CanTxQueue) -> Bool []
-    todo("can-nv.cantxq.is_empty")
+pub @tier(embedded)
+fn is_empty(q: CanTxQueue) -> Bool []
+    q.count == 0
 
 // Whether every slot is occupied.
-pub fn is_full(q: CanTxQueue) -> Bool []
-    todo("can-nv.cantxq.is_full")
+pub @tier(embedded)
+fn is_full(q: CanTxQueue) -> Bool []
+    q.count >= q.capacity
 
 // How many frames have been dropped since the queue was made.
-pub fn dropped(q: CanTxQueue) -> Int []
-    todo("can-nv.cantxq.dropped")
+pub @tier(embedded)
+fn dropped(q: CanTxQueue) -> Int []
+    q.dropped
 
 // ── Putting a frame in ───────────────────────────────────────────────
 
 // Which slot of the caller's array the next frame goes in, or -1 when
 // the queue is full.
 //
-// The caller writes the frame there itself and then calls `enqueued`.
-// The bookkeeping is this package's and the storage is the caller's,
-// so nothing here ever holds a frame.
+// The caller writes the frame there itself and then calls `enqueued`,
+// which is a two-step shape: the bookkeeping is this
+// package's and the storage is the caller's, so nothing here ever
+// holds a frame.
 //
 // ```novo
 // use cantxq
@@ -96,21 +108,28 @@ pub fn dropped(q: CanTxQueue) -> Int []
 // fn main() [io]
 //     println("${cantxq.enqueue_at(cantxq.queue(16))}")   // 0
 // ```
-pub fn enqueue_at(q: CanTxQueue) -> Int []
-    todo("can-nv.cantxq.enqueue_at")
+pub @tier(embedded)
+fn enqueue_at(q: CanTxQueue) -> Int []
+    if is_full(q)
+        return 0 - 1
+    slot(q, q.count)
 
 // The queue after a frame has been written to `enqueue_at`'s slot.
-pub fn enqueued(q: CanTxQueue) -> CanTxQueue []
-    todo("can-nv.cantxq.enqueued")
+pub @tier(embedded)
+fn enqueued(q: CanTxQueue) -> CanTxQueue []
+    if is_full(q)
+        return q
+    CanTxQueue { head: q.head, count: q.count + 1, capacity: q.capacity, dropped: q.dropped }
 
 // The queue with the drop counter raised, for a caller that had no
 // room.
 //
 // Nothing here panics when full: `enqueue_at` answers -1 and the
-// caller decides.  A transmit path runs in an interrupt, where a panic
-// is a reset.
-pub fn dropped_one(q: CanTxQueue) -> CanTxQueue []
-    todo("can-nv.cantxq.dropped_one")
+// caller decides.  That is the right rule
+// for a transmit path in an interrupt, where a panic is a reset.
+pub @tier(embedded)
+fn dropped_one(q: CanTxQueue) -> CanTxQueue []
+    CanTxQueue { head: q.head, count: q.count, capacity: q.capacity, dropped: q.dropped + 1 }
 
 // ── Taking one out ───────────────────────────────────────────────────
 
@@ -137,8 +156,17 @@ pub fn dropped_one(q: CanTxQueue) -> CanTxQueue []
 // fn main() [io]
 //     println("${cantxq.len(cantxq.queue(8))}")   // 0
 // ```
-pub fn dequeue_index(q: CanTxQueue, key_at: fn(Int) -> Int) -> Int []
-    todo("can-nv.cantxq.dequeue_index")
+pub @tier(embedded)
+fn dequeue_index(q: CanTxQueue, key_at: fn(Int) -> Int [mutate]) -> Int [mutate]
+    var best = 0 - 1
+    var best_key = 0
+    for k in 0..q.count
+        let i = slot(q, k)
+        let key = key_at(i)
+        if best < 0 or key < best_key
+            best = i
+            best_key = key
+    best
 
 // Which queued slot holds the OLDEST frame, or -1 when the queue is
 // empty.
@@ -147,13 +175,49 @@ pub fn dequeue_index(q: CanTxQueue, key_at: fn(Int) -> Int) -> Int []
 // capture, or a test that must be deterministic regardless of
 // identifier.  Named rather than implied, so the choice is visible at
 // the call site.
-pub fn dequeue_fifo_index(q: CanTxQueue) -> Int []
-    todo("can-nv.cantxq.dequeue_fifo_index")
+pub @tier(embedded)
+fn dequeue_fifo_index(q: CanTxQueue) -> Int []
+    if q.count == 0
+        return 0 - 1
+    q.head
+
+// The slot whose frame the caller moves into slot `i` before calling
+// `dequeued(q, i)`, or -1 when nothing moves.
+//
+// The occupied slots stay one run in arrival order, so taking a frame
+// out of the middle frees the oldest slot instead: the oldest frame is
+// copied into the slot just emptied, and `dequeued` releases the
+// oldest slot.  The copy is the caller's, because the frames are.
+// Nothing moves when `i` is the oldest or the newest slot.
+//
+// ```novo norun:fragment
+// let i = cantxq.dequeue_index(q, key_at)
+// send(frames[i])
+// let from = cantxq.refill_from(q, i)
+// if from >= 0
+//     frames[i] = frames[from]
+// q = cantxq.dequeued(q, i)
+// ```
+pub @tier(embedded)
+fn refill_from(q: CanTxQueue, i: Int) -> Int []
+    if q.count < 2 or not occupied(q, i)
+        return 0 - 1
+    if i == q.head or i == slot(q, q.count - 1)
+        return 0 - 1
+    q.head
 
 // The queue after the frame in slot `i` has been handed to the
-// controller.
-pub fn dequeued(q: CanTxQueue, i: Int) -> CanTxQueue []
-    todo("can-nv.cantxq.dequeued")
+// controller.  When `refill_from(q, i)` named a slot, its frame must
+// already have been copied into `i`.
+pub @tier(embedded)
+fn dequeued(q: CanTxQueue, i: Int) -> CanTxQueue []
+    if q.count == 0 or not occupied(q, i)
+        return q
+    if i == slot(q, q.count - 1) and i != q.head
+        return CanTxQueue { head: q.head, count: q.count - 1, capacity: q.capacity, dropped: q.dropped }
+    // The slot freed is the oldest: `refill_from` named it, and the
+    // caller has moved its frame into `i` already when `i` was not it.
+    CanTxQueue { head: slot(q, 1), count: q.count - 1, capacity: q.capacity, dropped: q.dropped }
 
 // The queue with everything discarded, the drop counter raised by
 // what was in it.
@@ -162,8 +226,9 @@ pub fn dequeued(q: CanTxQueue, i: Int) -> CanTxQueue []
 // going anywhere, and a queue that kept them would deliver stale
 // commands the moment the bus recovered — which for an actuator is
 // worse than delivering nothing.
-pub fn cleared(q: CanTxQueue) -> CanTxQueue []
-    todo("can-nv.cantxq.cleared")
+pub @tier(embedded)
+fn cleared(q: CanTxQueue) -> CanTxQueue []
+    CanTxQueue { head: 0, count: 0, capacity: q.capacity, dropped: q.dropped + q.count }
 
 // ── Making room ──────────────────────────────────────────────────────
 
@@ -175,14 +240,26 @@ pub fn cleared(q: CanTxQueue) -> CanTxQueue []
 // exactly the frame that mattered, which is the failure mode of every
 // queue that treats fullness as a property of arrival rather than of
 // priority.
-pub fn lowest_priority_index(q: CanTxQueue, key_at: fn(Int) -> Int) -> Int []
-    todo("can-nv.cantxq.lowest_priority_index")
+pub @tier(embedded)
+fn lowest_priority_index(q: CanTxQueue, key_at: fn(Int) -> Int [mutate]) -> Int [mutate]
+    var worst = 0 - 1
+    var worst_key = 0
+    for k in 0..q.count
+        let i = slot(q, k)
+        let key = key_at(i)
+        if worst < 0 or key >= worst_key
+            worst = i
+            worst_key = key
+    worst
 
 // Whether a frame with this arbitration key should displace something
 // rather than be dropped: true when the queue is full and the key
 // beats its lowest-priority member's.
-pub fn should_displace(q: CanTxQueue, key: Int, key_at: fn(Int) -> Int) -> Bool []
-    todo("can-nv.cantxq.should_displace")
+pub @tier(embedded)
+fn should_displace(q: CanTxQueue, key: Int, key_at: fn(Int) -> Int [mutate]) -> Bool [mutate]
+    if not is_full(q) or q.count == 0
+        return false
+    key < key_at(lowest_priority_index(q, key_at))
 
 // Whether a frame with this identifier is already queued.
 //
@@ -190,13 +267,43 @@ pub fn should_displace(q: CanTxQueue, key: Int, key_at: fn(Int) -> Int) -> Bool 
 // into a queue that is draining slower than that accumulates copies,
 // and the newest is the only one worth sending.  `replace_at` is what
 // follows.
-pub fn holds_id(q: CanTxQueue, id: Int, id_at: fn(Int) -> Int) -> Bool []
-    todo("can-nv.cantxq.holds_id")
+pub @tier(embedded)
+fn holds_id(q: CanTxQueue, id: Int, id_at: fn(Int) -> Int [mutate]) -> Bool [mutate]
+    index_of_id(q, id, id_at) >= 0
 
 // Which queued slot holds a frame with this identifier, or -1.
-pub fn index_of_id(q: CanTxQueue, id: Int, id_at: fn(Int) -> Int) -> Int []
-    todo("can-nv.cantxq.index_of_id")
+pub @tier(embedded)
+fn index_of_id(q: CanTxQueue, id: Int, id_at: fn(Int) -> Int [mutate]) -> Int [mutate]
+    for k in 0..q.count
+        let i = slot(q, k)
+        if id_at(i) == id
+            return i
+    0 - 1
 
 // Why a frame cannot be queued, or nothing.
-pub fn check_enqueue(q: CanTxQueue, f: CanFrame) -> ?CanError []
-    todo("can-nv.cantxq.check_enqueue")
+pub @tier(rt)
+fn check_enqueue(q: CanTxQueue, f: CanFrame) -> ?CanError []
+    match canframe.check_frame(f)
+        Some(e) =>
+            return Some(e)
+        None    => ()
+    if is_full(q)
+        return Some(CanQueueFull(q.capacity))
+    None
+
+// The array index of the `k`-th oldest occupied slot.
+@tier(embedded)
+fn slot(q: CanTxQueue, k: Int) -> Int
+    if q.capacity == 0
+        return 0
+    (q.head + k) % q.capacity
+
+// Whether array index `i` holds a queued frame.
+@tier(embedded)
+fn occupied(q: CanTxQueue, i: Int) -> Bool
+    if i < 0 or i >= q.capacity
+        return false
+    var k = i - q.head
+    if k < 0
+        k = k + q.capacity
+    k < q.count

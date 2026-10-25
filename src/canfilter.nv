@@ -1,7 +1,5 @@
 // canfilter.nv — acceptance filters and masks, as values.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // A FILTER IS A CONTROLLER'S ONLY DEFENCE.  A busy CAN bus carries
 // thousands of frames a second and a node cares about perhaps five of
 // them; a controller that interrupted on all of them would spend its
@@ -30,6 +28,9 @@
 // reports it and the symptom is frames that do not arrive.
 // `check_filter` is the refusal.
 
+use canframe
+use canerr
+
 // ── The filter ───────────────────────────────────────────────────────
 
 // One acceptance filter: an identifier, a mask over it, and flags.
@@ -57,6 +58,12 @@ pub const CAN_FILTER_INVERTED = 0x02
 // default, because a node that answers its own remote frames is a
 // surprise a caller should ask for.
 pub const CAN_FILTER_ALLOW_RTR = 0x04
+// The filter is a LIST of two identifiers rather than an identifier and
+// a mask: it matches exactly those two.  `id` holds the first and
+// `mask` the second.  A controller holds one in a filter slot in its
+// list mode (a bxCAN bank in identifier-list mode, an M_CAN dual-ID
+// element), which is two exact matches for the price of one slot.
+pub const CAN_FILTER_LIST = 0x08
 
 // Build a filter over standard identifiers.
 //
@@ -67,12 +74,14 @@ pub const CAN_FILTER_ALLOW_RTR = 0x04
 //     let f = canfilter.filter(0x100, 0x700)
 //     println("${canfilter.accepts_id(f, 0x123, false)}")   // true
 // ```
-pub fn filter(id: Int, mask: Int) -> CanFilter []
-    todo("can-nv.canfilter.filter")
+pub @tier(embedded)
+fn filter(id: Int, mask: Int) -> CanFilter []
+    CanFilter { id: id, mask: mask, flags: 0 }
 
 // Build a filter over extended identifiers.
-pub fn filter_ext(id: Int, mask: Int) -> CanFilter []
-    todo("can-nv.canfilter.filter_ext")
+pub @tier(embedded)
+fn filter_ext(id: Int, mask: Int) -> CanFilter []
+    CanFilter { id: id, mask: mask, flags: CAN_FILTER_EXTENDED }
 
 // A filter that accepts exactly one standard identifier.
 //
@@ -82,49 +91,83 @@ pub fn filter_ext(id: Int, mask: Int) -> CanFilter []
 // fn main() [io]
 //     println("${canfilter.filter_mask(canfilter.exact(0x123))}")   // 2047
 // ```
-pub fn exact(id: Int) -> CanFilter []
-    todo("can-nv.canfilter.exact")
+pub @tier(embedded)
+fn exact(id: Int) -> CanFilter []
+    filter(id, CAN_SFF_MASK)
 
 // A filter that accepts exactly one extended identifier.
-pub fn exact_ext(id: Int) -> CanFilter []
-    todo("can-nv.canfilter.exact_ext")
+pub @tier(embedded)
+fn exact_ext(id: Int) -> CanFilter []
+    filter_ext(id, CAN_EFF_MASK)
 
 // A filter that accepts every standard identifier.
-pub fn accept_all() -> CanFilter []
-    todo("can-nv.canfilter.accept_all")
+pub @tier(embedded)
+fn accept_all() -> CanFilter []
+    filter(0, 0)
 
 // A filter that accepts every extended identifier.
-pub fn accept_all_ext() -> CanFilter []
-    todo("can-nv.canfilter.accept_all_ext")
+pub @tier(embedded)
+fn accept_all_ext() -> CanFilter []
+    filter_ext(0, 0)
+
+// A list filter over standard identifiers: exactly `id_a` and `id_b`.
+//
+// ```novo
+// use canfilter
+//
+// fn main() [io]
+//     let f = canfilter.list(0x100, 0x2A0)
+//     println("${canfilter.accepts_id(f, 0x2A0, false)} ${canfilter.width(f)}")   // true 2
+// ```
+pub @tier(embedded)
+fn list(id_a: Int, id_b: Int) -> CanFilter []
+    CanFilter { id: id_a, mask: id_b, flags: CAN_FILTER_LIST }
+
+// A list filter over extended identifiers.
+pub @tier(embedded)
+fn list_ext(id_a: Int, id_b: Int) -> CanFilter []
+    CanFilter { id: id_a, mask: id_b, flags: CAN_FILTER_LIST | CAN_FILTER_EXTENDED }
+
+// Whether the filter is a list of two identifiers.
+pub @tier(embedded)
+fn filter_is_list(f: CanFilter) -> Bool []
+    (f.flags & CAN_FILTER_LIST) != 0
 
 // The same filter with its sense inverted: what it accepted it now
 // rejects.
-pub fn inverted(f: CanFilter) -> CanFilter []
-    todo("can-nv.canfilter.inverted")
+pub @tier(embedded)
+fn inverted(f: CanFilter) -> CanFilter []
+    CanFilter { id: f.id, mask: f.mask, flags: f.flags ^ CAN_FILTER_INVERTED }
 
 // The same filter, also accepting remote frames.
-pub fn allowing_remote(f: CanFilter) -> CanFilter []
-    todo("can-nv.canfilter.allowing_remote")
+pub @tier(embedded)
+fn allowing_remote(f: CanFilter) -> CanFilter []
+    CanFilter { id: f.id, mask: f.mask, flags: f.flags | CAN_FILTER_ALLOW_RTR }
 
 // The identifier.
-pub fn filter_id(f: CanFilter) -> Int []
-    todo("can-nv.canfilter.filter_id")
+pub @tier(embedded)
+fn filter_id(f: CanFilter) -> Int []
+    f.id
 
 // The mask.
-pub fn filter_mask(f: CanFilter) -> Int []
-    todo("can-nv.canfilter.filter_mask")
+pub @tier(embedded)
+fn filter_mask(f: CanFilter) -> Int []
+    f.mask
 
 // The flag bits.
-pub fn filter_flags(f: CanFilter) -> Int []
-    todo("can-nv.canfilter.filter_flags")
+pub @tier(embedded)
+fn filter_flags(f: CanFilter) -> Int []
+    f.flags
 
 // Whether the filter is over extended identifiers.
-pub fn filter_is_extended(f: CanFilter) -> Bool []
-    todo("can-nv.canfilter.filter_is_extended")
+pub @tier(embedded)
+fn filter_is_extended(f: CanFilter) -> Bool []
+    (f.flags & CAN_FILTER_EXTENDED) != 0
 
 // Whether the filter's sense is inverted.
-pub fn filter_is_inverted(f: CanFilter) -> Bool []
-    todo("can-nv.canfilter.filter_is_inverted")
+pub @tier(embedded)
+fn filter_is_inverted(f: CanFilter) -> Bool []
+    (f.flags & CAN_FILTER_INVERTED) != 0
 
 // ── Evaluating one ───────────────────────────────────────────────────
 
@@ -144,12 +187,23 @@ pub fn filter_is_inverted(f: CanFilter) -> Bool []
 //     println("${canfilter.accepts_id(f, 0x1FF, false)}")   // true
 //     println("${canfilter.accepts_id(f, 0x2FF, false)}")   // false
 // ```
-pub fn accepts_id(f: CanFilter, id: Int, extended: Bool) -> Bool []
-    todo("can-nv.canfilter.accepts_id")
+pub @tier(embedded)
+fn accepts_id(f: CanFilter, id: Int, extended: Bool) -> Bool []
+    if extended != filter_is_extended(f)
+        return false
+    let m = matches(f, id)
+    if filter_is_inverted(f)
+        return not m
+    m
 
 // Whether the filter accepts this frame, its remote flag included.
-pub fn accepts(f: CanFilter, fr: CanFrame) -> Bool []
-    todo("can-nv.canfilter.accepts")
+pub @tier(embedded)
+fn accepts(f: CanFilter, fr: CanFrame) -> Bool []
+    if not canframe.is_frame(fr)
+        return false
+    if canframe.is_remote(fr) and (f.flags & CAN_FILTER_ALLOW_RTR) == 0
+        return false
+    accepts_id(f, canframe.frame_id(fr), canframe.is_extended(fr))
 
 // How many identifiers the filter accepts.
 //
@@ -164,8 +218,12 @@ pub fn accepts(f: CanFilter, fr: CanFrame) -> Bool []
 // fn main() [io]
 //     println("${canfilter.width(canfilter.filter(0x100, 0x700))}")   // 256
 // ```
-pub fn width(f: CanFilter) -> Int []
-    todo("can-nv.canfilter.width")
+pub @tier(embedded)
+fn width(f: CanFilter) -> Int []
+    let n = match_width(f)
+    if filter_is_inverted(f)
+        return space(f) - n
+    n
 
 // Why a filter cannot be used, or nothing.
 //
@@ -180,8 +238,16 @@ pub fn width(f: CanFilter) -> Int []
 // fn main() [io]
 //     println("${canfilter.filter_id(canfilter.filter(0x123, 0x700))}")
 // ```
-pub fn check_filter(f: CanFilter) -> ?CanError []
-    todo("can-nv.canfilter.check_filter")
+pub @tier(rt)
+fn check_filter(f: CanFilter) -> ?CanError []
+    let fm = format_mask(f)
+    if filter_is_list(f)
+        if (f.id & ~fm) != 0 or (f.mask & ~fm) != 0
+            return Some(CanFilterUnreachable(f.id, f.mask))
+        return None
+    if (f.id & ~f.mask & fm) != 0 or (f.id & ~fm) != 0
+        return Some(CanFilterUnreachable(f.id, f.mask))
+    None
 
 // ── Fitting more filters than the hardware has ───────────────────────
 
@@ -205,13 +271,36 @@ pub fn check_filter(f: CanFilter) -> ?CanError []
 //     let m = canfilter.merge(canfilter.exact(0x100), canfilter.exact(0x101))
 //     println("${canfilter.width(m)}")   // 2
 // ```
-pub fn merge(a: CanFilter, b: CanFilter) -> CanFilter []
-    todo("can-nv.canfilter.merge")
+pub @tier(embedded)
+fn merge(a: CanFilter, b: CanFilter) -> CanFilter []
+    if filter_is_list(a) or filter_is_list(b)
+        if filter_is_inverted(a) or not can_merge(a, b)
+            if filter_is_extended(a)
+                return accept_all_ext()
+            return accept_all()
+        return merge(as_mask(a), as_mask(b))
+    if not can_merge(a, b)
+        if filter_is_extended(a)
+            return accept_all_ext()
+        return accept_all()
+    let fm = format_mask(a)
+    if filter_is_inverted(a)
+        // The match sets' intersection, inverted: what either input
+        // rejects is still rejected only where both reject it.
+        if not match_overlaps(a, b)
+            return CanFilter { id: 0, mask: 0, flags: a.flags & ~CAN_FILTER_INVERTED }
+        let m = (a.mask | b.mask) & fm
+        return CanFilter { id: ((a.id & a.mask) | (b.id & b.mask)) & m,
+            mask: m,
+            flags: a.flags | (b.flags & CAN_FILTER_ALLOW_RTR) }
+    let m = a.mask & b.mask & ~(a.id ^ b.id) & fm
+    CanFilter { id: a.id & m, mask: m, flags: a.flags | (b.flags & CAN_FILTER_ALLOW_RTR) }
 
 // Whether two filters can be merged at all: same identifier format,
 // same sense.
-pub fn can_merge(a: CanFilter, b: CanFilter) -> Bool []
-    todo("can-nv.canfilter.can_merge")
+pub @tier(embedded)
+fn can_merge(a: CanFilter, b: CanFilter) -> Bool []
+    filter_is_extended(a) == filter_is_extended(b) and filter_is_inverted(a) == filter_is_inverted(b)
 
 // How many identifiers the merge of these two accepts that neither of
 // them did.
@@ -219,8 +308,14 @@ pub fn can_merge(a: CanFilter, b: CanFilter) -> Bool []
 // The cost of the widening, as a number a driver can compare against a
 // budget: a merge that lets through 4096 extra identifiers on a bus
 // carrying 200 is a merge that has switched the filter off.
-pub fn false_accept_width(a: CanFilter, b: CanFilter) -> Int []
-    todo("can-nv.canfilter.false_accept_width")
+pub @tier(embedded)
+fn false_accept_width(a: CanFilter, b: CanFilter) -> Int []
+    let m = merge(a, b)
+    let either = width(a) + width(b) - both_width(a, b)
+    let extra = width(m) - either
+    if extra < 0
+        return 0
+    extra
 
 // Whether `a` accepts everything `b` does, so `b` adds nothing beside
 // it.
@@ -228,9 +323,130 @@ pub fn false_accept_width(a: CanFilter, b: CanFilter) -> Int []
 // The check that finds a redundant filter, which is the other half of
 // fitting nine filters into four slots: two of the nine are usually
 // the same filter written twice.
-pub fn covers(a: CanFilter, b: CanFilter) -> Bool []
-    todo("can-nv.canfilter.covers")
+pub @tier(embedded)
+fn covers(a: CanFilter, b: CanFilter) -> Bool []
+    if filter_is_extended(a) != filter_is_extended(b)
+        return width(b) == 0
+    if (b.flags & CAN_FILTER_ALLOW_RTR) != 0 and (a.flags & CAN_FILTER_ALLOW_RTR) == 0
+        return false
+    let ia = filter_is_inverted(a)
+    let ib = filter_is_inverted(b)
+    if not ia and not ib
+        return match_covers(a, b)
+    if ia and ib
+        return match_covers(b, a)
+    if ia
+        return not match_overlaps(a, b)
+    // `a` matches, `b` accepts the complement of what it matches: only
+    // a filter matching everything covers that.
+    match_width(a) == space(a)
 
 // Whether any identifier is accepted by both.
-pub fn overlaps(a: CanFilter, b: CanFilter) -> Bool []
-    todo("can-nv.canfilter.overlaps")
+pub @tier(embedded)
+fn overlaps(a: CanFilter, b: CanFilter) -> Bool []
+    if filter_is_extended(a) != filter_is_extended(b)
+        return false
+    both_width(a, b) > 0
+
+// ── Set arithmetic over one identifier format ────────────────────────
+
+// The identifier bits of the filter's format: eleven or twenty-nine.
+@tier(embedded)
+fn format_mask(f: CanFilter) -> Int
+    if filter_is_extended(f)
+        return canframe.CAN_EFF_MASK
+    canframe.CAN_SFF_MASK
+
+// How many identifiers the format has: 2048 or 2^29.
+@tier(embedded)
+fn space(f: CanFilter) -> Int
+    format_mask(f) + 1
+
+// Whether the identifier matches the filter's identifier under its mask,
+// before the inversion is applied.
+@tier(embedded)
+fn matches(f: CanFilter, id: Int) -> Bool
+    let fm = format_mask(f)
+    if filter_is_list(f)
+        return (id & fm) == (f.id & fm) or (id & fm) == (f.mask & fm)
+    ((id ^ f.id) & f.mask & fm) == 0
+
+// The number of bits set.
+@tier(embedded)
+fn ones(v: Int) -> Int
+    var n = 0
+    for i in 0..64
+        n = n + ((v >>> i) & 1)
+    n
+
+// How many identifiers the filter matches, before the inversion.
+@tier(embedded)
+fn match_width(f: CanFilter) -> Int
+    let fm = format_mask(f)
+    if filter_is_list(f)
+        if (f.id & fm) == (f.mask & fm)
+            return 1
+        return 2
+    1 << (ones(fm) - ones(f.mask & fm))
+
+// Whether some identifier matches both, before the inversions.
+@tier(embedded)
+fn match_overlaps(a: CanFilter, b: CanFilter) -> Bool
+    if filter_is_list(a) or filter_is_list(b)
+        return match_both(a, b) > 0
+    ((a.id ^ b.id) & a.mask & b.mask & format_mask(a)) == 0
+
+// How many identifiers match both, before the inversions.
+@tier(embedded)
+fn match_both(a: CanFilter, b: CanFilter) -> Int
+    if filter_is_list(a)
+        var n = 0
+        if matches(b, a.id)
+            n = n + 1
+        if match_width(a) == 2 and matches(b, a.mask)
+            n = n + 1
+        return n
+    if filter_is_list(b)
+        return match_both(b, a)
+    if not match_overlaps(a, b)
+        return 0
+    let fm = format_mask(a)
+    1 << (ones(fm) - ones((a.mask | b.mask) & fm))
+
+// Whether every identifier `b` matches is one `a` matches.
+@tier(embedded)
+fn match_covers(a: CanFilter, b: CanFilter) -> Bool
+    if filter_is_list(a) or filter_is_list(b)
+        return match_both(a, b) == match_width(b)
+    let fm = format_mask(a)
+    let am = a.mask & fm
+    (am & ~(b.mask & fm)) == 0 and ((a.id ^ b.id) & am) == 0
+
+// How many identifiers both filters accept, inversions included.  Two
+// filters of different formats share none.
+@tier(embedded)
+fn both_width(a: CanFilter, b: CanFilter) -> Int
+    if filter_is_extended(a) != filter_is_extended(b)
+        return 0
+    let ma = match_width(a)
+    let mb = match_width(b)
+    let mi = match_both(a, b)
+    let ia = filter_is_inverted(a)
+    let ib = filter_is_inverted(b)
+    if not ia and not ib
+        return mi
+    if ia and ib
+        return space(a) - (ma + mb - mi)
+    if ia
+        return mb - mi
+    ma - mi
+
+// A list filter widened to the mask filter that matches both of its
+// identifiers; any other filter unchanged.
+@tier(embedded)
+fn as_mask(f: CanFilter) -> CanFilter
+    if not filter_is_list(f)
+        return f
+    let fm = format_mask(f)
+    let m = ~(f.id ^ f.mask) & fm
+    CanFilter { id: f.id & m, mask: m, flags: f.flags & ~CAN_FILTER_LIST }
