@@ -1,0 +1,373 @@
+// canbxcan_regs_tests.nv — the bxCAN driver against a register file in
+// ordinary memory.
+//
+// `BxCan` holds a base address, so a test builds one over the bytes of a
+// zeroed buffer: `bytes.data_addr` gives the address of the first byte
+// and the driver's volatile loads and stores land there.  Memory has no
+// hardware behind it, so a register keeps what was last written to it
+// and no status bit changes on its own; each test presets the status
+// bits the path under test reads.  A wait on the hardware that never
+// sees its bit gives up after its bounded count of reads and answers
+// false, which is the driver's own answer for a controller without a
+// clock.
+//
+// Every test ends by reading the buffer's length, which keeps the buffer
+// alive until the driver is done with its address.
+
+use std.test
+use std.bytes
+use canbxcan
+use canbus
+use canfilter
+use canframe
+use canhal
+use canerr
+
+// The register offsets the driver uses (RM0090 § 32.9).
+const MCR = 0x000
+const MSR = 0x004
+const TSR = 0x008
+const RF0R = 0x00C
+const ESR = 0x018
+const BTR = 0x01C
+const TX0 = 0x180
+const RX0 = 0x1B0
+const FMR = 0x200
+const FM1R = 0x204
+const FS1R = 0x20C
+const FFA1R = 0x214
+const FA1R = 0x21C
+const FBANK = 0x240
+
+// Enough memory for the registers and the 28 filter banks.
+const SIZE = 0x400
+
+fn blank() -> Bytes [mutate]
+    bytes.zeros(SIZE)
+
+fn rr(a: Int, off: Int) -> Int [hw]
+    hw.mem_read32(a + off)
+
+fn rw(a: Int, off: Int, v: Int) [hw]
+    hw.mem_write32(a + off, v)
+
+fn can_at(a: Int) -> BxCan
+    BxCan { base: a, filters: a, first_bank: 0 }
+
+fn can2_at(a: Int) -> BxCan
+    BxCan { base: a, filters: a, first_bank: 14 }
+
+fn timing() -> CanBitTiming
+    canbus.solve_timing(42000000, 500000, 875, canbus.bxcan_limits())
+
+@test
+fn test_start_programs_the_controller_and_reports_a_controller_that_never_leaves_init() [hw, mutate]
+    test.case("with INAK set the controller acknowledges initialisation, the registers take the timing, the mode and slot 0, and the last wait gives up false")
+    let mem = blank()
+    let a = bytes.data_addr(mem)
+    rw(a, MSR, 1)
+    test.assert(canbxcan.start(can_at(a), timing(), canbxcan.BXCAN_MODE_SILENT_LOOPBACK) == false)
+    test.assert_eq(rr(a, MCR), 1 << 16)
+    test.assert_eq(rr(a, BTR), canbxcan.btr_of(timing(), canbxcan.BXCAN_MODE_SILENT_LOOPBACK))
+    test.assert_eq(rr(a, FMR), 14 << 8)
+    test.assert_eq(rr(a, FA1R), 1)
+    test.assert_eq(rr(a, FS1R), 1)
+    test.assert_eq(rr(a, FFA1R), 0)
+    test.assert_eq(rr(a, FM1R), 0)
+    test.assert_eq(rr(a, FBANK + 4), 0x6)
+    test.assert_eq(bytes.len(mem), SIZE)
+
+@test
+fn test_start_stops_when_the_controller_never_acknowledges_init() [hw, mutate]
+    test.case("a controller that does not set INAK is left with INRQ requested and nothing programmed")
+    let mem = blank()
+    let a = bytes.data_addr(mem)
+    test.assert(canbxcan.start(can_at(a), timing(), canbxcan.BXCAN_MODE_NORMAL) == false)
+    test.assert_eq(rr(a, MCR), 1)
+    test.assert_eq(rr(a, BTR), 0)
+    test.assert_eq(rr(a, FA1R), 0)
+    test.assert_eq(bytes.len(mem), SIZE)
+
+@test
+fn test_start_refuses_a_timing_the_solver_did_not_find() [hw, mutate]
+    test.case("no register is touched when the timing is not one")
+    let mem = blank()
+    let a = bytes.data_addr(mem)
+    let none = canbus.solve_timing(0, 500000, 875, canbus.bxcan_limits())
+    test.assert(canbxcan.start(can_at(a), none, canbxcan.BXCAN_MODE_NORMAL) == false)
+    test.assert_eq(rr(a, MCR), 0)
+    test.assert_eq(bytes.len(mem), SIZE)
+
+@test
+fn test_start_on_can2_clears_and_programs_its_own_banks() [hw, mutate]
+    test.case("CAN2 owns banks 14 to 27: its other banks are cleared, bank 14 holds the accept-all filter")
+    let mem = blank()
+    let a = bytes.data_addr(mem)
+    rw(a, MSR, 1)
+    rw(a, FA1R, 0x3FFFFFFF)
+    let _ = canbxcan.start(can2_at(a), timing(), canbxcan.BXCAN_MODE_NORMAL)
+    test.assert_eq(rr(a, FA1R), 0x30000000 | 0x3FFF | (1 << 14))
+    test.assert_eq(bytes.len(mem), SIZE)
+
+@test
+fn test_clear_filters_turns_off_only_this_instances_banks() [hw, mutate]
+    test.case("CAN1's fourteen banks go, CAN2's stay, and FMR.FINIT is left clear")
+    let mem = blank()
+    let a = bytes.data_addr(mem)
+    rw(a, FA1R, 0xFFFFFFF)
+    canbxcan.clear_filters(can_at(a))
+    test.assert_eq(rr(a, FA1R), 0xFFFFFFF & ~0x3FFF)
+    test.assert_eq(rr(a, FMR) & 1, 0)
+    rw(a, FA1R, 0xFFFFFFF)
+    canbxcan.clear_filters(can2_at(a))
+    test.assert_eq(rr(a, FA1R), 0x3FFF)
+    test.assert_eq(bytes.len(mem), SIZE)
+
+@test
+fn test_overran_reads_and_clears_the_fifo_overrun_flag() [hw, mutate]
+    test.case("false while RF0R.FOVR0 is clear; true once, with the flag written back to clear it")
+    let mem = blank()
+    let a = bytes.data_addr(mem)
+    let can = can_at(a)
+    test.assert(canbxcan.overran(can) == false)
+    test.assert_eq(rr(a, RF0R), 0)
+    rw(a, RF0R, 1 << 4)
+    rw(a, RF0R, 1 << 4)
+    test.assert(canbxcan.overran(can))
+    test.assert_eq(rr(a, RF0R), 1 << 4)
+    test.assert_eq(bytes.len(mem), SIZE)
+
+@test
+fn test_a_mask_filter_goes_to_its_bank_in_mask_mode() [hw, mutate]
+    test.case("a standard mask filter: 32-bit scale, FIFO 0, mask mode, identifier and mask words, bank enabled, FINIT clear")
+    let mem = blank()
+    let a = bytes.data_addr(mem)
+    let can = can_at(a)
+    test.assert(can.can_set_filter(2, canfilter.filter(0x123, 0x7F0)) == None)
+    test.assert_eq(rr(a, FBANK + 16), 0x123 << 21)
+    test.assert_eq(rr(a, FBANK + 20), (0x7F0 << 21) | 4 | 2)
+    test.assert_eq(rr(a, FA1R), 1 << 2)
+    test.assert_eq(rr(a, FS1R), 1 << 2)
+    test.assert_eq(rr(a, FFA1R), 0)
+    test.assert_eq(rr(a, FM1R), 0)
+    test.assert_eq(rr(a, FMR) & 1, 0)
+    test.case("a filter that allows remote frames leaves the RTR bit of its mask clear")
+    test.assert(can.can_set_filter(3, canfilter.allowing_remote(canfilter.filter(0x100, 0x700))) == None)
+    test.assert_eq(rr(a, FBANK + 28), (0x700 << 21) | 4)
+    test.assert_eq(bytes.len(mem), SIZE)
+
+@test
+fn test_an_extended_mask_filter_and_the_list_filters() [hw, mutate]
+    test.case("an extended mask filter shifts the identifier into bits 31 to 3 with IDE")
+    let mem = blank()
+    let a = bytes.data_addr(mem)
+    let can = can_at(a)
+    test.assert(can.can_set_filter(0, canfilter.allowing_remote(canfilter.filter_ext(0x1234567, 0x1FFFFF00))) == None)
+    test.assert_eq(rr(a, FBANK), (0x1234567 << 3) | 4)
+    test.assert_eq(rr(a, FBANK + 4), (0x1FFFFF00 << 3) | 4)
+    test.case("a standard list filter sets list mode and stores two identifiers")
+    test.assert(can.can_set_filter(1, canfilter.list(0x100, 0x2A0)) == None)
+    test.assert_eq(rr(a, FM1R), 1 << 1)
+    test.assert_eq(rr(a, FBANK + 8), 0x100 << 21)
+    test.assert_eq(rr(a, FBANK + 12), 0x2A0 << 21)
+    test.case("an extended list filter does the same with the extended layout, and a mask filter after it clears list mode")
+    test.assert(can.can_set_filter(4, canfilter.list_ext(0x1000, 0x2000)) == None)
+    test.assert_eq(rr(a, FM1R), (1 << 1) | (1 << 4))
+    test.assert_eq(rr(a, FBANK + 32), (0x1000 << 3) | 4)
+    test.assert_eq(rr(a, FBANK + 36), (0x2000 << 3) | 4)
+    test.assert(can.can_set_filter(4, canfilter.filter(0x10, 0x7FF)) == None)
+    test.assert_eq(rr(a, FM1R), 1 << 1)
+    test.assert_eq(bytes.len(mem), SIZE)
+
+@test
+fn test_a_filter_the_hardware_cannot_hold_is_refused() [hw, mutate]
+    test.case("an inverted filter, a negative slot and a slot past the fourteenth answer CanFilterNotSupported and write nothing")
+    let mem = blank()
+    let a = bytes.data_addr(mem)
+    let can = can_at(a)
+    test.assert(can.can_set_filter(0, canfilter.inverted(canfilter.exact(0x10))) == Some(CanFilterNotSupported))
+    test.assert(can.can_set_filter(0 - 1, canfilter.exact(0x10)) == Some(CanFilterNotSupported))
+    test.assert(can.can_set_filter(14, canfilter.exact(0x10)) == Some(CanFilterNotSupported))
+    test.assert_eq(rr(a, FA1R), 0)
+    test.assert_eq(can.can_filter_slots(), canbxcan.BXCAN_FILTER_SLOTS)
+    test.assert_eq(bytes.len(mem), SIZE)
+
+@test
+fn test_a_free_mailbox_takes_the_frame() [hw, mutate]
+    test.case("the lowest empty mailbox is loaded: identifier, length, data words, then the request bit")
+    let mem = blank()
+    let a = bytes.data_addr(mem)
+    let can = can_at(a)
+    rw(a, TSR, 1 << 27)
+    let r = can.can_transmit(canframe.frame(0x123, 2, 0x2211))
+    test.assert(canhal.tx_ok(r))
+    test.assert_eq(canhal.accepted_mailbox(r), 1)
+    test.assert_eq(canhal.accepted_displaced(r), 0 - 1)
+    test.assert_eq(rr(a, TX0 + 16), (0x123 << 21) | 1)
+    test.assert_eq(rr(a, TX0 + 20), 2)
+    test.assert_eq(rr(a, TX0 + 24), 0x2211)
+    test.assert_eq(rr(a, TX0 + 28), 0)
+    test.case("an extended frame carries IDE, a remote frame carries RTR, and the high data word is split off")
+    rw(a, TSR, 1 << 26)
+    let e = can.can_transmit(canframe.frame_ext(0x1ABCDEF, 8, 0x1122334455667788))
+    test.assert_eq(canhal.accepted_mailbox(e), 0)
+    test.assert_eq(rr(a, TX0), (0x1ABCDEF << 3) | 4 | 1)
+    test.assert_eq(rr(a, TX0 + 4), 8)
+    test.assert_eq(rr(a, TX0 + 8), 0x55667788)
+    test.assert_eq(rr(a, TX0 + 12), 0x11223344)
+    rw(a, TSR, 1 << 28)
+    let m = can.can_transmit(canframe.remote_frame(0x7FF, 0))
+    test.assert_eq(canhal.accepted_mailbox(m), 2)
+    test.assert_eq(rr(a, TX0 + 32), (0x7FF << 21) | 2 | 1)
+    test.assert_eq(bytes.len(mem), SIZE)
+
+@test
+fn test_a_bus_off_controller_and_a_bad_frame_are_refused_before_a_mailbox_is_looked_at() [hw, mutate]
+    test.case("ESR.BOFF refuses with bus-off, and a frame the bus cannot carry is refused")
+    let mem = blank()
+    let a = bytes.data_addr(mem)
+    let can = can_at(a)
+    rw(a, TSR, 7 << 26)
+    test.assert_eq(canhal.tx_status(can.can_transmit(canframe.frame(0x123, 1, 7))), canhal.CAN_TX_ACCEPTED)
+    test.assert_eq(canhal.tx_status(can.can_transmit(canframe.frame(0x800, 1, 7))), canhal.CAN_TX_REFUSED)
+    rw(a, ESR, 4)
+    test.assert_eq(canhal.tx_status(can.can_transmit(canframe.frame(0x123, 1, 7))), canhal.CAN_TX_BUS_OFF)
+    test.assert_eq(bytes.len(mem), SIZE)
+
+// Three mailboxes pending, with the identifiers the arguments name.
+fn all_pending(a: Int, t0: Int, t1: Int, t2: Int) [hw]
+    rw(a, TSR, 0)
+    rw(a, TX0, t0)
+    rw(a, TX0 + 16, t1)
+    rw(a, TX0 + 32, t2)
+
+@test
+fn test_a_full_set_of_mailboxes_displaces_the_loser_only_for_a_frame_that_outranks_it() [hw, mutate]
+    test.case("the worst pending frame is mailbox 1 (id 0x300): a frame that does not outrank it is refused as full and nothing is written")
+    let mem = blank()
+    let a = bytes.data_addr(mem)
+    let can = can_at(a)
+    all_pending(a, (0x100 << 21) | 1, (0x300 << 21) | 1, (0x200 << 21) | 1)
+    test.assert_eq(canhal.tx_status(can.can_transmit(canframe.frame(0x400, 1, 1))), canhal.CAN_TX_FULL)
+    test.assert_eq(rr(a, TSR), 0)
+    test.case("a frame that outranks it asks for that mailbox's abort (ABRQ1) and, since the mailbox never empties, is refused as full")
+    test.assert_eq(canhal.tx_status(can.can_transmit(canframe.frame(0x010, 1, 1))), canhal.CAN_TX_FULL)
+    test.assert_eq(rr(a, TSR), 1 << 15)
+    test.assert_eq(bytes.len(mem), SIZE)
+
+@test
+fn test_the_pending_key_reads_every_identifier_format() [hw, mutate]
+    test.case("the worst pending frame is found whatever its format: a standard remote frame loses to extended frames with a small base identifier")
+    let mem = blank()
+    let a = bytes.data_addr(mem)
+    let can = can_at(a)
+    all_pending(a, (1 << 3) | 4 | 1, (1 << 3) | 4 | 2 | 1, (0x001 << 21) | 2 | 1)
+    test.assert_eq(canhal.tx_status(can.can_transmit(canframe.frame(0x000, 1, 1))), canhal.CAN_TX_FULL)
+    test.assert_eq(rr(a, TSR), 1 << 23)
+    test.case("a standard remote frame loses to the standard data frame of its identifier")
+    all_pending(a, (0x100 << 21) | 1, (0x100 << 21) | 2 | 1, (0x1000 << 3) | 4 | 1)
+    test.assert_eq(canhal.tx_status(can.can_transmit(canframe.frame(0x001, 1, 1))), canhal.CAN_TX_FULL)
+    test.assert_eq(rr(a, TSR), 1 << 15)
+    test.assert_eq(bytes.len(mem), SIZE)
+
+@test
+fn test_transmit_done_and_abort_address_one_mailbox_each() [hw, mutate]
+    test.case("a mailbox is done when its TME bit is set; one that does not exist is done")
+    let mem = blank()
+    let a = bytes.data_addr(mem)
+    let can = can_at(a)
+    rw(a, TSR, 1 << 27)
+    test.assert(can.can_tx_done(0) == false)
+    test.assert(can.can_tx_done(1))
+    test.assert(can.can_tx_done(0 - 1))
+    test.assert(can.can_tx_done(3))
+    test.case("an abort writes that mailbox's ABRQ bit; a mailbox that does not exist writes nothing")
+    rw(a, TSR, 0)
+    test.assert(can.can_tx_abort(2) == None)
+    test.assert_eq(rr(a, TSR), 1 << 23)
+    rw(a, TSR, 0)
+    test.assert(can.can_tx_abort(3) == None)
+    test.assert(can.can_tx_abort(0 - 1) == None)
+    test.assert_eq(rr(a, TSR), 0)
+    test.assert_eq(bytes.len(mem), SIZE)
+
+@test
+fn test_receive_reads_the_fifo_in_every_frame_format() [hw, mutate]
+    test.case("an empty FIFO answers none")
+    let mem = blank()
+    let a = bytes.data_addr(mem)
+    let can = can_at(a)
+    test.assert(canframe.is_none(can.can_receive()))
+    test.case("a standard data frame, with RFOM0 written to release it")
+    rw(a, RF0R, 1)
+    rw(a, RX0, 0x123 << 21)
+    rw(a, RX0 + 4, 2)
+    rw(a, RX0 + 8, 0x2211)
+    rw(a, RX0 + 12, 0)
+    let f = can.can_receive()
+    test.assert_eq(canframe.frame_id(f), 0x123)
+    test.assert_eq(canframe.frame_len(f), 2)
+    test.assert_eq(canframe.frame_data(f), 0x2211)
+    test.assert(canframe.is_extended(f) == false)
+    test.assert_eq(rr(a, RF0R), 1 << 5)
+    test.case("an extended data frame carries both data words")
+    rw(a, RF0R, 3)
+    rw(a, RX0, (0x1ABCDEF << 3) | 4)
+    rw(a, RX0 + 4, 8)
+    rw(a, RX0 + 8, 0x55667788)
+    rw(a, RX0 + 12, 0x11223344)
+    let e = can.can_receive()
+    test.assert(canframe.is_extended(e))
+    test.assert_eq(canframe.frame_id(e), 0x1ABCDEF)
+    test.assert_eq(canframe.frame_data(e), 0x1122334455667788)
+    test.case("remote frames of both formats, and a length code above 8 is cut to 8")
+    rw(a, RF0R, 1)
+    rw(a, RX0, (0x1ABCDEF << 3) | 4 | 2)
+    rw(a, RX0 + 4, 3)
+    let re = can.can_receive()
+    test.assert(canframe.is_remote(re) and canframe.is_extended(re))
+    test.assert_eq(canframe.frame_len(re), 3)
+    rw(a, RF0R, 1)
+    rw(a, RX0, (0x55 << 21) | 2)
+    rw(a, RX0 + 4, 15)
+    let rs = can.can_receive()
+    test.assert(canframe.is_remote(rs) and canframe.is_extended(rs) == false)
+    test.assert_eq(canframe.frame_id(rs), 0x55)
+    test.assert_eq(canframe.frame_len(rs), 8)
+    test.assert_eq(bytes.len(mem), SIZE)
+
+@test
+fn test_the_bus_state_comes_from_the_error_status_register() [hw, mutate]
+    test.case("TEC and REC from ESR give the counters; BOFF makes the transmit counter the bus-off limit")
+    let mem = blank()
+    let a = bytes.data_addr(mem)
+    let can = can_at(a)
+    rw(a, ESR, (7 << 24) | (130 << 16))
+    let s = can.can_bus_state()
+    test.assert_eq(canbus.tx_errors(s), 130)
+    test.assert_eq(canbus.rx_errors(s), 7)
+    rw(a, ESR, (9 << 24) | (130 << 16) | 4)
+    let off = can.can_bus_state()
+    test.assert_eq(canbus.tx_errors(off), canbus.CAN_BUS_OFF_LIMIT)
+    test.assert_eq(canbus.rx_errors(off), 9)
+    test.assert_eq(bytes.len(mem), SIZE)
+
+@test
+fn test_recovery_does_nothing_unless_the_controller_is_bus_off() [hw, mutate]
+    test.case("a controller that is not bus-off answers None and is left alone")
+    let mem = blank()
+    let a = bytes.data_addr(mem)
+    let can = can_at(a)
+    test.assert(can.can_recover() == None)
+    test.assert_eq(rr(a, TSR), 0)
+    test.assert_eq(rr(a, MCR), 0)
+    test.case("a bus-off controller has its mailboxes aborted and initialisation requested; one that never acknowledges is still bus-off")
+    rw(a, ESR, 4)
+    test.assert(can.can_recover() == Some(CanBusOff))
+    test.assert_eq(rr(a, TSR), (1 << 7) | (1 << 15) | (1 << 23))
+    test.assert_eq(rr(a, MCR), 1)
+    test.case("one that acknowledges initialisation but never leaves it is still bus-off, with INRQ cleared")
+    rw(a, MSR, 1)
+    test.assert(can.can_recover() == Some(CanBusOff))
+    test.assert_eq(rr(a, MCR), 0)
+    test.assert_eq(bytes.len(mem), SIZE)
