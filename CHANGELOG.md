@@ -5,6 +5,12 @@ All notable changes to can-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.3 — 2026-11-04
+
+The test suites now run the bxCAN and FDCAN drivers over a register file in memory and the interface questions of cansocket over a directory laid out as /sys/class/net, so the regions excused from coverage shrink to the clock and pin routines at fixed addresses, the waits whose status bit changes between two reads of one register, and the socket paths that need a bound CAN interface.  The private helpers of cansocket that read sysfs now take the directory they read, and the public functions pass /sys/class/net; no public signature or answer changed.
+
+This release requires novo 0.23.0 or later.
+
 ## 0.1.2 — 2026-10-25
 
 A call that passes a variable to a `var` parameter now writes the `var` marker, which the 0.21.1 compiler asks for (E2050).  The package needs Novo 0.21.1 or later.  A file that names a sibling module's type, function or constant now has the `use` line for that module (E2033, E2003).  No signature and no behaviour changed.
