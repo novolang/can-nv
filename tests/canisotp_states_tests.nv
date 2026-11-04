@@ -85,7 +85,8 @@ fn test_a_sender_walks_flow_control_blocks() [io]
     test.assert_eq(canisotp.session_state(sending), canisotp.CAN_ISOTP_STATE_SENDING)
     test.assert_eq(canisotp.session_block_left(sending), 2)
     test.assert_eq(canisotp.session_st_min_us(sending), 200)
-    test.assert_eq(canisotp.session_state(canisotp.take_flow(sending, canisotp.flow_frame(0x1, 0, 2, 0))), canisotp.CAN_ISOTP_STATE_SENDING)
+    test.assert_eq(canisotp.session_state(canisotp.take_flow(sending, canisotp.flow_frame(0x1, 0, 2, 0))),
+        canisotp.CAN_ISOTP_STATE_SENDING)
     s = canisotp.sent_consecutive(sending, 7)
     test.assert_eq(canisotp.session_state(s), canisotp.CAN_ISOTP_STATE_SENDING)
     test.assert_eq(canisotp.session_block_left(s), 1)
@@ -100,7 +101,8 @@ fn test_a_sender_walks_flow_control_blocks() [io]
     test.assert_eq(canisotp.session_state(s), canisotp.CAN_ISOTP_STATE_DONE)
     test.assert_eq(canisotp.session_done(s), 30)
     // a consecutive frame reported outside the sending state is ignored
-    test.assert_eq(canisotp.session_state(canisotp.sent_consecutive(canisotp.begin_send(canisotp.session(), 30), 7)), canisotp.CAN_ISOTP_STATE_WAIT_FLOW)
+    test.assert_eq(canisotp.session_state(canisotp.sent_consecutive(canisotp.begin_send(canisotp.session(), 30), 7)),
+        canisotp.CAN_ISOTP_STATE_WAIT_FLOW)
 
 @test
 fn test_waits_are_counted_and_overflow_ends_the_transfer() [io]
@@ -114,7 +116,8 @@ fn test_waits_are_counted_and_overflow_ends_the_transfer() [io]
     s = canisotp.take_flow(s, wait)
     test.assert_eq(canisotp.session_state(s), canisotp.CAN_ISOTP_STATE_FAILED)
     test.assert(canisotp.session_fault(s) != None)
-    let o = canisotp.take_flow(canisotp.begin_send(canisotp.session(), 30), canisotp.flow_frame(0x1, canisotp.CAN_ISOTP_OVERFLOW, 0, 0))
+    let o = canisotp.take_flow(canisotp.begin_send(canisotp.session(), 30),
+        canisotp.flow_frame(0x1, canisotp.CAN_ISOTP_OVERFLOW, 0, 0))
     test.assert(fault_is(canisotp.session_fault(o), CanIsoTpOverflow))
     test.assert_eq(canisotp.session_block_left(o), 0)
 
@@ -132,7 +135,8 @@ fn test_a_receiver_refuses_what_it_cannot_take() [io]
     let bad = canisotp.take_consecutive(r, canisotp.consecutive_frame(0x1, 5, 0, 7))
     test.assert(fault_is(canisotp.session_fault(bad), CanIsoTpBadSequence(1, 5)))
     // ignored while not receiving
-    test.assert_eq(canisotp.session_state(canisotp.take_consecutive(canisotp.session(), canisotp.consecutive_frame(0x1, 1, 0, 7))), canisotp.CAN_ISOTP_STATE_IDLE)
+    test.assert_eq(canisotp.session_state(canisotp.take_consecutive(canisotp.session(), canisotp.consecutive_frame(0x1, 1, 0, 7))),
+        canisotp.CAN_ISOTP_STATE_IDLE)
     // a short first frame clamps what has arrived
     let tiny = canisotp.begin_receive(canisotp.session(), canisotp.first_frame(0x1, 4, 0), 100)
     test.assert_eq(canisotp.session_done(tiny), 4)

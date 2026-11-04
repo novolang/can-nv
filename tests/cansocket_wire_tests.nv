@@ -8,7 +8,6 @@
 // tests/socketcan.sh, which runs them on a virtual one.
 
 use std.test
-use std.bytes
 use std.str
 use cansocket
 use canframe
@@ -82,10 +81,10 @@ fn test_too_few_bytes_read_as_a_zeroed_frame() [io]
     test.assert_eq(canframe.frame_len(n), 0)
     match cansocket.check_wire(short, 0)
         Some(CanShortWire(have)) => test.assert_eq(have, 3)
-        _ => test.assert(false)
+        _                        => test.assert(false)
     match cansocket.check_wire(short, 9)
         Some(CanShortWire(have)) => test.assert_eq(have, 0)
-        _ => test.assert(false)
+        _                        => test.assert(false)
     test.assert(is_err(cansocket.check_wire(wire_of(canframe.frame(1, 0, 0)), 0)) == false)
 
 @test
@@ -172,7 +171,7 @@ fn test_an_fd_frame_writes_seventy_two_bytes() [io, mutate]
 fn test_a_socket_on_every_interface_answers_its_properties() [io, net, fs]
     test.case("open_all binds index 0: no interface name, no FD, a descriptor, and close twice is not an error")
     match cansocket.open_all()
-        Ok(s) =>
+        Ok(s)  =>
             test.assert_eq(cansocket.interface_of(s), "")
             test.assert(cansocket.carries_fd(s) == false)
             test.assert(cansocket.fd_of(s) >= 0)
@@ -184,7 +183,7 @@ fn test_a_socket_on_every_interface_answers_its_properties() [io, net, fs]
 fn test_the_options_of_a_raw_socket_are_taken() [io, net, fs]
     test.case("filters of every shape, the error mask, loop-back and receive-own are accepted by the kernel")
     match cansocket.open_all()
-        Ok(s) =>
+        Ok(s)  =>
             let fs_ = [canfilter.exact(0x123),
                        canfilter.filter(0x100, 0x700),
                        canfilter.exact_ext(0x1ABCDEF),
@@ -206,13 +205,13 @@ fn test_the_options_of_a_raw_socket_are_taken() [io, net, fs]
 fn test_an_empty_socket_reports_nothing_and_a_write_is_refused() [io, net, fs]
     test.case("a receive with no frame is none rather than a fault; receive_into counts 0; a write with no interface is refused")
     match cansocket.open_all()
-        Ok(s) =>
+        Ok(s)  =>
             test.assert(is_err(cansocket.set_receive_timeout(s, 0)) == false)
             test.assert(canframe.is_none(cansocket.receive(s)))
             test.assert(canframe.is_none(cansocket.receive_from(s)))
             var dst: Vec[u8; 72] = Vec.new()
             match cansocket.receive_into(s, var dst)
-                Ok(n) => test.assert_eq(n, 0)
+                Ok(n)  => test.assert_eq(n, 0)
                 Err(_) => test.assert(false)
             test.assert(is_err(cansocket.set_receive_timeout(s, 1)) == false)
             test.assert(canframe.is_none(cansocket.receive(s)))
@@ -226,13 +225,13 @@ fn test_an_empty_socket_reports_nothing_and_a_write_is_refused() [io, net, fs]
 fn test_an_interface_index_names_the_interface() [io, fs]
     test.case("index 0 is every interface, the loop-back device is index 1 on a host, and an index nobody holds is refused by number")
     match cansocket.interface_name(0)
-        Ok(n) => test.assert_eq(n, "")
+        Ok(n)  => test.assert_eq(n, "")
         Err(_) => test.assert(false)
     match cansocket.interface_name(1)
-        Ok(n) => test.assert(str.len(n) > 0)
+        Ok(n)  => test.assert(str.len(n) > 0)
         Err(_) => test.assert(false)
     match cansocket.interface_name(0x7FFFFFF)
-        Ok(_) => test.assert(false)
+        Ok(_)  => test.assert(false)
         Err(e) => test.assert(e == CanNoSuchInterface("#134217727"))
     test.assert(cansocket.is_virtual("lo") == false)
 
@@ -240,13 +239,13 @@ fn test_an_interface_index_names_the_interface() [io, fs]
 fn test_a_closed_socket_refuses_every_call() [io, net, fs]
     test.case("a read that fails is not a read that found nothing, and an option or timeout the kernel refuses says so")
     match cansocket.open_all()
-        Ok(s) =>
+        Ok(s)  =>
             let _ = cansocket.close(s)
             test.assert(canframe.is_fault(cansocket.receive(s)))
             test.assert(canframe.is_fault(cansocket.receive_from(s)))
             var dst: Vec[u8; 72] = Vec.new()
             match cansocket.receive_into(s, var dst)
-                Ok(_) => test.assert(false)
+                Ok(_)  => test.assert(false)
                 Err(e) => test.assert(e == CanSocketRefused("the read failed"))
             test.assert(is_err(cansocket.set_receive_timeout(s, 5)))
             test.assert(is_err(cansocket.set_loopback(s, true)))

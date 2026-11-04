@@ -110,7 +110,9 @@ fn test_check_fd_frame_refuses_each_field_out_of_range() [io]
     test.case("identifier too wide in either format and a length no DLC encodes")
     test.assert(canframe.check_fd_frame(canframe.fd_frame(0x7FF, 64, false)) == None)
     test.assert(canframe.check_fd_frame(canframe.fd_frame_ext(0x1FFFFFFF, 12, true)) == None)
-    test.assert(canframe.check_fd_frame(CanFdFrame { id: 0x20000000, flags: canframe.CAN_FD_FLAG_FD | canframe.CAN_FLAG_EXTENDED, len: 8 }) == Some(CanIdTooWide(0x20000000, true)))
+    test.assert(canframe.check_fd_frame(CanFdFrame { id: 0x20000000,
+        flags: canframe.CAN_FD_FLAG_FD | canframe.CAN_FLAG_EXTENDED,
+        len: 8 }) == Some(CanIdTooWide(0x20000000, true)))
     test.assert(canframe.check_fd_frame(CanFdFrame { id: 0 - 1, flags: canframe.CAN_FD_FLAG_FD | canframe.CAN_FLAG_EXTENDED, len: 8 }) == Some(CanIdTooWide(0 - 1, true)))
     test.assert(canframe.check_fd_frame(CanFdFrame { id: 0x800, flags: canframe.CAN_FD_FLAG_FD, len: 8 }) == Some(CanIdTooWide(0x800, false)))
     test.assert(canframe.check_fd_frame(canframe.fd_frame(0x1, 13, false)) != None)

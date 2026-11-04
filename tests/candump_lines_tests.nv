@@ -9,7 +9,7 @@ use canerr
 
 fn bad_at(r: Result<CanLogLine, CanError>, want: Int) -> Bool
     match r
-        Ok(_) => false
+        Ok(_)  => false
         Err(e) => e == CanBadLogLine(want)
 
 @test
@@ -22,7 +22,7 @@ fn test_a_remote_frame_renders_and_parses_in_both_formats() [io]
     test.assert_eq(candump.render_compact(canframe.remote_frame_ext(0x1ABCDEF, 0)), "01ABCDEF#R")
     let line = candump.render_line("can0", 7, 42, r)
     match candump.parse_line(line)
-        Ok(l) =>
+        Ok(l)  =>
             test.assert(canframe.is_remote(candump.line_frame(l)))
             test.assert_eq(canframe.frame_len(candump.line_frame(l)), 4)
             test.assert_eq(candump.line_micros(l), 42)
@@ -30,7 +30,7 @@ fn test_a_remote_frame_renders_and_parses_in_both_formats() [io]
         Err(_) => test.assert(false)
     let e = canframe.remote_frame_ext(0x1ABCDEF, 2)
     match candump.parse_line(candump.render_frame("can1", e))
-        Ok(l) =>
+        Ok(l)  =>
             let g = candump.line_frame(l)
             test.assert(canframe.is_remote(g))
             test.assert(canframe.is_extended(g))
@@ -39,7 +39,7 @@ fn test_a_remote_frame_renders_and_parses_in_both_formats() [io]
             test.assert_eq(candump.line_interface(l), "can1")
         Err(_) => test.assert(false)
     match candump.parse_line(candump.render_frame("can1", canframe.frame_ext(0x1ABCDEF, 2, 0x2211)))
-        Ok(l) =>
+        Ok(l)  =>
             test.assert_eq(canframe.frame_byte(candump.line_frame(l), 1), 0x22)
             test.assert_eq(candump.line_seconds(l), 0 - 1)
         Err(_) => test.assert(false)
@@ -78,7 +78,8 @@ fn test_a_compact_line_that_is_not_a_frame_is_a_fault() [io]
     test.assert_eq(canframe.fault_code(candump.parse_compact("123#Rx")), canframe.CAN_FAULT_MALFORMED)
     test.assert_eq(canframe.fault_code(candump.parse_compact("123#R9")), canframe.CAN_FAULT_BAD_LENGTH)
     test.assert_eq(canframe.fault_code(candump.parse_compact("123#112")), canframe.CAN_FAULT_MALFORMED)
-    test.assert_eq(canframe.fault_code(candump.parse_compact("123#112233445566778899")), canframe.CAN_FAULT_BAD_LENGTH)
+    test.assert_eq(canframe.fault_code(candump.parse_compact("123#112233445566778899")),
+        canframe.CAN_FAULT_BAD_LENGTH)
     test.assert_eq(canframe.fault_code(candump.parse_compact("123#1G")), canframe.CAN_FAULT_MALFORMED)
     let r = candump.parse_compact("123#R3")
     test.assert(canframe.is_remote(r))
@@ -98,11 +99,14 @@ fn test_an_fd_compact_line_carries_both_flag_bits() [io, mutate]
     test.case("the flags nibble is 1 for a bit-rate switch and 2 for the error-state indicator")
     let brs = canframe.fd_frame(0x123, 2, true)
     test.assert_eq(candump.render_fd_compact(brs, fd_byte), "123##1A0A1")
-    let esi = CanFdFrame { id: 0x123, flags: canframe.CAN_FD_FLAG_FD | canframe.CAN_FD_FLAG_BRS | canframe.CAN_FD_FLAG_ESI, len: 1 }
+    let esi = CanFdFrame { id: 0x123,
+        flags: canframe.CAN_FD_FLAG_FD | canframe.CAN_FD_FLAG_BRS | canframe.CAN_FD_FLAG_ESI,
+        len: 1 }
     test.assert_eq(candump.render_fd_compact(esi, fd_byte), "123##3A0")
 
 @test
 fn test_an_identifier_with_no_digits_or_too_many_is_malformed() [io]
     test.case("hex_value refuses the empty string and anything longer than fifteen digits")
     test.assert_eq(canframe.fault_code(candump.parse_compact("#11")), canframe.CAN_FAULT_MALFORMED)
-    test.assert_eq(canframe.fault_code(candump.parse_compact("0000000000000000#11")), canframe.CAN_FAULT_MALFORMED)
+    test.assert_eq(canframe.fault_code(candump.parse_compact("0000000000000000#11")),
+        canframe.CAN_FAULT_MALFORMED)

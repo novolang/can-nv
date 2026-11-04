@@ -44,7 +44,8 @@ impl CanBus for FakeCan
 fn fake() -> FakeCan
     FakeCan { opens: true, sends: true, has_rx: true, done: true, tx: 0, rx: 0, state: 0 }
 
-fn fake_with(opens: Bool, sends: Bool, has_rx: Bool, done: Bool, tx: Int, rx: Int, state: Int) -> FakeCan
+fn fake_with(opens: Bool, sends: Bool, has_rx: Bool, done: Bool, tx: Int, rx: Int,
+             state: Int) -> FakeCan
     FakeCan { opens: opens, sends: sends, has_rx: has_rx, done: done, tx: tx, rx: rx, state: state }
 
 @test
@@ -65,7 +66,8 @@ fn test_a_transmit_is_gated_by_frame_state_then_bus_then_mailbox() [io, hw]
     let ok = canboard.bus_transmit(fake(), f)
     test.assert(canhal.tx_ok(ok))
     test.assert_eq(canhal.accepted_mailbox(ok), 0)
-    test.assert_eq(canhal.tx_status(canboard.bus_transmit(fake(), canframe.frame(0x800, 1, 7))), canhal.CAN_TX_REFUSED)
+    test.assert_eq(canhal.tx_status(canboard.bus_transmit(fake(), canframe.frame(0x800, 1, 7))),
+        canhal.CAN_TX_REFUSED)
     let off = fake_with(true, true, true, true, 0, 0, 2)
     test.assert_eq(canhal.tx_status(canboard.bus_transmit(off, f)), canhal.CAN_TX_BUS_OFF)
     let busy = fake_with(true, false, true, true, 0, 0, 0)

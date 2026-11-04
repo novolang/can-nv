@@ -8,12 +8,10 @@
 // publish gate measures.  The program prints one line per check and
 // exits non-zero when one fails.
 
-use std.bytes
 use std.process
 use cansocket
 use canframe
 use canfilter
-use canbus
 use canerr
 
 fn check(ok: Bool, what: Str) -> Int [io]
@@ -34,14 +32,19 @@ fn main() [io, net, fs, mutate]
     bad = bad + check(cansocket.interface_tx_errors("vcan0") == Ok(0), "no transmit errors")
     bad = bad + check(cansocket.interface_rx_errors("vcan0") == Ok(0), "no receive errors")
     match cansocket.interfaces()
-        Ok(names) => bad = bad + check(names == ["vcan0", "vcan1"], "both interfaces are listed in name order")
-        Err(_) => bad = bad + check(false, "the interface list is readable")
+        Ok(names) =>
+            bad = bad + check(names == ["vcan0", "vcan1"], "both interfaces are listed in name order")
+        Err(_)    =>
+            bad = bad + check(false, "the interface list is readable")
     match cansocket.interface_index("vcan0")
-        Ok(i) =>
+        Ok(i)  =>
             match cansocket.interface_name(i)
-                Ok(n) => bad = bad + check(n == "vcan0", "an index names its interface")
-                Err(_) => bad = bad + check(false, "an index names its interface")
-        Err(_) => bad = bad + check(false, "vcan0 has an index")
+                Ok(n)  =>
+                    bad = bad + check(n == "vcan0", "an index names its interface")
+                Err(_) =>
+                    bad = bad + check(false, "an index names its interface")
+        Err(_) =>
+            bad = bad + check(false, "vcan0 has an index")
     match cansocket.open("vcan0")
         Ok(tx) =>
             match cansocket.open("vcan0")
@@ -49,37 +52,52 @@ fn main() [io, net, fs, mutate]
                     bad = bad + check(cansocket.interface_of(rx) == "vcan0", "a socket knows its interface")
                     bad = bad + check(cansocket.set_receive_timeout(rx, 200) == None, "a receive timeout is set")
                     bad = bad + check(canframe.is_none(cansocket.receive(rx)), "nothing arrived yet")
-                    bad = bad + check(cansocket.send(tx, canframe.frame(0x123, 3, 0x332211)) == None, "a frame is sent")
+                    bad = bad + check(cansocket.send(tx, canframe.frame(0x123, 3, 0x332211)) == None,
+                        "a frame is sent")
                     let f = cansocket.receive(rx)
-                    bad = bad + check(canframe.frame_id(f) == 0x123 and canframe.frame_byte(f, 2) == 0x33, "the frame arrives intact")
+                    bad = bad + check(canframe.frame_id(f) == 0x123 and canframe.frame_byte(f, 2) == 0x33,
+                        "the frame arrives intact")
                     let _ = cansocket.send(tx, canframe.remote_frame_ext(0x1ABCDEF, 2))
                     let r = cansocket.receive_from(rx)
-                    bad = bad + check(canframe.is_remote(r) and canframe.is_extended(r), "a remote extended frame arrives")
+                    bad = bad + check(canframe.is_remote(r) and canframe.is_extended(r),
+                        "a remote extended frame arrives")
                     bad = bad + check(cansocket.last_interface_index(rx) > 0, "the arrival interface is reported")
                     let _ = cansocket.send(tx, canframe.frame(0x7FF, 1, 9))
                     var dst: Vec[u8; 72] = Vec.new()
                     match cansocket.receive_into(rx, var dst)
-                        Ok(n) => bad = bad + check(n == 16, "receive_into counts sixteen bytes")
-                        Err(_) => bad = bad + check(false, "receive_into succeeds")
-                    bad = bad + check(cansocket.set_filters(rx, [canfilter.exact(0x200), canfilter.list(0x300, 0x301)]) == None, "filters are installed")
+                        Ok(n)  =>
+                            bad = bad + check(n == 16, "receive_into counts sixteen bytes")
+                        Err(_) =>
+                            bad = bad + check(false, "receive_into succeeds")
+                    bad = bad + check(cansocket.set_filters(rx, [canfilter.exact(0x200), canfilter.list(0x300, 0x301)]) == None,
+                        "filters are installed")
                     let _ = cansocket.send(tx, canframe.frame(0x100, 0, 0))
-                    bad = bad + check(canframe.is_none(cansocket.receive(rx)), "a frame outside the filters is not delivered")
+                    bad = bad + check(canframe.is_none(cansocket.receive(rx)),
+                        "a frame outside the filters is not delivered")
                     let _ = cansocket.send(tx, canframe.frame(0x301, 0, 0))
-                    bad = bad + check(canframe.frame_id(cansocket.receive(rx)) == 0x301, "a frame in a list filter is delivered")
-                    bad = bad + check(cansocket.send_fd(tx, canframe.fd_frame(0x1, 8, false), payload) == Some(CanFdNotSupported), "a classic socket refuses an FD frame")
+                    bad = bad + check(canframe.frame_id(cansocket.receive(rx)) == 0x301,
+                        "a frame in a list filter is delivered")
+                    bad = bad + check(cansocket.send_fd(tx, canframe.fd_frame(0x1, 8, false), payload) == Some(CanFdNotSupported),
+                        "a classic socket refuses an FD frame")
                     let _ = cansocket.close(rx)
-                Err(_) => bad = bad + check(false, "a second socket opens")
+                Err(_) =>
+                    bad = bad + check(false, "a second socket opens")
             let _ = cansocket.close(tx)
-        Err(_) => bad = bad + check(false, "a socket opens on vcan0")
+        Err(_) =>
+            bad = bad + check(false, "a socket opens on vcan0")
     match cansocket.open_fd("vcan0")
-        Ok(a) =>
+        Ok(a)  =>
             bad = bad + check(cansocket.carries_fd(a), "an FD socket carries FD")
-            bad = bad + check(cansocket.send_fd(a, canframe.fd_frame(0x42, 12, true), payload) == None, "an FD frame is sent")
+            bad = bad + check(cansocket.send_fd(a, canframe.fd_frame(0x42, 12, true), payload) == None,
+                "an FD frame is sent")
             let _ = cansocket.close(a)
-        Err(_) => bad = bad + check(false, "an FD socket opens")
+        Err(_) =>
+            bad = bad + check(false, "an FD socket opens")
     match cansocket.open("vcan9")
-        Ok(_) => bad = bad + check(false, "an absent interface is refused by name")
-        Err(e) => bad = bad + check(e == CanNoSuchInterface("vcan9"), "an absent interface is refused by name")
+        Ok(_)  =>
+            bad = bad + check(false, "an absent interface is refused by name")
+        Err(e) =>
+            bad = bad + check(e == CanNoSuchInterface("vcan9"), "an absent interface is refused by name")
     if bad > 0
         println("${bad} check(s) failed")
         process.exit(1)

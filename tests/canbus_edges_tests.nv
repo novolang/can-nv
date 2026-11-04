@@ -58,7 +58,10 @@ fn test_only_a_bus_off_controller_counts_recovery_sequences() [io]
 fn test_an_error_frame_carries_the_counters_in_bytes_six_and_seven() [io]
     test.case("a data frame answers a fresh state; an error frame answers the counters it carries")
     test.assert_eq(canbus.tx_errors(canbus.state_from_error_frame(canframe.frame(1, 0, 0))), 0)
-    let e = CanFrame { id: canbus.CAN_ERR_BIT, flags: canframe.CAN_FLAG_ERROR, len: 8, data: canframe.pack8(0, 0, 1, 0, 0, 0, 100, 20) }
+    let e = CanFrame { id: canbus.CAN_ERR_BIT,
+        flags: canframe.CAN_FLAG_ERROR,
+        len: 8,
+        data: canframe.pack8(0, 0, 1, 0, 0, 0, 100, 20) }
     let s = canbus.state_from_error_frame(e)
     test.assert_eq(canbus.tx_errors(s), 100)
     test.assert_eq(canbus.rx_errors(s), 20)

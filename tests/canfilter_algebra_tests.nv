@@ -10,7 +10,7 @@ use canerr
 fn unreachable(e: ?CanError) -> Bool
     match e
         Some(CanFilterUnreachable(_, _)) => true
-        _ => false
+        _                                => false
 
 @test
 fn test_a_non_frame_and_a_remote_frame_are_not_accepted_by_default() [io]
