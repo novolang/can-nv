@@ -1,9 +1,11 @@
 // The drivers' handles and the words they program, on the host.
 //
-// The bring-up functions, `canbxcan.start` and `canfdcan.start` and the
-// clock and pin routines beside them, write a controller's registers
-// and run only on a board: `tests/driver_probe.nv` builds them for the
-// STM32F407G-DISC1 and the NUCLEO-H723ZG, and the programs under
+// The register-level behaviour of `canbxcan` and `canfdcan` runs over a
+// register file in memory in `tests/canbxcan_regs_tests.nv` and
+// `tests/canfdcan_regs_tests.nv`.  The clock and pin routines beside the
+// bring-up write the STM32's RCC and GPIO registers at their fixed
+// addresses and run only on a board: `tests/driver_probe.nv` builds them
+// for the STM32F407G-DISC1 and the NUCLEO-H723ZG, and the programs under
 // `examples/embedded/can_demo` run them on the bench.
 
 use std.test

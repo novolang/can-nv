@@ -174,44 +174,40 @@ fn h7_route_pd0_pd1() [hw]
     hw.mem_write32(gpiod + 0x20, (hw.mem_read32(gpiod + 0x20) & ~0xFF) | 0x99)
 
 @tier(embedded)
-// cov: skip — reads the FDCAN controller's registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
 fn rd(d: FdCan, off: Int) -> Int [hw]
     hw.mem_read32(d.base + off) & 0xFFFFFFFF
 
 @tier(embedded)
-// cov: skip — writes the FDCAN controller's registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
 fn wr(d: FdCan, off: Int, v: Int) [hw]
     hw.mem_write32(d.base + off, v & 0xFFFFFFFF)
 
 @tier(embedded)
-// cov: skip — reads the FDCAN message RAM at its fixed address, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
 fn ram_rd(d: FdCan, off: Int) -> Int [hw]
     hw.mem_read32(d.ram + off) & 0xFFFFFFFF
 
 @tier(embedded)
-// cov: skip — writes the FDCAN message RAM at its fixed address, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
 fn ram_wr(d: FdCan, off: Int, v: Int) [hw]
     hw.mem_write32(d.ram + off, v & 0xFFFFFFFF)
 
 // Sets CCCR.INIT and CCCR.CCE, so the protected registers take writes.
 @tier(embedded)
-// cov: skip — reads and writes the FDCAN controller's registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
 fn enter_config(d: FdCan) -> Bool [hw]
     wr(d, CCCR, rd(d, CCCR) | 1)
     for _i in 0..SPIN
         if (rd(d, CCCR) & 1) != 0
             wr(d, CCCR, rd(d, CCCR) | 2)
             return true
+    // cov: skip — reached only when CCCR.INIT does not read back the value written to it, which is a controller whose kernel clock is off; a register in memory always reads back what was written, and tests/canfdcan_regs_tests.nv runs every other path of this function; examples/embedded/can_demo in the novo-lang repository runs the whole driver on the NUCLEO-H723ZG
     false
 
 // Clears CCCR.INIT and waits for the controller to join the bus.
 @tier(embedded)
-// cov: skip — reads and writes the FDCAN controller's registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
 fn leave_config(d: FdCan) -> Bool [hw]
     wr(d, CCCR, rd(d, CCCR) & ~3)
     for _i in 0..SPIN
         if (rd(d, CCCR) & 1) == 0
             return true
+    // cov: skip — reached only when CCCR.INIT does not read back the value written to it, which is a controller whose kernel clock is off; a register in memory always reads back what was written, and tests/canfdcan_regs_tests.nv runs every other path of this function; examples/embedded/can_demo in the novo-lang repository runs the whole driver on the NUCLEO-H723ZG
     false
 
 // Starts the controller: enters initialisation, programs the mode, the
@@ -221,11 +217,11 @@ fn leave_config(d: FdCan) -> Bool [hw]
 // controller did not answer, which on a part whose kernel clock is off
 // is the first call.
 pub @tier(embedded)
-// cov: skip — reads and writes the FDCAN controller's registers and its message RAM at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
 fn start(d: FdCan, nominal: CanBitTiming, data: CanBitTiming, fd: Bool, mode: Int) -> Bool [hw]
     if not canbus.timing_ok(nominal) or fd and not canbus.timing_ok(data)
         return false
     if not enter_config(d)
+        // cov: skip — reached only when CCCR.INIT does not read back the value written to it, which is a controller whose kernel clock is off; a register in memory always reads back what was written, and tests/canfdcan_regs_tests.nv runs every other path of this function; examples/embedded/can_demo in the novo-lang repository runs the whole driver on the NUCLEO-H723ZG
         return false
     // CCCR: INIT and CCE, FDOE (8) and BRSE (9) for FD, TEST (7) and
     // MON (5) for the modes.
@@ -267,7 +263,6 @@ fn start(d: FdCan, nominal: CanBitTiming, data: CanBitTiming, fd: Bool, mode: In
 // Whether FIFO 0 lost a frame since the last call (IR.RF0L, bit 3),
 // which also clears the flag.
 pub @tier(embedded)
-// cov: skip — reads and writes the FDCAN controller's registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
 fn overran(d: FdCan) -> Bool [hw]
     if (rd(d, IR) & (1 << 3)) == 0
         return false
@@ -323,7 +318,6 @@ fn ext_element1(f: CanFilter) -> Int []
 
 // The arbitration key of the frame pending in transmit buffer `i`.
 @tier(embedded)
-// cov: skip — reads the FDCAN message RAM at its fixed address, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
 fn pending_key(d: FdCan, i: Int) -> Int [hw]
     let t0 = ram_rd(d, TX_AT + ELEMENT * i)
     let ext = (t0 & (1 << 30)) != 0
@@ -343,7 +337,6 @@ fn pending_key(d: FdCan, i: Int) -> Int [hw]
 // and the displaced one or -1, packed as `buffer | displaced << 8`; -1
 // when the queue is full of frames that outrank this one.
 @tier(embedded)
-// cov: skip — reads and writes the FDCAN controller's registers and its message RAM at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
 fn free_buffer(d: FdCan, key: Int) -> Int [hw]
     let q = rd(d, TXFQS)
     if (q & (1 << 21)) == 0
@@ -360,6 +353,7 @@ fn free_buffer(d: FdCan, key: Int) -> Int [hw]
     if worst < 0 or key >= worst_key
         return 0 - 1
     wr(d, TXBCR, 1 << worst)
+    // cov: skip — reached only when TXFQS.TFQF clears after the cancel request, which is a status bit changing between two reads of one register; memory never does that, and tests/canfdcan_regs_tests.nv runs the same function up to the wait; examples/embedded/can_demo in the novo-lang repository runs the whole driver on the NUCLEO-H723ZG
     for _i in 0..SPIN
         let s = rd(d, TXFQS)
         if (s & (1 << 21)) == 0
@@ -368,20 +362,18 @@ fn free_buffer(d: FdCan, key: Int) -> Int [hw]
 
 // Answers a transmit attempt from what `free_buffer` found.
 @tier(embedded)
-// cov: skip — the transmit methods are its only callers, and they read and write the FDCAN controller's registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds them for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs them
 fn accepted_from(slot: Int) -> CanTxAccepted
     let disp = (slot >>> 8) & 0xFF
     if disp == 0xFF
         return canhal.accepted(slot & 0xFF, 0 - 1)
+    // cov: skip — reached only for a buffer displaced by a cancel request that `free_buffer` saw complete, which needs TXFQS.TFQF to change between two reads of one register; memory never does that, and tests/canfdcan_regs_tests.nv runs the same function up to the wait; examples/embedded/can_demo in the novo-lang repository runs the whole driver on the NUCLEO-H723ZG
     canhal.accepted(slot & 0xFF, disp)
 
 // Whether the controller is bus-off (PSR.BO, bit 7).
 @tier(embedded)
-// cov: skip — reads the FDCAN controller's registers at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
 fn bus_off(d: FdCan) -> Bool [hw]
     (rd(d, PSR) & (1 << 7)) != 0
 
-// cov: skip — reads and writes the FDCAN controller's registers and its message RAM at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
 impl CanPeripheral[hw] for FdCan
     @tier(embedded)
     fn can_transmit(self, f: CanFrame) -> CanTxAccepted [hw]
@@ -452,6 +444,7 @@ impl CanPeripheral[hw] for FdCan
         if ext and slot >= FDCAN_EXT_FILTERS or not ext and slot >= FDCAN_STD_FILTERS
             return Some(CanFilterNotSupported)
         if not enter_config(self)
+            // cov: skip — reached only when CCCR.INIT does not read back the value written to it, which is a controller whose kernel clock is off; a register in memory always reads back what was written, and tests/canfdcan_regs_tests.nv runs every other path of this function; examples/embedded/can_demo in the novo-lang repository runs the whole driver on the NUCLEO-H723ZG
             return Some(CanFilterNotSupported)
         if ext
             ram_wr(self, EXT_AT + 8 * slot, ext_element0(f))
@@ -496,10 +489,10 @@ impl CanPeripheral[hw] for FdCan
         wr(self, CCCR, rd(self, CCCR) & ~3)
         for _i in 0..SPIN
             if not bus_off(self)
+                // cov: skip — reached only when PSR.BO clears after the controller leaves initialisation, which is a status bit changing between two reads of one register; memory never does that, and tests/canfdcan_regs_tests.nv runs the same function up to the wait; examples/embedded/can_demo in the novo-lang repository runs the whole driver on the NUCLEO-H723ZG
                 return None
         Some(CanBusOff)
 
-// cov: skip — reads and writes the FDCAN controller's registers and its message RAM at their fixed addresses, which only a board maps; tests/driver_probe.nv builds it for the NUCLEO-H723ZG, and examples/embedded/can_demo in the novo-lang repository runs it
 impl CanFdPeripheral[hw] for FdCan
     @tier(embedded)
     fn can_transmit_fd(self, f: CanFdFrame, data: Vec[u8; 64]) -> CanTxAccepted [hw]

@@ -1,0 +1,499 @@
+// canfdcan_regs_tests.nv — the FDCAN driver against a register file and a
+// message RAM in ordinary memory.
+//
+// `FdCan` holds the base of the registers and the address of the
+// instance's part of the message RAM, so a test builds one over two
+// zeroed buffers, whose addresses `bytes.data_addr` gives.  Memory has
+// no hardware behind it: a register keeps what was last written to it,
+// which is also what CCCR.INIT does, so the controller "answers" the
+// driver's requests to enter and leave initialisation.  No status bit
+// changes on its own, so each test presets the ones the path under test
+// reads, and a wait for a bit that never comes gives up after its
+// bounded count of reads, as the driver's does on a controller whose
+// clock is off.
+//
+// Every test ends by reading the buffers' lengths, which keeps them
+// alive until the driver is done with their addresses.
+
+use std.test
+use std.bytes
+use canfdcan
+use canbus
+use canfilter
+use canframe
+use canhal
+use canerr
+
+// The registers the driver uses (RM0468 § 56.5).
+const DBTP = 0x0C
+const TEST = 0x10
+const CCCR = 0x18
+const NBTP = 0x1C
+const ECR = 0x40
+const PSR = 0x44
+const IR = 0x50
+const GFC = 0x80
+const SIDFC = 0x84
+const XIDFC = 0x88
+const XIDAM = 0x90
+const RXF0C = 0xA0
+const RXF0S = 0xA4
+const RXF0A = 0xA8
+const RXESC = 0xBC
+const TXBC = 0xC0
+const TXFQS = 0xC4
+const TXESC = 0xC8
+const TXBRP = 0xCC
+const TXBAR = 0xD0
+const TXBCR = 0xD4
+
+// The message RAM layout inside an instance's part.
+const STD_AT = 0
+const EXT_AT = 112
+const RX_AT = 176
+const TX_AT = 1328
+const ELEMENT = 72
+
+const REGS = 0x100
+const RAM = 2048
+
+fn regs() -> Bytes [mutate]
+    bytes.zeros(REGS)
+
+fn ram() -> Bytes [mutate]
+    bytes.zeros(RAM)
+
+fn rr(a: Int, off: Int) -> Int [hw]
+    hw.mem_read32(a + off)
+
+fn rw(a: Int, off: Int, v: Int) [hw]
+    hw.mem_write32(a + off, v)
+
+fn fd_at(r: Int, m: Int) -> FdCan
+    FdCan { base: r, ram: m }
+
+fn nominal() -> CanBitTiming
+    canbus.solve_timing(8000000, 500000, 875, canbus.fdcan_nominal_limits())
+
+fn data_phase() -> CanBitTiming
+    canbus.solve_timing(8000000, 2000000, 750, canbus.fdcan_data_limits())
+
+fn nothing() -> CanBitTiming
+    canbus.solve_timing(0, 500000, 875, canbus.fdcan_nominal_limits())
+
+@test
+fn test_start_programs_a_classic_controller() [hw, mutate]
+    test.case("the timing, the filter and FIFO sections, the element sizes and the queue are programmed, the RAM is cleared, and INIT is left")
+    let rg = regs()
+    let mm = ram()
+    let r = bytes.data_addr(rg)
+    let m = bytes.data_addr(mm)
+    for w in 0..RAM / 4
+        rw(m, 4 * w, 0xFFFFFFFF)
+    test.assert(canfdcan.start(fd_at(r, m), nominal(), data_phase(), false, canfdcan.FDCAN_MODE_NORMAL))
+    let at = m - canfdcan.FDCAN_MESSAGE_RAM
+    test.assert_eq(rr(r, CCCR), 0)
+    test.assert_eq(rr(r, NBTP), canfdcan.nbtp_of(nominal()))
+    test.assert_eq(rr(r, DBTP), 0)
+    test.assert_eq(rr(r, TEST), 0)
+    test.assert_eq(rr(r, SIDFC), (28 << 16) | ((at + STD_AT) & 0xFFFC))
+    test.assert_eq(rr(r, XIDFC), (8 << 16) | ((at + EXT_AT) & 0xFFFC))
+    test.assert_eq(rr(r, XIDAM), 0x1FFFFFFF)
+    test.assert_eq(rr(r, GFC), 0)
+    test.assert_eq(rr(r, RXF0C), (16 << 16) | ((at + RX_AT) & 0xFFFC))
+    test.assert_eq(rr(r, RXESC), 0x777)
+    test.assert_eq(rr(r, TXESC), 7)
+    test.assert_eq(rr(r, TXBC), (1 << 30) | (8 << 24) | ((at + TX_AT) & 0xFFFC))
+    test.assert_eq(rr(r, IR), 0xFFFFFFFF)
+    test.assert_eq(rr(m, 0), 0)
+    test.assert_eq(rr(m, RAM - 4), 0)
+    test.assert_eq(bytes.len(rg), REGS)
+    test.assert_eq(bytes.len(mm), RAM)
+
+@test
+fn test_start_sets_the_fd_and_test_bits_the_mode_asks_for() [hw, mutate]
+    test.case("CAN FD with bit rate switching and internal loopback: FDOE, BRSE, TEST and MON in CCCR, LBCK in TEST, the data timing in DBTP")
+    let rg = regs()
+    let mm = ram()
+    let r = bytes.data_addr(rg)
+    let m = bytes.data_addr(mm)
+    let can = fd_at(r, m)
+    test.assert(canfdcan.start(can, nominal(), data_phase(), true, canfdcan.FDCAN_MODE_INTERNAL_LOOPBACK))
+    test.assert_eq(rr(r, CCCR), (1 << 8) | (1 << 9) | (1 << 7) | (1 << 5))
+    test.assert_eq(rr(r, TEST), 1 << 4)
+    test.assert_eq(rr(r, DBTP), canfdcan.dbtp_of(data_phase()))
+    test.case("external loopback sets TEST and LBCK only; monitor mode sets MON and no TEST register bit")
+    test.assert(canfdcan.start(can, nominal(), data_phase(), false, canfdcan.FDCAN_MODE_EXTERNAL_LOOPBACK))
+    test.assert_eq(rr(r, CCCR), 1 << 7)
+    test.assert_eq(rr(r, TEST), 1 << 4)
+    rw(r, TEST, 0)
+    test.assert(canfdcan.start(can, nominal(), data_phase(), false, canfdcan.FDCAN_MODE_MONITOR))
+    test.assert_eq(rr(r, CCCR), 1 << 5)
+    test.assert_eq(rr(r, TEST), 0)
+    test.assert_eq(bytes.len(rg), REGS)
+    test.assert_eq(bytes.len(mm), RAM)
+
+@test
+fn test_start_refuses_a_timing_the_solver_did_not_find() [hw, mutate]
+    test.case("an unsolved nominal timing, or an unsolved data timing for a controller that uses FD, writes nothing; a classic controller does not look at the data timing")
+    let rg = regs()
+    let mm = ram()
+    let r = bytes.data_addr(rg)
+    let m = bytes.data_addr(mm)
+    let can = fd_at(r, m)
+    test.assert(canfdcan.start(can, nothing(), data_phase(), false, canfdcan.FDCAN_MODE_NORMAL) == false)
+    test.assert(canfdcan.start(can, nominal(), nothing(), true, canfdcan.FDCAN_MODE_NORMAL) == false)
+    test.assert_eq(rr(r, CCCR), 0)
+    test.assert_eq(rr(r, NBTP), 0)
+    test.assert(canfdcan.start(can, nominal(), nothing(), false, canfdcan.FDCAN_MODE_NORMAL))
+    test.assert_eq(bytes.len(rg), REGS)
+    test.assert_eq(bytes.len(mm), RAM)
+
+@test
+fn test_overran_reads_and_clears_the_fifo_loss_flag() [hw, mutate]
+    test.case("false while IR.RF0L is clear; true once, with the flag written back to clear it")
+    let rg = regs()
+    let mm = ram()
+    let r = bytes.data_addr(rg)
+    let can = fd_at(r, bytes.data_addr(mm))
+    test.assert(canfdcan.overran(can) == false)
+    test.assert_eq(rr(r, IR), 0)
+    rw(r, IR, 1 << 3)
+    test.assert(canfdcan.overran(can))
+    test.assert_eq(rr(r, IR), 1 << 3)
+    test.assert_eq(bytes.len(rg), REGS)
+    test.assert_eq(bytes.len(mm), RAM)
+
+@test
+fn test_a_free_buffer_takes_the_frame() [hw, mutate]
+    test.case("TXFQS names the buffer to put the frame in; the header, the length and the data words go to its element, then TXBAR")
+    let rg = regs()
+    let mm = ram()
+    let r = bytes.data_addr(rg)
+    let m = bytes.data_addr(mm)
+    let can = fd_at(r, m)
+    rw(r, TXFQS, 3 << 16)
+    let a = can.can_transmit(canframe.frame(0x123, 2, 0x2211))
+    test.assert(canhal.tx_ok(a))
+    test.assert_eq(canhal.accepted_mailbox(a), 3)
+    test.assert_eq(canhal.accepted_displaced(a), 0 - 1)
+    let at = TX_AT + ELEMENT * 3
+    test.assert_eq(rr(m, at), 0x123 << 18)
+    test.assert_eq(rr(m, at + 4), 2 << 16)
+    test.assert_eq(rr(m, at + 8), 0x2211)
+    test.assert_eq(rr(r, TXBAR), 1 << 3)
+    test.case("an extended remote frame sets XTD and RTR, and the data splits across two words")
+    rw(r, TXFQS, 1 << 16)
+    let e = can.can_transmit(canframe.frame_ext(0x1ABCDEF, 8, 0x1122334455667788))
+    test.assert_eq(canhal.accepted_mailbox(e), 1)
+    let at1 = TX_AT + ELEMENT
+    test.assert_eq(rr(m, at1), (1 << 30) | 0x1ABCDEF)
+    test.assert_eq(rr(m, at1 + 8), 0x55667788)
+    test.assert_eq(rr(m, at1 + 12), 0x11223344)
+    let rem = can.can_transmit(canframe.remote_frame_ext(0x10, 0))
+    test.assert(canhal.tx_ok(rem))
+    test.assert_eq(rr(m, at1), (1 << 30) | (1 << 29) | 0x10)
+    test.assert_eq(bytes.len(rg), REGS)
+    test.assert_eq(bytes.len(mm), RAM)
+
+@test
+fn test_a_bus_off_controller_and_a_bad_frame_are_refused_first() [hw, mutate]
+    test.case("a frame the bus cannot carry is refused, and PSR.BO refuses everything with bus-off")
+    let rg = regs()
+    let mm = ram()
+    let r = bytes.data_addr(rg)
+    let can = fd_at(r, bytes.data_addr(mm))
+    test.assert_eq(canhal.tx_status(can.can_transmit(canframe.frame(0x800, 1, 7))), canhal.CAN_TX_REFUSED)
+    rw(r, PSR, 1 << 7)
+    test.assert_eq(canhal.tx_status(can.can_transmit(canframe.frame(0x123, 1, 7))), canhal.CAN_TX_BUS_OFF)
+    test.assert_eq(bytes.len(rg), REGS)
+    test.assert_eq(bytes.len(mm), RAM)
+
+// Puts a pending frame in transmit buffer `i`: the first header word.
+fn pend(r: Int, m: Int, i: Int, header0: Int) [hw]
+    rw(m, TX_AT + ELEMENT * i, header0)
+    rw(r, TXBRP, rr(r, TXBRP) | (1 << i))
+
+@test
+fn test_a_full_queue_cancels_the_loser_only_for_a_frame_that_outranks_it() [hw, mutate]
+    test.case("TXFQS.TFQF set and buffers 0 and 1 pending: a frame that does not outrank the worse of them is refused as full, and TXBCR is not written")
+    let rg = regs()
+    let mm = ram()
+    let r = bytes.data_addr(rg)
+    let m = bytes.data_addr(mm)
+    let can = fd_at(r, m)
+    rw(r, TXFQS, 1 << 21)
+    pend(r, m, 0, 0x100 << 18)
+    pend(r, m, 1, 0x300 << 18)
+    test.assert_eq(canhal.tx_status(can.can_transmit(canframe.frame(0x400, 1, 1))), canhal.CAN_TX_FULL)
+    test.assert_eq(rr(r, TXBCR), 0)
+    test.case("a frame that outranks it cancels buffer 1 and, since the queue never frees, is refused as full")
+    test.assert_eq(canhal.tx_status(can.can_transmit(canframe.frame(0x010, 1, 1))), canhal.CAN_TX_FULL)
+    test.assert_eq(rr(r, TXBCR), 1 << 1)
+    test.case("every format is read back when the worst pending frame is picked: standard remote, extended data, extended remote")
+    rw(r, TXBRP, 0)
+    pend(r, m, 0, (0x100 << 18) | (1 << 29))
+    pend(r, m, 1, (1 << 30) | 0x20)
+    pend(r, m, 2, (1 << 30) | (1 << 29) | 0x20)
+    rw(r, TXBCR, 0)
+    test.assert_eq(canhal.tx_status(can.can_transmit(canframe.frame(0x001, 1, 1))), canhal.CAN_TX_FULL)
+    test.assert_eq(rr(r, TXBCR), 1 << 0)
+    test.case("a full queue with nothing pending is refused as full")
+    rw(r, TXBRP, 0)
+    rw(r, TXBCR, 0)
+    test.assert_eq(canhal.tx_status(can.can_transmit(canframe.frame(0x001, 1, 1))), canhal.CAN_TX_FULL)
+    test.assert_eq(rr(r, TXBCR), 0)
+    test.assert_eq(bytes.len(rg), REGS)
+    test.assert_eq(bytes.len(mm), RAM)
+
+@test
+fn test_transmit_done_and_abort_address_one_buffer_each() [hw, mutate]
+    test.case("a buffer is done when its TXBRP bit is clear; one that does not exist is done")
+    let rg = regs()
+    let mm = ram()
+    let r = bytes.data_addr(rg)
+    let can = fd_at(r, bytes.data_addr(mm))
+    rw(r, TXBRP, 1 << 2)
+    test.assert(can.can_tx_done(2) == false)
+    test.assert(can.can_tx_done(1))
+    test.assert(can.can_tx_done(0 - 1))
+    test.assert(can.can_tx_done(8))
+    test.case("an abort writes that buffer's TXBCR bit; a buffer that does not exist writes nothing")
+    test.assert(can.can_tx_abort(5) == None)
+    test.assert_eq(rr(r, TXBCR), 1 << 5)
+    rw(r, TXBCR, 0)
+    test.assert(can.can_tx_abort(8) == None)
+    test.assert(can.can_tx_abort(0 - 1) == None)
+    test.assert_eq(rr(r, TXBCR), 0)
+    test.assert_eq(bytes.len(rg), REGS)
+    test.assert_eq(bytes.len(mm), RAM)
+
+// A receive element in FIFO slot `gi`: two header words and two data words.
+fn element(r: Int, m: Int, gi: Int, r0: Int, r1: Int, lo: Int, hi: Int) [hw]
+    let at = RX_AT + ELEMENT * gi
+    rw(m, at, r0)
+    rw(m, at + 4, r1)
+    rw(m, at + 8, lo)
+    rw(m, at + 12, hi)
+    rw(r, RXF0S, 1 | (gi << 8))
+
+@test
+fn test_receive_reads_the_fifo_in_every_frame_format() [hw, mutate]
+    test.case("an empty FIFO answers none")
+    let rg = regs()
+    let mm = ram()
+    let r = bytes.data_addr(rg)
+    let m = bytes.data_addr(mm)
+    let can = fd_at(r, m)
+    test.assert(canframe.is_none(can.can_receive()))
+    test.case("a standard data frame, acknowledged by writing the get index to RXF0A")
+    element(r, m, 2, 0x123 << 18, 2 << 16, 0x2211, 0)
+    let f = can.can_receive()
+    test.assert_eq(canframe.frame_id(f), 0x123)
+    test.assert_eq(canframe.frame_len(f), 2)
+    test.assert_eq(canframe.frame_data(f), 0x2211)
+    test.assert_eq(rr(r, RXF0A), 2)
+    test.case("an extended data frame, an extended remote frame and a standard remote frame")
+    element(r, m, 0, (1 << 30) | 0x1ABCDEF, 8 << 16, 0x55667788, 0x11223344)
+    let e = can.can_receive()
+    test.assert(canframe.is_extended(e))
+    test.assert_eq(canframe.frame_id(e), 0x1ABCDEF)
+    test.assert_eq(canframe.frame_data(e), 0x1122334455667788)
+    element(r, m, 0, (1 << 30) | (1 << 29) | 0x77, 3 << 16, 0, 0)
+    let re = can.can_receive()
+    test.assert(canframe.is_remote(re) and canframe.is_extended(re))
+    test.assert_eq(canframe.frame_id(re), 0x77)
+    element(r, m, 0, (0x55 << 18) | (1 << 29), 4 << 16, 0, 0)
+    let rs = can.can_receive()
+    test.assert(canframe.is_remote(rs) and canframe.is_extended(rs) == false)
+    test.assert_eq(canframe.frame_id(rs), 0x55)
+    test.case("a CAN FD frame longer than eight bytes does not fit a classic frame and answers a bad-length fault")
+    element(r, m, 0, 0x100 << 18, (1 << 21) | (9 << 16), 0, 0)
+    let big = can.can_receive()
+    test.assert(canframe.is_fault(big))
+    test.assert_eq(canframe.fault_code(big), canframe.CAN_FAULT_BAD_LENGTH)
+    test.case("a CAN FD frame of eight bytes or fewer is an ordinary frame")
+    element(r, m, 0, 0x100 << 18, (1 << 21) | (8 << 16), 0x04030201, 0x08070605)
+    let ok = can.can_receive()
+    test.assert(canframe.is_frame(ok))
+    test.assert_eq(canframe.frame_len(ok), 8)
+    test.assert_eq(bytes.len(rg), REGS)
+    test.assert_eq(bytes.len(mm), RAM)
+
+@test
+fn test_receive_fd_reads_the_payload_and_the_flags() [hw, mutate]
+    test.case("an empty FIFO answers an FD none and clears the buffer")
+    let rg = regs()
+    let mm = ram()
+    let r = bytes.data_addr(rg)
+    let m = bytes.data_addr(mm)
+    let can = fd_at(r, m)
+    var data: Vec[u8; 64] = Vec.new()
+    let _ = data.push(9 as u8)
+    test.assert(canframe.fd_is_none(can.can_receive_fd(var data)))
+    test.assert_eq(data.len(), 0)
+    test.case("an FD frame with bit rate switching, the error state indicator and an extended identifier carries twelve bytes")
+    element(r,
+        m,
+        1,
+        (1 << 31) | (1 << 30) | 0x1ABCDEF,
+        (1 << 21) | (1 << 20) | (9 << 16),
+        0x04030201,
+        0x08070605)
+    rw(m, RX_AT + ELEMENT + 16, 0x0C0B0A09)
+    let f = can.can_receive_fd(var data)
+    test.assert(canframe.fd_is_fd(f) and canframe.fd_has_brs(f) and canframe.fd_has_esi(f) and canframe.fd_is_extended(f))
+    test.assert_eq(canframe.fd_id(f), 0x1ABCDEF)
+    test.assert_eq(canframe.fd_len(f), 12)
+    test.assert_eq(data.len(), 12)
+    test.assert_eq(data[0] as Int, 1)
+    test.assert_eq(data[11] as Int, 0x0C)
+    test.assert_eq(rr(r, RXF0A), 1)
+    test.case("a classic standard remote frame has no FD flag, and its length code is the classic one")
+    element(r, m, 0, (0x55 << 18) | (1 << 29), 3 << 16, 0, 0)
+    let c = can.can_receive_fd(var data)
+    test.assert(canframe.fd_is_fd(c) == false and canframe.fd_is_extended(c) == false)
+    test.assert_eq(canframe.fd_id(c), 0x55)
+    test.assert_eq(canframe.fd_len(c), 3)
+    test.assert_eq(bytes.len(rg), REGS)
+    test.assert_eq(bytes.len(mm), RAM)
+
+@test
+fn test_transmit_fd_writes_the_header_and_the_padded_payload() [hw, mutate]
+    test.case("an FD frame with bit rate switching: FDF and BRS in the second header word, the payload packed little-endian, then TXBAR")
+    let rg = regs()
+    let mm = ram()
+    let r = bytes.data_addr(rg)
+    let m = bytes.data_addr(mm)
+    let can = fd_at(r, m)
+    var data: Vec[u8; 64] = Vec.new()
+    for i in 0..12
+        let _ = data.push((i + 1) as u8)
+    rw(r, TXFQS, 2 << 16)
+    let a = can.can_transmit_fd(canframe.fd_frame(0x123, 12, true), data)
+    test.assert(canhal.tx_ok(a))
+    test.assert_eq(canhal.accepted_mailbox(a), 2)
+    let at = TX_AT + ELEMENT * 2
+    test.assert_eq(rr(m, at), 0x123 << 18)
+    test.assert_eq(rr(m, at + 4), (1 << 21) | (1 << 20) | (9 << 16))
+    test.assert_eq(rr(m, at + 8), 0x04030201)
+    test.assert_eq(rr(m, at + 16), 0x0C0B0A09)
+    test.assert_eq(rr(r, TXBAR), 1 << 2)
+    test.case("a classic-format frame sent through the FD interface carries its length as the code and no FD flags; a short payload is zero-padded")
+    var short: Vec[u8; 64] = Vec.new()
+    let _ = short.push(0xAA as u8)
+    rw(r, TXFQS, 0)
+    let c = can.can_transmit_fd(canframe.fd_of_classic(canframe.frame_ext(0x1000, 3, 0)), short)
+    test.assert(canhal.tx_ok(c))
+    test.assert_eq(rr(m, TX_AT), (1 << 30) | 0x1000)
+    test.assert_eq(rr(m, TX_AT + 4), 3 << 16)
+    test.assert_eq(rr(m, TX_AT + 8), 0xAA)
+    test.assert_eq(bytes.len(rg), REGS)
+    test.assert_eq(bytes.len(mm), RAM)
+
+@test
+fn test_transmit_fd_refusals() [hw, mutate]
+    test.case("bus-off, a frame that is not a frame, an invalid length and a full queue are each refused")
+    let rg = regs()
+    let mm = ram()
+    let r = bytes.data_addr(rg)
+    let m = bytes.data_addr(mm)
+    let can = fd_at(r, m)
+    var data: Vec[u8; 64] = Vec.new()
+    rw(r, PSR, 1 << 7)
+    test.assert_eq(canhal.tx_status(can.can_transmit_fd(canframe.fd_frame(0x1, 8, false), data)),
+        canhal.CAN_TX_BUS_OFF)
+    rw(r, PSR, 0)
+    test.assert_eq(canhal.tx_status(can.can_transmit_fd(canframe.fd_none(), data)), canhal.CAN_TX_REFUSED)
+    test.assert_eq(canhal.tx_status(can.can_transmit_fd(canframe.fd_frame(0x1, 13, false), data)),
+        canhal.CAN_TX_REFUSED)
+    rw(r, TXFQS, 1 << 21)
+    test.assert_eq(canhal.tx_status(can.can_transmit_fd(canframe.fd_frame(0x1, 8, false), data)),
+        canhal.CAN_TX_FULL)
+    test.assert_eq(bytes.len(rg), REGS)
+    test.assert_eq(bytes.len(mm), RAM)
+
+@test
+fn test_a_filter_goes_to_its_element_and_the_global_rules_follow() [hw, mutate]
+    test.case("a standard mask filter is a classic element for FIFO 0; the first filter makes non-matching and remote frames rejected")
+    let rg = regs()
+    let mm = ram()
+    let r = bytes.data_addr(rg)
+    let m = bytes.data_addr(mm)
+    let can = fd_at(r, m)
+    test.assert(can.can_set_filter(2, canfilter.filter(0x123, 0x7F0)) == None)
+    test.assert_eq(rr(m, STD_AT + 8), canfdcan.std_element(canfilter.filter(0x123, 0x7F0)))
+    test.assert_eq(rr(r, GFC), (2 << 4) | (2 << 2) | 3)
+    test.assert_eq(rr(r, CCCR), 0)
+    test.case("a second filter keeps the remote-frame switches the first one chose, and one that allows remote frames lifts them")
+    test.assert(can.can_set_filter(0, canfilter.list(0x100, 0x2A0)) == None)
+    test.assert_eq(rr(m, STD_AT), canfdcan.std_element(canfilter.list(0x100, 0x2A0)))
+    test.assert_eq(rr(r, GFC), (2 << 4) | (2 << 2) | 3)
+    test.assert(can.can_set_filter(1, canfilter.allowing_remote(canfilter.exact(0x10))) == None)
+    test.assert_eq(rr(r, GFC), (2 << 4) | (2 << 2))
+    test.assert(can.can_set_filter(4, canfilter.exact(0x20)) == None)
+    test.assert_eq(rr(r, GFC), (2 << 4) | (2 << 2))
+    test.case("an extended filter goes to the extended section, two words an element")
+    test.assert(can.can_set_filter(3, canfilter.filter_ext(0x1234567, 0x1FFFFF00)) == None)
+    test.assert_eq(rr(m, EXT_AT + 24), canfdcan.ext_element0(canfilter.filter_ext(0x1234567, 0x1FFFFF00)))
+    test.assert_eq(rr(m, EXT_AT + 28), canfdcan.ext_element1(canfilter.filter_ext(0x1234567, 0x1FFFFF00)))
+    test.case("an extended list filter is a dual-ID element")
+    test.assert(can.can_set_filter(5, canfilter.list_ext(0x1000, 0x2000)) == None)
+    test.assert_eq(rr(m, EXT_AT + 40 + 4), (1 << 30) | 0x2000)
+    test.assert_eq(can.can_filter_slots(), canfdcan.FDCAN_STD_FILTERS)
+    test.assert_eq(bytes.len(rg), REGS)
+    test.assert_eq(bytes.len(mm), RAM)
+
+@test
+fn test_a_filter_the_hardware_cannot_hold_is_refused() [hw, mutate]
+    test.case("inverted, a negative slot, and a slot past the last standard or extended element answer CanFilterNotSupported and write nothing")
+    let rg = regs()
+    let mm = ram()
+    let r = bytes.data_addr(rg)
+    let m = bytes.data_addr(mm)
+    let can = fd_at(r, m)
+    test.assert(can.can_set_filter(0, canfilter.inverted(canfilter.exact(0x10))) == Some(CanFilterNotSupported))
+    test.assert(can.can_set_filter(0 - 1, canfilter.exact(0x10)) == Some(CanFilterNotSupported))
+    test.assert(can.can_set_filter(28, canfilter.exact(0x10)) == Some(CanFilterNotSupported))
+    test.assert(can.can_set_filter(8, canfilter.exact_ext(0x10)) == Some(CanFilterNotSupported))
+    test.assert_eq(rr(r, GFC), 0)
+    test.assert_eq(rr(r, CCCR), 0)
+    test.assert_eq(bytes.len(rg), REGS)
+    test.assert_eq(bytes.len(mm), RAM)
+
+@test
+fn test_the_bus_state_comes_from_the_error_counter_register() [hw, mutate]
+    test.case("ECR's transmit and receive counters give the state; PSR.BO makes the transmit counter the bus-off limit")
+    let rg = regs()
+    let mm = ram()
+    let r = bytes.data_addr(rg)
+    let can = fd_at(r, bytes.data_addr(mm))
+    rw(r, ECR, (7 << 8) | 130)
+    let s = can.can_bus_state()
+    test.assert_eq(canbus.tx_errors(s), 130)
+    test.assert_eq(canbus.rx_errors(s), 7)
+    rw(r, PSR, 1 << 7)
+    rw(r, ECR, (9 << 8) | 130)
+    let off = can.can_bus_state()
+    test.assert_eq(canbus.tx_errors(off), canbus.CAN_BUS_OFF_LIMIT)
+    test.assert_eq(canbus.rx_errors(off), 9)
+    test.assert_eq(bytes.len(rg), REGS)
+    test.assert_eq(bytes.len(mm), RAM)
+
+@test
+fn test_recovery_does_nothing_unless_the_controller_is_bus_off() [hw, mutate]
+    test.case("a controller that is not bus-off answers None and is left alone")
+    let rg = regs()
+    let mm = ram()
+    let r = bytes.data_addr(rg)
+    let can = fd_at(r, bytes.data_addr(mm))
+    test.assert(can.can_recover() == None)
+    test.assert_eq(rr(r, TXBCR), 0)
+    test.case("a bus-off controller has every buffer cancelled and INIT cleared; one that stays bus-off is still bus-off")
+    rw(r, PSR, 1 << 7)
+    rw(r, CCCR, 3)
+    test.assert(can.can_recover() == Some(CanBusOff))
+    test.assert_eq(rr(r, TXBCR), 0xFF)
+    test.assert_eq(rr(r, CCCR), 0)
+    test.assert_eq(bytes.len(rg), REGS)
+    test.assert_eq(bytes.len(mm), RAM)
