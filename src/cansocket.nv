@@ -220,7 +220,7 @@ pub struct CanSocket
 // ```
 pub @tier(app)
 fn open(interface: Str) -> Result<CanSocket, CanError> [net, fs]
-    open_on(interface, false)
+    open_on(SYS_NET, interface, false)
 
 // Open a socket that also carries CAN FD frames.
 //
@@ -231,7 +231,7 @@ fn open(interface: Str) -> Result<CanSocket, CanError> [net, fs]
 // looks almost right.
 pub @tier(app)
 fn open_fd(interface: Str) -> Result<CanSocket, CanError> [net, fs]
-    open_on(interface, true)
+    open_on(SYS_NET, interface, true)
 
 // Open a socket bound to EVERY CAN interface on the machine.
 //
@@ -290,7 +290,6 @@ pub @tier(app)
 fn send_fd(s: CanSocket, f: CanFdFrame, byte_at: fn(Int) -> Int [mutate]) -> ?CanError [net, mutate]
     if not s.fd_frames
         return Some(CanFdNotSupported)
-    // cov: skip — needs a SocketCAN interface, which a host has only when one is configured; tests/socketcan.sh runs it on vcan0 in a user network namespace
     send_fd_bytes(s, f, byte_at)
 
 // Take the next frame.
@@ -320,11 +319,7 @@ fn receive_into(s: CanSocket, var dst: Vec[u8; 72]) -> Result<Int, CanError> [ne
     dst.clear()
     match net.recv_bytes(s.sock, CAN_FD_WIRE_LEN)
         // cov: skip — needs a SocketCAN interface, which a host has only when one is configured; tests/socketcan.sh runs it on vcan0 in a user network namespace
-        Some(b) =>
-            let n = bytes.len(b)
-            for i in 0..n
-                let _ = dst.push((bytes.__byte_at_or(b, i, 0) & 0xFF) as u8)
-            Ok(n)
+        Some(b) => Ok(copy_read(b, var dst))
         None    =>
             if net.recv_would_block()
                 return Ok(0)
@@ -431,56 +426,29 @@ fn set_receive_own(s: CanSocket, on: Bool) -> ?CanError [net]
 // not exist, which is the most common way a SocketCAN program fails.
 pub @tier(app)
 fn interfaces() -> Result<[Str], CanError> [fs]
-    var out: [Str] = []
-    for name in fs.read_dir(SYS_NET)
-        if is_can(name)
-            // cov: skip — needs a SocketCAN interface, which a host has only when one is configured; tests/socketcan.sh runs it on vcan0 in a user network namespace
-            list.push(out, name)
-    Ok(list.sort(out))
+    interfaces_in(SYS_NET)
 
 // Whether this machine has a CAN interface by that name.
 pub @tier(app)
 fn interface_exists(name: Str) -> Bool [fs]
-    is_can(name)
+    is_can(SYS_NET, name)
 
 // The kernel index of an interface, which a bind needs.
 pub @tier(app)
 fn interface_index(name: Str) -> Result<Int, CanError> [fs]
-    if not is_can(name)
-        return Err(CanNoSuchInterface(name))
-    // cov: skip — needs a SocketCAN interface, which a host has only when one is configured; tests/socketcan.sh runs it on vcan0 in a user network namespace, where the two refusals do not run, since sysfs gives every interface an ifindex holding a number
-    match fs.read(SYS_NET + "/" + name + "/ifindex")
-        Some(t) =>
-            match str.to_int(str.trim(t))
-                Some(v) => Ok(v)
-                None    => Err(CanNoSuchInterface(name))
-        None    => Err(CanNoSuchInterface(name))
+    interface_index_in(SYS_NET, name)
 
 // The name of an interface index, or empty.
 pub @tier(app)
 fn interface_name(index: Int) -> Result<Str, CanError> [fs]
-    if index == 0
-        return Ok("")
-    for name in fs.read_dir(SYS_NET)
-        match fs.read(SYS_NET + "/" + name + "/ifindex")
-            Some(t) =>
-                if str.trim(t) == str.from_int(index)
-                    return Ok(name)
-            // cov: skip — runs for an entry of /sys/class/net that is not an interface, such as the bonding driver's bonding_masters file; the hosts this package is measured on have none
-            None    => ()
-    Err(CanNoSuchInterface("#" + str.from_int(index)))
+    interface_name_in(SYS_NET, index)
 
 // The bit rate an interface is configured for, or -1 when the kernel
 // does not say — which is the case for a virtual interface, since
 // `vcan0` has no bit rate at all.
 pub @tier(app)
 fn interface_bitrate(name: Str) -> Result<Int, CanError> [fs]
-    if not is_can(name)
-        return Err(CanNoSuchInterface(name))
-    // sysfs carries no bit rate; the kernel reports it over netlink
-    // (`ip -details link show`), which this module does not read.
-    // cov: skip — needs a SocketCAN interface, which a host has only when one is configured; tests/socketcan.sh runs it on vcan0 in a user network namespace
-    Ok(0 - 1)
+    interface_bitrate_in(SYS_NET, name)
 
 // The error counters and confinement state the kernel reports for an
 // interface.
@@ -492,12 +460,12 @@ fn interface_bitrate(name: Str) -> Result<Int, CanError> [fs]
 // works against a host and the other way round.
 pub @tier(app)
 fn interface_tx_errors(name: Str) -> Result<Int, CanError> [fs]
-    statistic(name, "tx_errors")
+    statistic(SYS_NET, name, "tx_errors")
 
 // The receive error counter the kernel reports for an interface.
 pub @tier(app)
 fn interface_rx_errors(name: Str) -> Result<Int, CanError> [fs]
-    statistic(name, "rx_errors")
+    statistic(SYS_NET, name, "rx_errors")
 
 // Whether an interface is virtual — `vcan` or `vxcan` — and therefore
 // needs no hardware.
@@ -514,13 +482,7 @@ fn interface_rx_errors(name: Str) -> Result<Int, CanError> [fs]
 // ```
 pub @tier(app)
 fn is_virtual(name: Str) -> Bool [fs]
-    // An interface that exists is asked of sysfs; a name that does not
-    // is judged by the driver names Linux gives virtual CAN, so a test
-    // can ask before it creates one.
-    if is_can(name)
-        // cov: skip — needs a SocketCAN interface, which a host has only when one is configured; tests/socketcan.sh runs it on vcan0 in a user network namespace
-        return fs.exists("/sys/devices/virtual/net/" + name)
-    str.starts_with(name, "vcan") or str.starts_with(name, "vxcan")
+    is_virtual_in(SYS_NET, VIRTUAL_NET, name)
 
 // ── Inside the module ────────────────────────────────────────────────
 
@@ -553,28 +515,85 @@ const CAN_INV_FILTER = 0x20000000
 
 // Where Linux lists its network interfaces.
 const SYS_NET = "/sys/class/net"
+// Where Linux lists the interfaces that have no hardware behind them.
+const VIRTUAL_NET = "/sys/devices/virtual/net"
 // ARPHRD_CAN, the link type sysfs reports for a CAN interface.
 const ARPHRD_CAN = "280"
 
-// Opens a socket on one named interface.
+// Every interface of the CAN link type under the sysfs directory `root`,
+// in name order.
 @tier(app)
-fn open_on(interface: Str, fd_frames: Bool) -> Result<CanSocket, CanError> [net, fs]
-    if not is_can(interface)
+fn interfaces_in(root: Str) -> Result<[Str], CanError> [fs]
+    var out: [Str] = []
+    for name in fs.read_dir(root)
+        if is_can(root, name)
+            list.push(out, name)
+    Ok(list.sort(out))
+
+// The index sysfs under `root` holds for a CAN interface.
+@tier(app)
+fn interface_index_in(root: Str, name: Str) -> Result<Int, CanError> [fs]
+    if not is_can(root, name)
+        return Err(CanNoSuchInterface(name))
+    match fs.read(root + "/" + name + "/ifindex")
+        Some(t) =>
+            match str.to_int(str.trim(t))
+                Some(v) => Ok(v)
+                None    => Err(CanNoSuchInterface(name))
+        None    => Err(CanNoSuchInterface(name))
+
+// The name of the interface under `root` that holds `index`.
+@tier(app)
+fn interface_name_in(root: Str, index: Int) -> Result<Str, CanError> [fs]
+    if index == 0
+        return Ok("")
+    for name in fs.read_dir(root)
+        match fs.read(root + "/" + name + "/ifindex")
+            Some(t) =>
+                if str.trim(t) == str.from_int(index)
+                    return Ok(name)
+            // An entry that is not an interface, such as the bonding
+            // driver's bonding_masters file, holds no index.
+            None    => ()
+    Err(CanNoSuchInterface("#" + str.from_int(index)))
+
+// A CAN interface's bit rate, always unknown: sysfs carries none.
+@tier(app)
+fn interface_bitrate_in(root: Str, name: Str) -> Result<Int, CanError> [fs]
+    if not is_can(root, name)
+        return Err(CanNoSuchInterface(name))
+    // sysfs carries no bit rate; the kernel reports it over netlink
+    // (`ip -details link show`), which this module does not read.
+    Ok(0 - 1)
+
+// Whether `name` is virtual: asked of the sysfs directory `virtual_root`
+// when the interface exists under `root`, and judged by the driver names
+// Linux gives virtual CAN when it does not, so a test can ask before it
+// creates one.
+@tier(app)
+fn is_virtual_in(root: Str, virtual_root: Str, name: Str) -> Bool [fs]
+    if is_can(root, name)
+        return fs.exists(virtual_root + "/" + name)
+    str.starts_with(name, "vcan") or str.starts_with(name, "vxcan")
+
+// Opens a socket on one named interface of the sysfs directory `root`.
+@tier(app)
+fn open_on(root: Str, interface: Str, fd_frames: Bool) -> Result<CanSocket, CanError> [net, fs]
+    if not is_can(root, interface)
         return Err(CanNoSuchInterface(interface))
-    // cov: skip — needs a SocketCAN interface, which a host has only when one is configured; tests/socketcan.sh runs it on vcan0 in a user network namespace
-    bind_on(interface, fd_frames)
+    bind_on(root, interface, fd_frames)
 
 // Opens a socket on the CAN interface `interface` and binds it.
 @tier(app)
-// cov: skip — needs a SocketCAN interface, which a host has only when one is configured; tests/socketcan.sh runs it on vcan0 in a user network namespace, where the two refusals do not run: an interface sysfs lists has an index, and the socket opens on a kernel with can_raw
-fn bind_on(interface: Str, fd_frames: Bool) -> Result<CanSocket, CanError> [net, fs]
+fn bind_on(root: Str, interface: Str, fd_frames: Bool) -> Result<CanSocket, CanError> [net, fs]
     var index = 0
-    match interface_index(interface)
+    match interface_index_in(root, interface)
         Ok(i)  =>
             index = i
         Err(e) =>
             return Err(e)
     match net.can_open(interface, fd_frames)
+        // cov: skip — needs a SocketCAN interface, which only a kernel with one configured can bind; tests/socketcan.sh runs it on vcan0 in a user network namespace
         Some(sock) => Ok(CanSocket { fd: net.sock_fd(sock),
             interface: interface,
             fd_frames: fd_frames,
@@ -588,32 +607,32 @@ fn bind_on(interface: Str, fd_frames: Bool) -> Result<CanSocket, CanError> [net,
 // Writes an FD frame to the socket `s`, with the payload supplied by
 // the caller's accessor.
 @tier(app)
-// cov: skip — needs a SocketCAN interface, since only a socket bound to one carries CAN FD frames; tests/socketcan.sh runs it on vcan0 and vcan1 in a user network namespace
 fn send_fd_bytes(s: CanSocket, f: CanFdFrame,
                  byte_at: fn(Int) -> Int [mutate]) -> ?CanError [net, mutate]
     var b = bytes.zeros(CAN_FD_WIRE_LEN)
     for i in 0..CAN_FD_WIRE_LEN
         b = bytes.set_u8(b, i, fd_frame_to_wire(f, byte_at, i))
     if net.send_bytes(s.sock, b)
+        // cov: skip — needs a SocketCAN interface, since only a socket bound to one carries CAN FD frames; tests/socketcan.sh runs it on vcan0 and vcan1 in a user network namespace
         return None
     Some(CanSocketRefused("the kernel refused the write: the interface is down, its queue is full, or it carries no CAN FD"))
 
-// Whether `name` is a network interface of the CAN link type.
+// Whether `name` is a network interface of the CAN link type under the
+// sysfs directory `root`.
 @tier(app)
-fn is_can(name: Str) -> Bool [fs]
+fn is_can(root: Str, name: Str) -> Bool [fs]
     if str.len(name) == 0 or str.contains(name, "/")
         return false
-    match fs.read(SYS_NET + "/" + name + "/type")
+    match fs.read(root + "/" + name + "/type")
         Some(t) => str.trim(t) == ARPHRD_CAN
         None    => false
 
 // One of an interface's error statistics.
 @tier(app)
-fn statistic(name: Str, which: Str) -> Result<Int, CanError> [fs]
-    if not is_can(name)
+fn statistic(root: Str, name: Str, which: Str) -> Result<Int, CanError> [fs]
+    if not is_can(root, name)
         return Err(CanNoSuchInterface(name))
-    // cov: skip — needs a SocketCAN interface, which a host has only when one is configured; tests/socketcan.sh runs it on vcan0 in a user network namespace, where the two refusals do not run, since sysfs gives every interface its statistics as numbers
-    match fs.read(SYS_NET + "/" + name + "/statistics/" + which)
+    match fs.read(root + "/" + name + "/statistics/" + which)
         Some(t) =>
             match str.to_int(str.trim(t))
                 Some(v) => Ok(v)
@@ -623,7 +642,6 @@ fn statistic(name: Str, which: Str) -> Result<Int, CanError> [fs]
 // A frame read off the socket: sixteen bytes, or seventy-two whose
 // payload fits a classic frame.
 @tier(app)
-// cov: skip — needs a SocketCAN interface to receive a frame from; tests/socketcan.sh runs it on vcan0 in a user network namespace, where the malformed-length refusal does not run, since the kernel delivers 16 or 72 bytes
 fn frame_of_read(b: Bytes) -> CanFrame [net]
     let n = bytes.len(b)
     if n != CAN_WIRE_LEN and n != CAN_FD_WIRE_LEN
@@ -632,6 +650,14 @@ fn frame_of_read(b: Bytes) -> CanFrame [net]
     if n == CAN_FD_WIRE_LEN and (raw[4] as Int) > canframe.CAN_MAX_DLEN
         return canframe.fault(canframe.CAN_FAULT_BAD_LENGTH)
     frame_from_wire(raw, 0)
+
+// Appends the bytes of a read to `dst` and answers how many there were.
+@tier(app)
+fn copy_read(b: Bytes, var dst: Vec[u8; 72]) -> Int
+    let n = bytes.len(b)
+    for i in 0..n
+        let _ = dst.push((bytes.__byte_at_or(b, i, 0) & 0xFF) as u8)
+    n
 
 // What a read that returned nothing means: a timeout, or a failure.
 @tier(app)

@@ -1,0 +1,266 @@
+// cansocket_sysfs_tests.nv — the interface questions of cansocket against a
+// directory tree laid out as /sys/class/net is.
+//
+// Each question has a helper that takes the sysfs directory it reads, and
+// the public function passes `/sys/class/net`.  A test builds a small tree
+// in a temporary directory: `vcanfk` is a CAN interface with an index and
+// two counters, `can9` is one whose index file is missing, `eth0` is an
+// interface of another link type, and `bonding_masters` is a plain file
+// the bonding driver leaves beside the interfaces.  No CAN interface is
+// needed on the machine, and nothing the machine has is looked at.
+//
+// The socket paths that need a bound interface are in
+// tests/socketcan.sh, which runs them on a virtual one.
+
+use std.test
+use std.bytes
+use std.fs
+use cansocket
+use canframe
+use canerr
+
+// The tree under `root`; the virtual directory lists vcanfk only.
+fn build(root: Str, virt: Str) [fs]
+    let _ = fs.mkdir_all(root + "/vcanfk/statistics")
+    let _ = fs.write(root + "/vcanfk/type", "280\n")
+    let _ = fs.write(root + "/vcanfk/ifindex", "7\n")
+    let _ = fs.write(root + "/vcanfk/statistics/tx_errors", "3\n")
+    let _ = fs.write(root + "/vcanfk/statistics/rx_errors", "many\n")
+    let _ = fs.mkdir_all(root + "/can9")
+    let _ = fs.write(root + "/can9/type", "280\n")
+    let _ = fs.write(root + "/can9/ifindex", "nine\n")
+    let _ = fs.mkdir_all(root + "/can8")
+    let _ = fs.write(root + "/can8/type", "280\n")
+    let _ = fs.mkdir_all(root + "/eth0")
+    let _ = fs.write(root + "/eth0/type", "1\n")
+    let _ = fs.write(root + "/eth0/ifindex", "2\n")
+    let _ = fs.write(root + "/bonding_masters", "\n")
+    let _ = fs.mkdir_all(virt + "/vcanfk")
+
+// Removes what `build` made.
+fn tear_down(root: Str, virt: Str) [fs]
+    let _ = fs.delete(root + "/vcanfk/statistics/tx_errors")
+    let _ = fs.delete(root + "/vcanfk/statistics/rx_errors")
+    let _ = fs.delete(root + "/vcanfk/statistics")
+    let _ = fs.delete(root + "/vcanfk/type")
+    let _ = fs.delete(root + "/vcanfk/ifindex")
+    let _ = fs.delete(root + "/vcanfk")
+    let _ = fs.delete(root + "/can9/type")
+    let _ = fs.delete(root + "/can9/ifindex")
+    let _ = fs.delete(root + "/can9")
+    let _ = fs.delete(root + "/can8/type")
+    let _ = fs.delete(root + "/can8")
+    let _ = fs.delete(root + "/eth0/type")
+    let _ = fs.delete(root + "/eth0/ifindex")
+    let _ = fs.delete(root + "/eth0")
+    let _ = fs.delete(root + "/bonding_masters")
+    let _ = fs.delete(root)
+    let _ = fs.delete(virt + "/vcanfk")
+    let _ = fs.delete(virt)
+
+fn is_err(r: Result<Int, CanError>) -> Bool
+    match r
+        Ok(_)  => false
+        Err(_) => true
+
+@test
+fn test_the_interface_list_holds_the_can_interfaces_in_name_order() [io, fs]
+    test.case("only entries of the CAN link type are listed, a plain file and another link type are not, and the list is sorted")
+    let top = fs.temp_dir()
+    let root = top + "/net"
+    let virt = top + "/virtual"
+    build(root, virt)
+    match cansocket.interfaces_in(root)
+        Ok(names) => test.assert(names == ["can8", "can9", "vcanfk"])
+        Err(_)    => test.assert(false)
+    test.case("a directory with no interfaces lists none")
+    match cansocket.interfaces_in(top + "/nothing-here")
+        Ok(names) => test.assert_eq(list.len(names), 0)
+        Err(_)    => test.assert(false)
+    tear_down(root, virt)
+    let _ = fs.delete(top)
+
+@test
+fn test_an_interface_index_is_read_from_its_ifindex_file() [io, fs]
+    test.case("a number is the index; a missing file, a file that is not a number and a name of another link type each refuse by name")
+    let top = fs.temp_dir()
+    let root = top + "/net"
+    let virt = top + "/virtual"
+    build(root, virt)
+    match cansocket.interface_index_in(root, "vcanfk")
+        Ok(i)  => test.assert_eq(i, 7)
+        Err(_) => test.assert(false)
+    test.assert(is_err(cansocket.interface_index_in(root, "can8")))
+    test.assert(is_err(cansocket.interface_index_in(root, "can9")))
+    test.assert(is_err(cansocket.interface_index_in(root, "eth0")))
+    match cansocket.interface_index_in(root, "can9")
+        Ok(_)  => test.assert(false)
+        Err(e) => test.assert(e == CanNoSuchInterface("can9"))
+    test.assert(is_err(cansocket.interface_index_in(root, "")))
+    test.assert(is_err(cansocket.interface_index_in(root, "../net/vcanfk")))
+    tear_down(root, virt)
+    let _ = fs.delete(top)
+
+@test
+fn test_an_index_names_its_interface_and_skips_entries_that_hold_none() [io, fs]
+    test.case("index 0 is every interface and has no name; an index in the tree answers the entry that holds it, a file beside the interfaces is stepped over, and an index nobody holds is refused as '#n'")
+    let top = fs.temp_dir()
+    let root = top + "/net"
+    let virt = top + "/virtual"
+    build(root, virt)
+    match cansocket.interface_name_in(root, 0)
+        Ok(n)  => test.assert_eq(n, "")
+        Err(_) => test.assert(false)
+    match cansocket.interface_name_in(root, 7)
+        Ok(n)  => test.assert_eq(n, "vcanfk")
+        Err(_) => test.assert(false)
+    match cansocket.interface_name_in(root, 99)
+        Ok(_)  => test.assert(false)
+        Err(e) => test.assert(e == CanNoSuchInterface("#99"))
+    tear_down(root, virt)
+    let _ = fs.delete(top)
+
+@test
+fn test_a_virtual_interface_has_no_bit_rate_and_a_missing_one_is_refused() [io, fs]
+    test.case("a CAN interface answers -1, for the kernel reports no rate through sysfs; a name that is not one is refused")
+    let top = fs.temp_dir()
+    let root = top + "/net"
+    let virt = top + "/virtual"
+    build(root, virt)
+    match cansocket.interface_bitrate_in(root, "vcanfk")
+        Ok(r)  => test.assert_eq(r, 0 - 1)
+        Err(_) => test.assert(false)
+    test.assert(is_err(cansocket.interface_bitrate_in(root, "eth0")))
+    tear_down(root, virt)
+    let _ = fs.delete(top)
+
+@test
+fn test_the_error_counters_are_read_from_the_statistics_files() [io, fs]
+    test.case("a number is the counter; a file that is not a number, a missing file and a name of another link type each refuse by name")
+    let top = fs.temp_dir()
+    let root = top + "/net"
+    let virt = top + "/virtual"
+    build(root, virt)
+    match cansocket.statistic(root, "vcanfk", "tx_errors")
+        Ok(n)  => test.assert_eq(n, 3)
+        Err(_) => test.assert(false)
+    test.assert(is_err(cansocket.statistic(root, "vcanfk", "rx_errors")))
+    test.assert(is_err(cansocket.statistic(root, "vcanfk", "no_such_counter")))
+    test.assert(is_err(cansocket.statistic(root, "eth0", "tx_errors")))
+    tear_down(root, virt)
+    let _ = fs.delete(top)
+
+@test
+fn test_an_existing_interface_is_virtual_when_the_virtual_directory_lists_it() [io, fs]
+    test.case("an interface the tree lists is asked of the virtual directory: vcanfk is there, can9 is not")
+    let top = fs.temp_dir()
+    let root = top + "/net"
+    let virt = top + "/virtual"
+    build(root, virt)
+    test.assert(cansocket.is_virtual_in(root, virt, "vcanfk"))
+    test.assert(cansocket.is_virtual_in(root, virt, "can9") == false)
+    test.case("a name the tree does not list is judged by its driver prefix")
+    test.assert(cansocket.is_virtual_in(root, virt, "vcan0"))
+    test.assert(cansocket.is_virtual_in(root, virt, "vxcan3"))
+    test.assert(cansocket.is_virtual_in(root, virt, "can0") == false)
+    tear_down(root, virt)
+    let _ = fs.delete(top)
+
+@test
+fn test_opening_an_interface_the_kernel_does_not_have_is_refused() [io, net, fs]
+    test.case("a name that is not a CAN interface is refused by name, with or without FD frames")
+    let top = fs.temp_dir()
+    let root = top + "/net"
+    let virt = top + "/virtual"
+    build(root, virt)
+    match cansocket.open_on(root, "eth0", false)
+        Ok(_)  => test.assert(false)
+        Err(e) => test.assert(e == CanNoSuchInterface("eth0"))
+    test.case("an interface the tree lists without a usable index is refused by name before any socket is made")
+    match cansocket.open_on(root, "can9", false)
+        Ok(_)  => test.assert(false)
+        Err(e) => test.assert(e == CanNoSuchInterface("can9"))
+    test.case("an interface the tree lists but the kernel does not have is refused with the reason for a classic socket and for an FD one")
+    match cansocket.open_on(root, "vcanfk", false)
+        Ok(_)  => test.assert(false)
+        Err(e) => test.assert(e == CanSocketRefused("the socket could not be opened on vcanfk: the kernel's can_raw module is missing"))
+    match cansocket.open_on(root, "vcanfk", true)
+        Ok(_)  => test.assert(false)
+        Err(e) => test.assert(e == CanSocketRefused("the socket could not be opened on vcanfk with CAN FD frames: the interface carries no CAN FD, or the kernel's can_raw module is missing"))
+    tear_down(root, virt)
+    let _ = fs.delete(top)
+
+@test
+fn test_the_public_questions_read_the_machines_sysfs() [io, fs]
+    test.case("whatever the machine has, each question answers a value of its own type rather than faulting")
+    test.assert(cansocket.interface_exists("can-that-does-not-exist") == false)
+    test.assert(is_err(cansocket.interface_index("can-that-does-not-exist")))
+    test.assert(is_err(cansocket.interface_bitrate("can-that-does-not-exist")))
+    test.assert(is_err(cansocket.interface_tx_errors("can-that-does-not-exist")))
+    test.assert(is_err(cansocket.interface_rx_errors("can-that-does-not-exist")))
+    match cansocket.interface_name(0)
+        Ok(n)  => test.assert_eq(n, "")
+        Err(_) => test.assert(false)
+    match cansocket.interface_name(2147483000)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+    match cansocket.interfaces()
+        Ok(names) => test.assert(list.len(names) >= 0)
+        Err(_)    => test.assert(false)
+    test.assert(cansocket.is_virtual("vcan-that-does-not-exist"))
+
+// A socket on every interface, with the FD flag set by hand, so the FD
+// write path runs up to the kernel's refusal of an unbound socket.
+@test
+fn test_an_fd_frame_goes_to_the_kernel_through_a_socket_that_allows_it() [io, net, fs, mutate]
+    test.case("a socket that carries FD frames hands the 72 bytes to the kernel, which refuses them on a socket bound to no interface")
+    match cansocket.open_all()
+        Ok(s)  =>
+            let fd = CanSocket { fd: s.fd,
+                interface: s.interface,
+                fd_frames: true,
+                sock: s.sock,
+                ifindex: s.ifindex }
+            test.assert(cansocket.send_fd(fd, canframe.fd_frame(0x123, 12, true), payload) == Some(CanSocketRefused("the kernel refused the write: the interface is down, its queue is full, or it carries no CAN FD")))
+            test.assert(cansocket.send_fd(s, canframe.fd_frame(0x123, 12, true), payload) == Some(CanFdNotSupported))
+            let _ = cansocket.close(s)
+        Err(_) => test.assert(false)
+
+fn payload(i: Int) -> Int [mutate]
+    i
+
+@test
+fn test_a_read_of_the_wrong_length_is_a_fault_and_a_right_one_is_a_frame() [io, net]
+    test.case("five bytes are neither sixteen nor seventy-two and answer a malformed fault")
+    test.assert_eq(canframe.fault_code(cansocket.frame_of_read(bytes.zeros(5))), canframe.CAN_FAULT_MALFORMED)
+    test.case("seventy-two bytes with a length past eight answer a bad-length fault; sixteen bytes decode as a frame")
+    var big = bytes.zeros(72)
+    big = bytes.set_u8(big, 4, 9)
+    test.assert_eq(canframe.fault_code(cansocket.frame_of_read(big)), canframe.CAN_FAULT_BAD_LENGTH)
+    var ok = bytes.zeros(16)
+    ok = bytes.set_u8(ok, 0, 0x23)
+    ok = bytes.set_u8(ok, 1, 0x01)
+    ok = bytes.set_u8(ok, 4, 2)
+    ok = bytes.set_u8(ok, 8, 0x11)
+    let f = cansocket.frame_of_read(ok)
+    test.assert_eq(canframe.frame_id(f), 0x123)
+    test.assert_eq(canframe.frame_len(f), 2)
+    test.assert_eq(canframe.frame_byte(f, 0), 0x11)
+    test.case("seventy-two bytes of a classic-sized frame decode too")
+    var fdsized = bytes.zeros(72)
+    fdsized = bytes.set_u8(fdsized, 0, 0x23)
+    fdsized = bytes.set_u8(fdsized, 4, 8)
+    test.assert_eq(canframe.frame_len(cansocket.frame_of_read(fdsized)), 8)
+
+@test
+fn test_a_read_is_copied_into_the_callers_buffer_and_counted() [io]
+    test.case("every byte of the read arrives in order and the count is the read's length")
+    var b = bytes.zeros(4)
+    b = bytes.set_u8(b, 0, 1)
+    b = bytes.set_u8(b, 3, 0xFF)
+    var dst: Vec[u8; 72] = Vec.new()
+    let _ = dst.push(7 as u8)
+    test.assert_eq(cansocket.copy_read(b, var dst), 4)
+    test.assert_eq(dst.len(), 5)
+    test.assert_eq(dst[1] as Int, 1)
+    test.assert_eq(dst[4] as Int, 0xFF)

@@ -309,15 +309,24 @@ novo test tests/cansocket_tests.nv    # 16: the socket surface on a machine with
 novo test tests/canloop_tests.nv      # 16: a controller in memory, the ring and the queue behind it
 novo test tests/candriver_tests.nv    #  5: the drivers' handles, words and message RAM layout
 novo test tests/canboard_tests.nv     # 11: the device half over a CanBus double, and over a host's absent controller
+novo test tests/canbxcan_regs_tests.nv   # 17: the bxCAN driver over a register file in memory
+novo test tests/canfdcan_regs_tests.nv   # 16: the FDCAN driver over a register file and a message RAM in memory
+novo test tests/cansocket_sysfs_tests.nv # 11: the interface questions over a directory laid out as /sys/class/net
 ```
 
 The suites run every line of `src/` on a host but for the regions a
-`cov: skip` marker names with its reason: the bxCAN and FDCAN drivers'
-register access, which only a board maps, and the paths of `cansocket`
-that need a CAN interface.  `tests/socketcan.sh` runs those `cansocket`
-paths on two virtual interfaces, vcan0 and vcan1, in a user network
-namespace (`unshare -rnm`), which needs no privilege on a kernel that
-allows unprivileged user namespaces and has the vcan module.
+`cov: skip` marker names with its reason.  The two controller drivers
+run over memory: a test builds the handle over a zeroed buffer, so the
+driver's loads and stores land there, and presets the status bits the
+path under test reads.  The regions left are the clock and pin routines,
+which write the STM32's RCC and GPIO at fixed addresses that only a
+board maps, the waits whose status bit changes between two reads of one
+register, which memory never does, and the paths of `cansocket` that
+need a bound CAN interface or a frame the kernel delivered.
+`tests/socketcan.sh` runs those `cansocket` paths on two virtual
+interfaces, vcan0 and vcan1, in a user network namespace
+(`unshare -rnm`), which needs no privilege on a kernel that allows
+unprivileged user namespaces and has the vcan module.
 
 `tests/board_probe.nv` runs `CanBoard` on a board that serves `hal.can`:
 `novo build --target=frdm-mcxn947 tests/board_probe.nv` builds it, and
