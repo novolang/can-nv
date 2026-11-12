@@ -5,6 +5,12 @@ All notable changes to can-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.4 — 2026-11-12
+
+The same drivers built against embedded-hal-nv 0.4.0.  A program that holds embedded-hal-nv 0.4.0 beside can-nv 0.1.3, whose range asked for `^0.3.0`, resolved two copies of embedded-hal-nv and was refused as such; this release's range is `^0.4.0`.  No public signature or answer changed.
+
+This release requires novo 0.23.0 or later.
+
 ## 0.1.3 — 2026-11-04
 
 The test suites now run the bxCAN and FDCAN drivers over a register file in memory and the interface questions of cansocket over a directory laid out as /sys/class/net, so the regions excused from coverage shrink to the clock and pin routines at fixed addresses, the waits whose status bit changes between two reads of one register, and the socket paths that need a bound CAN interface.  The private helpers of cansocket that read sysfs now take the directory they read, and the public functions pass /sys/class/net; no public signature or answer changed.

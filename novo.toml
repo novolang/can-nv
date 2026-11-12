@@ -1,6 +1,6 @@
 [package]
 name        = "can-nv"
-version     = "0.1.3"
+version     = "0.1.4"
 description = "The CAN bus on a microcontroller and on Linux behind one interface: classic and CAN FD frames as values, acceptance filters by mask and by list, the error-confinement state machine, a bit-timing solver, a transmit queue that sends by arbitration priority and a receive ring over the caller's frames, ISO-TP, candump lines, drivers for ST's bxCAN and FDCAN (Bosch M_CAN), a loopback controller for tests and emulators, and SocketCAN over raw sockets.  Nothing is allocated after start-up on a device."
 license     = "Apache-2.0"
 
@@ -37,6 +37,4 @@ novo        = ">= 0.23.0"
 # `CanBus` and the handle `BoardCan`.  The transmit queue and the
 # receive ring keep their own bookkeeping over a `Vec[CanFrame; N]` the
 # caller declares, the language's own fixed-capacity storage.
-# A path dependency until 0.4.0 is published: PATH-DEPENDENCIES.md in the
-# parent directory lists the line that becomes "^0.4.0".
 embedded-hal-nv = { path = "../embedded-hal-nv" }
