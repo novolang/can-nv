@@ -37,4 +37,4 @@ novo        = ">= 0.23.0"
 # `CanBus` and the handle `BoardCan`.  The transmit queue and the
 # receive ring keep their own bookkeeping over a `Vec[CanFrame; N]` the
 # caller declares, the language's own fixed-capacity storage.
-embedded-hal-nv = { path = "../embedded-hal-nv" }
+embedded-hal-nv = "^0.4.0"
